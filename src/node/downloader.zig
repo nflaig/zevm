@@ -661,9 +661,10 @@ pub const Downloader = struct {
     fn pickEthPeer(self: *Self, msg: eth.Message) !rlpx.Server.PeerId {
         switch (msg) {
             .get_block_headers => |header_req| {
+                const allowed_height_gap = 16;
                 const height = switch (header_req.range.origin) {
-                    .number => |number| number,
-                    .hash => self.syncTarget().number,
+                    .number => |number| number -| allowed_height_gap,
+                    .hash => self.syncTarget().number -| allowed_height_gap,
                 };
                 return self.eth_provider.pickRandomPeer(PeerFilter(eth.Message).init(self, &self.inflight_eth_requests, height));
             },
