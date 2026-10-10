@@ -72,7 +72,7 @@ pub const Downloader = struct {
     };
     const Outcome = union(enum) {
         headers: struct { hashes: [][32]u8, headers: []types.BlockHeader },
-        bal: struct { hash: [32]u8, rlp: []const u8, parsed: types.BlockAccessLists },
+        bal: struct { hash: [32]u8, parsed: types.BlockAccessLists },
         accounts: VerifiedAccounts,
         storage: VerifiedStorage,
         codes: [][32]u8,
@@ -132,12 +132,7 @@ pub const Downloader = struct {
         started_at: std.Io.Timestamp,
 
         bal_requested: bool = false,
-        bal: ?struct {
-            arena: std.heap.ArenaAllocator,
-            rlp: rlp.RawValue,
-            parsed: types.BlockAccessLists,
-            resume_index: usize = 0,
-        } = null,
+        bal_applied: bool = false,
         pivot_hash_buf: [1][32]u8 = undefined,
         stale_storage_roots: std.AutoArrayHashMapUnmanaged([32]u8, void) = .empty,
     } = null,
@@ -369,7 +364,7 @@ pub const Downloader = struct {
                 self.validating_eth_requests.remove(resp.req);
                 switch (resp.msg.msg) {
                     .block_headers => try self.handleHeaders(resp.req, validated.outcome),
-                    .block_access_list => try self.handleBals(resp.req, validated.outcome, &validated.arena),
+                    .block_access_list => try self.handleBals(resp.req, validated.outcome),
                     else => unreachable,
                 }
                 self.drainPendingEthRequests();
@@ -422,13 +417,11 @@ pub const Downloader = struct {
 
     fn validateBal(allocator: std.mem.Allocator, response: eth.BlockAccessLists) !Outcome {
         if (response.rlps.len == 0) return error.EmptyResponse;
-        // decode from a copy, the parsed lists point into it and outlive the frame
-        const bal_rlp = try allocator.dupe(u8, response.rlps[0].value);
         var hash: [32]u8 = undefined;
-        std.crypto.hash.sha3.Keccak256.hash(bal_rlp, &hash, .{});
+        std.crypto.hash.sha3.Keccak256.hash(response.rlps[0].value, &hash, .{});
         var parsed: types.BlockAccessLists = undefined;
-        _ = try rlp.deserialize(types.BlockAccessLists, allocator, bal_rlp, &parsed);
-        return .{ .bal = .{ .hash = hash, .rlp = bal_rlp, .parsed = parsed } };
+        _ = try rlp.deserialize(types.BlockAccessLists, allocator, response.rlps[0].value, &parsed);
+        return .{ .bal = .{ .hash = hash, .parsed = parsed } };
     }
 
     fn verifyAccounts(allocator: std.mem.Allocator, request: snap.GetAccountRange, response: *const snap.AccountRange) !Outcome {
@@ -1368,22 +1361,18 @@ pub const Downloader = struct {
     fn advanceStateHeal(self: *Self) !void {
         const state_heal = &self.state_heal.?;
 
-        if (state_heal.bal) |*bal| {
-            if (bal.resume_index < bal.parsed.len) {
-                bal.resume_index = try self.applyBal(bal.parsed, bal.resume_index);
-            }
-            if (bal.resume_index == bal.parsed.len and state_heal.next_pivot.number + 1 > state_heal.target_pivot.number) {
+        if (state_heal.bal_applied) {
+            if (state_heal.next_pivot.number + 1 > state_heal.target_pivot.number) {
                 if (self.fetchStaleStorageRoots()) return;
             }
-            if (bal.resume_index == bal.parsed.len and self.inflight_snap_requests.empty() and
-                self.pending_snap_requests.empty() and self.validating_snap_requests.empty())
+            if (self.inflight_snap_requests.empty() and self.pending_snap_requests.empty() and
+                self.validating_snap_requests.empty())
             {
                 if (state_heal.next_pivot.number + 1 > state_heal.target_pivot.number) {
                     log.info("state heal: done, healed {} blocks in {}s", .{
                         state_heal.target_pivot.number - state_heal.start_number,
                         state_heal.started_at.durationTo(std.Io.Clock.now(.real, self.io)).toSeconds(),
                     });
-                    bal.arena.deinit();
                     state_heal.stale_storage_roots.deinit(self.allocator);
                     self.state_heal = null;
                     try self.popSnapRequests();
@@ -1394,9 +1383,7 @@ pub const Downloader = struct {
                 std.debug.assert(std.meta.eql(state_heal.pivot_hash_buf[0], state_heal.next_pivot.parent_hash));
                 state_heal.pivot_hash_buf[0] = state_heal.next_pivot.hash();
                 state_heal.bal_requested = false;
-
-                bal.arena.deinit();
-                state_heal.bal = null;
+                state_heal.bal_applied = false;
             }
         }
 
@@ -1416,18 +1403,13 @@ pub const Downloader = struct {
         self.sendEthRequest(req, true);
     }
 
-    fn handleBals(self: *Self, req: *Request(eth.Message), outcome: anyerror!Outcome, arena: *std.heap.ArenaAllocator) !void {
+    fn handleBals(self: *Self, req: *Request(eth.Message), outcome: anyerror!Outcome) !void {
         if (self.state_heal) |*state_heal| {
             if (outcome) |result| {
                 if (std.meta.eql(result.bal.hash, state_heal.next_pivot.block_access_list_hash.?)) {
-                    std.debug.assert(state_heal.bal == null);
-                    // the parsed bal outlives this response, take ownership of the arena it lives in
-                    state_heal.bal = .{
-                        .arena = arena.*,
-                        .rlp = .{ .value = result.bal.rlp },
-                        .parsed = result.bal.parsed,
-                    };
-                    arena.* = .init(self.allocator);
+                    std.debug.assert(!state_heal.bal_applied);
+                    try self.applyBal(result.bal.parsed);
+                    state_heal.bal_applied = true;
                     self.free_eth_requests.push(req);
                     try self.advanceStateHeal();
                     return;
@@ -1437,14 +1419,13 @@ pub const Downloader = struct {
         } else unreachable;
     }
 
-    fn applyBal(self: *Self, bal: types.BlockAccessLists, resume_index: usize) !usize {
+    fn applyBal(self: *Self, bal: types.BlockAccessLists) !void {
         const txn_start = std.Io.Timestamp.now(self.io, .awake);
         const txn = try self.eth_db.kv_store.transaction_rw();
         defer self.commitTxn(txn, "bal", txn_start) catch unreachable;
         const codes = self.eth_db.kv_store.table(txn, .codes);
 
-        for (resume_index..bal.len) |account_index| {
-            const changes = bal[account_index];
+        for (bal) |changes| {
             if (changes.balance_changes.len == 0 and
                 changes.code_changes.len == 0 and
                 changes.nonce_changes.len == 0 and
@@ -1490,8 +1471,6 @@ pub const Downloader = struct {
                 } else try self.eth_db.writeAccount(self.allocator, txn, addr_hash, updated_account);
             }
         }
-
-        return bal.len;
     }
 
     fn isStorageFetched(self: *Self, account_hash: [32]u8, slot_hash: ?[32]u8) bool {
@@ -1618,20 +1597,13 @@ pub const Downloader = struct {
         if (self.state_heal) |state_heal| {
             const healed = state_heal.next_pivot.number - 1 - state_heal.start_number;
             const total = state_heal.target_pivot.number - state_heal.start_number;
-            const bal_status: []const u8, const applied: usize, const touched: usize = if (state_heal.bal) |bal|
-                .{ "applying", bal.resume_index, bal.parsed.len }
-            else if (state_heal.bal_requested)
-                .{ "requested", 0, 0 }
-            else
-                .{ "not requested", 0, 0 };
-            log.info("state heal: block {} ({}/{} healed, {}s elapsed), bal {s} ({}/{} accounts), inflight snap {}, pending snap {}, inflight eth {}", .{
+            const bal_status = if (state_heal.bal_applied) "applied" else if (state_heal.bal_requested) "requested" else "not requested";
+            log.info("state heal: block {} ({}/{} healed, {}s elapsed), bal {s}, inflight snap {}, pending snap {}, inflight eth {}", .{
                 state_heal.next_pivot.number,
                 healed,
                 total,
                 state_heal.started_at.durationTo(now).toSeconds(),
                 bal_status,
-                applied,
-                touched,
                 self.inflight_snap_requests.inner.len(),
                 self.pending_snap_requests.inner.len(),
                 self.inflight_eth_requests.inner.len(),
