@@ -40,6 +40,10 @@ fn Request(comptime msg: type) type {
         deadline: std.Io.Timestamp,
         keyspace: [2]u256 = .{ 0, 0 },
         storage_roots: [][32]u8 = &.{},
+
+        fn lessThan(ctx: void, left: @This(), right: @This()) bool {
+            return msg.lessThan(ctx, left.msg, right.msg);
+        }
     };
 }
 
@@ -311,7 +315,7 @@ pub const Downloader = struct {
             else => null,
         };
         if (matched) |req| {
-            self.validating_snap_requests.push(req);
+            insertRequest(&self.validating_snap_requests, req, .back);
             try self.startValidation(&self.snap_arena, .{ .snap = .{ .msg = received, .req = req } });
         }
         self.drainPendingSnapRequests();
@@ -623,8 +627,16 @@ pub const Downloader = struct {
 
     fn drainPendingRequests(self: *Self, pending: anytype, inflight: anytype, send_fn: anytype) void {
         while (pending.pop()) |req| {
-            send_fn(self, req) catch return pending.prepend(req);
-            inflight.push(req);
+            send_fn(self, req) catch return insertRequest(pending, req, .front);
+            insertRequest(inflight, req, .back);
+        }
+    }
+
+    fn insertRequest(list: anytype, req: anytype, comptime at: enum { front, back }) void {
+        if (@TypeOf(list) == *List(Request(snap.Message))) return list.insertSorted(req, Request(snap.Message).lessThan);
+        switch (at) {
+            .front => list.prepend(req),
+            .back => list.push(req),
         }
     }
 
@@ -656,7 +668,7 @@ pub const Downloader = struct {
                 const assumed_rtt: std.Io.Duration = .fromNanoseconds(request.elem.sent_at.durationTo(now).nanoseconds * 2);
                 provider.observeDelay(request.elem.peer, std.meta.activeTag(request.elem.msg), assumed_rtt);
                 list.inner.remove(node);
-                pending.prepend(&request.elem);
+                insertRequest(pending, &request.elem, .front);
             }
 
             current_node = next_node;
@@ -701,7 +713,7 @@ pub const Downloader = struct {
     }
 
     fn sendSnapRequest(self: *Self, req: *Request(snap.Message)) !void {
-        self.pending_snap_requests.push(req);
+        insertRequest(&self.pending_snap_requests, req, .back);
         self.drainPendingSnapRequests();
     }
 

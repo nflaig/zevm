@@ -49,6 +49,16 @@ pub fn List(comptime T: type) type {
             self.inner.remove(&node.node);
         }
 
+        pub fn insertSorted(self: *List(T), elem: *T, comptime lessThan: fn (void, T, T) bool) void {
+            const node: *Node = @alignCast(@fieldParentPtr("elem", elem));
+            var current_node = self.inner.last;
+            while (current_node) |list_node| : (current_node = list_node.prev) {
+                const current: *Node = @alignCast(@fieldParentPtr("node", list_node));
+                if (!lessThan({}, elem.*, current.elem)) return self.inner.insertAfter(list_node, &node.node);
+            }
+            self.inner.prepend(&node.node);
+        }
+
         pub fn empty(self: *List(T)) bool {
             return self.inner.first == null;
         }

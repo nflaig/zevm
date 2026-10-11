@@ -77,6 +77,23 @@ pub const Message = union(MessageId) {
     trie_nodes: rlp.RawValue,
     get_access_lists: rlp.RawValue,
     access_lists: rlp.RawValue,
+
+    pub fn lessThan(_: void, left: Message, right: Message) bool {
+        switch (left) {
+            .get_account_range => |left_range| if (right == .get_account_range)
+                return std.mem.order(u8, &left_range.origin, &right.get_account_range.origin) == .lt,
+            .get_storage_ranges => |left_ranges| if (right == .get_storage_ranges) {
+                const right_ranges = right.get_storage_ranges;
+                return switch (std.mem.order(u8, &left_ranges.account_hashes[0], &right_ranges.account_hashes[0])) {
+                    .lt => true,
+                    .gt => false,
+                    .eq => std.mem.order(u8, &left_ranges.starting_hash, &right_ranges.starting_hash) == .lt,
+                };
+            },
+            else => {},
+        }
+        return false;
+    }
 };
 
 pub const Config: proto.Config = .{
