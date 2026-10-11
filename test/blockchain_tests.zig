@@ -209,6 +209,8 @@ fn runBlockchainTest(gpa: std.mem.Allocator, test_case: *const BlockchainTest, c
             break :blk .{ null, p };
         };
 
+        if (validate_err != null) utils.discardBlock(&state);
+
         if (block_entry.expectException) |expected| {
             const actual = validate_err orelse return error.ExpectedExceptionButSucceeded;
             if (!utils.exceptionMatches(actual, expected)) return actual;
