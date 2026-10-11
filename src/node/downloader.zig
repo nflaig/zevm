@@ -1064,23 +1064,22 @@ pub const Downloader = struct {
         const get_accounts_range = request.msg.get_account_range;
         const verified: ?VerifiedAccounts = if (outcome) |result| result.accounts else |_| null;
 
-        var remaining: ?struct { [32]u8, [32]u8 } = null;
+        var continue_from_account: ?[32]u8 = null;
         if (verified) |accounts| {
             const hashes = accounts.hashes;
             const last = if (hashes.len > 0) hashes[hashes.len - 1] else get_accounts_range.limit;
             log.debug("verified account range {x}-{x}", .{ get_accounts_range.origin, last });
             if (accounts.has_more and std.mem.order(u8, &last, &get_accounts_range.limit) == .lt)
-                remaining = .{ last, get_accounts_range.limit };
+                continue_from_account = last;
             try self.persistAccounts(get_accounts_range, hashes, response);
             const covered_until = if (accounts.has_more) last else get_accounts_range.limit;
             self.progress.account_keyspace +|= std.mem.readInt(u256, &covered_until, .big) - std.mem.readInt(u256, &get_accounts_range.origin, .big);
         } else {
-            remaining = .{ get_accounts_range.origin, get_accounts_range.limit };
+            continue_from_account = get_accounts_range.origin;
         }
 
-        if (remaining) |range| {
-            const origin = range.@"0";
-            const limit = range.@"1";
+        if (continue_from_account) |origin| {
+            const limit = get_accounts_range.limit;
             log.debug("remaining account range {x}-{x}", .{ origin, limit });
 
             const origin_numeric = std.mem.readInt(u256, &origin, .big);
