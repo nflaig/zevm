@@ -126,6 +126,10 @@ pub fn finalizeBlock(state: *state_mod.State, committed: *CommittedState) !void 
         }
     }
 
+    discardBlock(state);
+}
+
+pub fn discardBlock(state: *state_mod.State) void {
     state.accounts.dirties.clearRetainingCapacity();
     state.accounts.journal.clearRetainingCapacity();
     state.contract_state.dirties.clearRetainingCapacity();
