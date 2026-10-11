@@ -1,3 +1,6 @@
+// Copyright (c) 2025-2026 zevm authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 const std = @import("std");
 
 /// Allocator wrapper that rounds every allocation size up to a multiple of

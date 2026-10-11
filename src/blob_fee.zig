@@ -1,3 +1,6 @@
+// Copyright (c) 2025-2026 zevm authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 pub fn blobBaseFee(excess_blob_gas: u64, update_fraction: u64) u256 {
     if (update_fraction == 0) return 1;
     // fake_exponential(1, excess_blob_gas, update_fraction)

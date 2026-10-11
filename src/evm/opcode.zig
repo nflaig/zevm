@@ -1,3 +1,6 @@
+// Copyright (c) 2025-2026 zevm authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 pub const Opcode = enum(u8) {
     STOP = 0x00,
     ADD = 0x01,

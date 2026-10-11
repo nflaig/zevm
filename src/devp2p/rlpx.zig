@@ -1,3 +1,6 @@
+// Copyright (c) 2025-2026 zevm authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 const std = @import("std");
 const enr = @import("enr.zig");
 const secp256k1 = @import("zig-eth-secp256k1");

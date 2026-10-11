@@ -1,3 +1,6 @@
+// Copyright (c) 2025-2026 zevm authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /// Optimized u256 division via a 4-limb u64 algorithm.
 const Limbs = [4]u64;
 

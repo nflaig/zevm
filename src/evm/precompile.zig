@@ -1,3 +1,6 @@
+// Copyright (c) 2025-2026 zevm authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 const std = @import("std");
 const build_options = @import("build_options");
 const evm = @import("evm.zig");

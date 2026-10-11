@@ -1,3 +1,6 @@
+// Copyright (c) 2025-2026 zevm authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 pub const evm = @import("evm/evm.zig");
 pub const state = @import("evm/state.zig");
 pub const spec = @import("evm/spec.zig");
