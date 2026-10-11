@@ -122,6 +122,8 @@ pub const Downloader = struct {
         pivot: types.BlockHeader,
 
         accounts_done: bool = false,
+        account_fetch_head: u256 = 0,
+        account_fetch_step: u256 = 0,
         storage_fetch_head: [32]u8 = @splat(0),
         storage_and_fetch_initiated: bool = false,
     } = null,
@@ -1014,17 +1016,16 @@ pub const Downloader = struct {
                         new_pivot_height - cur_pivot.number,
                     });
                 }
-            } else {
-                self.requestAccountRange(
-                    self.free_snap_requests.pop() orelse unreachable,
-                    new_pivot.state_root,
-                    @splat(0),
-                    @splat(0xff),
-                );
             }
 
             log.debug("new pivot {}, old {}", .{ new_pivot, cur_pivot });
             self.state.?.pivot = new_pivot;
+            if (cur_pivot.number == 0) self.requestAccountRange(
+                self.free_snap_requests.pop() orelse unreachable,
+                new_pivot.state_root,
+                0,
+                std.math.maxInt(u256),
+            );
         }
     }
 
@@ -1050,12 +1051,17 @@ pub const Downloader = struct {
         }
     }
 
-    fn requestAccountRange(self: *Self, req: *Request(snap.Message), state_root: [32]u8, origin: [32]u8, limit: [32]u8) void {
+    fn requestAccountRange(self: *Self, req: *Request(snap.Message), state_root: [32]u8, origin: u256, limit: u256) void {
         log.debug("requesting account range origin: {x} limit: {x}", .{ origin, limit });
+        var origin_bytes: [32]u8 = undefined;
+        var limit_bytes: [32]u8 = undefined;
+        std.mem.writeInt(u256, &origin_bytes, origin, .big);
+        std.mem.writeInt(u256, &limit_bytes, limit, .big);
+
         req.msg = .{ .get_account_range = .{
             .root = state_root,
-            .origin = origin,
-            .limit = limit,
+            .origin = origin_bytes,
+            .limit = limit_bytes,
         } };
         self.sendSnapRequest(req) catch {};
     }
@@ -1078,26 +1084,41 @@ pub const Downloader = struct {
             continue_from_account = get_accounts_range.origin;
         }
 
-        if (continue_from_account) |origin| {
-            const limit = get_accounts_range.limit;
-            log.debug("remaining account range {x}-{x}", .{ origin, limit });
+        const state = &self.state.?;
+        const prev_origin = std.mem.readInt(u256, &get_accounts_range.origin, .big);
+        const limit = std.mem.readInt(u256, &get_accounts_range.limit, .big);
+        if (continue_from_account) |origin_bytes| {
+            log.debug("remaining account range {x}-{x}", .{ origin_bytes, get_accounts_range.limit });
 
-            const origin_numeric = std.mem.readInt(u256, &origin, .big);
-            const limit_numeric = std.mem.readInt(u256, &limit, .big);
-            const pivot_state_root = self.state.?.pivot.state_root;
-            if (limit_numeric - origin_numeric < min_split_range) {
-                self.requestAccountRange(request, pivot_state_root, origin, limit);
-            } else if (self.free_snap_requests.pop()) |new_req| {
-                var split_point: [32]u8 = undefined;
-                std.mem.writeInt(u256, &split_point, origin_numeric / 2 + limit_numeric / 2, .big);
-                self.requestAccountRange(new_req, pivot_state_root, origin, split_point);
-                self.requestAccountRange(request, pivot_state_root, split_point, limit);
+            const origin = std.mem.readInt(u256, &origin_bytes, .big);
+            if (state.account_fetch_step == 0 and origin != prev_origin) {
+                // first response of the initial full range request sizes the chunks
+                state.account_fetch_step = origin - prev_origin;
+                state.account_fetch_head = origin;
+                self.requestAccountChunks(request);
             } else {
-                self.requestAccountRange(request, pivot_state_root, origin, limit);
+                self.requestAccountRange(request, state.pivot.state_root, origin, limit);
             }
+        } else if (prev_origin != limit and limit < std.math.maxInt(u256)) {
+            self.requestAccountChunks(request);
         } else {
             self.free_snap_requests.push(request);
         }
+    }
+
+    fn requestAccountChunks(self: *Self, request: *Request(snap.Message)) void {
+        const state = &self.state.?;
+        const max = std.math.maxInt(u256);
+
+        var req = request;
+        while (state.account_fetch_head < max) {
+            const origin = state.account_fetch_head;
+            const limit = if (max - origin > state.account_fetch_step +| 1) origin + state.account_fetch_step else max;
+            self.requestAccountRange(req, state.pivot.state_root, origin, limit);
+            state.account_fetch_head = limit +| 1;
+            req = self.free_snap_requests.pop() orelse return;
+        }
+        self.free_snap_requests.push(req);
     }
 
     fn persistAccounts(self: *Self, request: snap.GetAccountRange, hashes: [][32]u8, response: *const snap.AccountRange) !void {
@@ -1506,7 +1527,8 @@ pub const Downloader = struct {
         while (stale_storage_roots.count() > 0) {
             const req = self.free_snap_requests.pop() orelse break;
             const account_hash = stale_storage_roots.pop().?.key;
-            self.requestAccountRange(req, self.state.?.pivot.state_root, account_hash, account_hash);
+            const account = std.mem.readInt(u256, &account_hash, .big);
+            self.requestAccountRange(req, self.state.?.pivot.state_root, account, account);
         }
         return true;
     }
