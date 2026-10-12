@@ -24,6 +24,7 @@ const STATE_BYTES_PER_AUTH_BASE = 23;
 pub const STATE_BYTES_PER_STORAGE_SLOT = 64;
 const SYSTEM_ADDRESS: u160 = 0xfffffffffffffffffffffffffffffffffffffffe;
 
+pub const HostErrors = @import("committed_state.zig").Errors || std.mem.Allocator.Error;
 pub const Errors = error{
     OutOfGas,
     InvalidOpcode,
@@ -52,7 +53,7 @@ pub const Errors = error{
     InvalidPrecompileInput,
     MissingAncestorHash,
     CreateCollision,
-} || @import("committed_state.zig").Errors || std.mem.Allocator.Error;
+} || HostErrors;
 
 pub const Context = struct {
     chainid: u64,
@@ -707,7 +708,7 @@ pub const EVM = struct {
             defer frame.memory.deinit();
 
             frame.enter(cfg) catch |frameErr| {
-                if (isHostError(frameErr)) return frameErr;
+                try checkHostError(frameErr);
                 err = frameErr;
             };
             remaining_gas = frame.gas;
@@ -715,7 +716,7 @@ pub const EVM = struct {
         }
 
         if (err != null) {
-            if (isHostError(err.?)) return err.?;
+            try checkHostError(err.?);
             state.revert(state_snap);
             self.revert(evm_snap);
             remaining_gas += state_gas_spillover;
@@ -818,7 +819,7 @@ pub const EVM = struct {
         // Use write() (journaled) so the caller's revert can undo this entry if needed.
         _ = try self.created_accounts.write(new_addr, .Created);
         frame.enter(cfg) catch |err| {
-            if (isHostError(err)) return err;
+            try checkHostError(err);
             state.revert(state_snap);
             self.revert(evm_snap);
             frame.gas += frame.state_gas_spillover;
@@ -1031,14 +1032,10 @@ pub const EVM = struct {
     }
 };
 
-// Missing host data and allocation failures must abort simulation,
-// including inside nested CALL/CREATE frames. They are not EVM exceptions.
-fn isHostError(err: Errors) bool {
-    if (err == error.OutOfMemory) return true;
-    inline for (@typeInfo(@import("committed_state.zig").Errors).error_set.error_names.?) |name| {
-        if (err == @field(anyerror, name)) return true;
+fn checkHostError(err: Errors) !void {
+    inline for (@typeInfo(HostErrors).error_set.error_names.?) |name| {
+        if (err == @field(HostErrors, name)) return err;
     }
-    return false;
 }
 
 // EIP-7702: resolve delegation designator one level deep. Pure lookup with no gas side effects.
