@@ -26,7 +26,7 @@ pub fn verifyRangeProof(
             return false;
         }
         var t = try trie.Trie.init(allocator);
-        try t.update(keys, values);
+        try t.updateNoDeletions(keys, values);
         if (!std.mem.eql(u8, &try t.rootHash(), &root)) return error.BadRangeProof;
         return false;
     }
@@ -43,7 +43,7 @@ pub fn verifyRangeProof(
 
     const last = keys[keys.len - 1];
     try clearInternal(&t, origin, last);
-    try t.update(keys, values);
+    try t.updateNoDeletions(keys, values);
 
     const more = try hasRightElement(t.root, last);
 

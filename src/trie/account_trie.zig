@@ -35,6 +35,7 @@ pub const AccountTrie = struct {
 
     pub fn insert(self: *@This(), keys: []const [32]u8, accounts: []const ?types.Account) !void {
         const val_slices = try self.inner.allocator.alloc([]const u8, accounts.len);
+        var has_deletions = false;
         for (accounts, val_slices) |account_opt, *s| {
             if (account_opt) |account| {
                 var buf = std.array_list.Managed(u8).init(self.inner.allocator);
@@ -42,9 +43,10 @@ pub const AccountTrie = struct {
                 s.* = buf.items;
             } else {
                 s.* = &.{};
+                has_deletions = true;
             }
         }
-        try self.inner.update(keys, val_slices);
+        if (has_deletions) try self.inner.update(keys, val_slices) else try self.inner.updateNoDeletions(keys, val_slices);
     }
 
     pub fn rootHash(self: *@This()) ![32]u8 {

@@ -29,6 +29,7 @@ pub const StorageTrie = struct {
 
     pub fn insert(self: *@This(), keys: []const [32]u8, values: []const ?u256) !void {
         const val_slices = try self.inner.allocator.alloc([]const u8, values.len);
+        var has_deletions = false;
         for (values, val_slices) |value_opt, *s| {
             if (value_opt) |value| {
                 var buf = std.array_list.Managed(u8).init(self.inner.allocator);
@@ -36,9 +37,10 @@ pub const StorageTrie = struct {
                 s.* = buf.items;
             } else {
                 s.* = &.{};
+                has_deletions = true;
             }
         }
-        try self.inner.update(keys, val_slices);
+        if (has_deletions) try self.inner.update(keys, val_slices) else try self.inner.updateNoDeletions(keys, val_slices);
     }
 
     pub fn rootHash(self: *@This()) ![32]u8 {

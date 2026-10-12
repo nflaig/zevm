@@ -152,10 +152,12 @@ fn runBenchmark(io: std.Io, allocator: std.mem.Allocator, bench_def: BenchmarkDe
         _ = vm_arena.reset(.retain_capacity);
         var vm = try evm.EVM.init(vm_arena.allocator(), &context, bench_fork.fork.evmCapacities());
         const start = std.Io.Timestamp.now(io, .awake);
-        gas_used, state_gas_used = vm.process(bench_fork, &msg, &state) catch |err| {
+        const result = vm.process(bench_fork, &msg, &state) catch |err| {
             std.debug.print("error at iter {d}: {}\n", .{ i, err });
             return;
         };
+        gas_used = result.regular_gas;
+        state_gas_used = result.state_gas;
         const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake));
         if (i >= warmup) {
             times[i - warmup] = @intCast(elapsed.toNanoseconds());

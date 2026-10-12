@@ -24,6 +24,7 @@ const STATE_BYTES_PER_AUTH_BASE = 23;
 pub const STATE_BYTES_PER_STORAGE_SLOT = 64;
 const SYSTEM_ADDRESS: u160 = 0xfffffffffffffffffffffffffffffffffffffffe;
 
+pub const HostErrors = @import("committed_state.zig").Errors || std.mem.Allocator.Error;
 pub const Errors = error{
     OutOfGas,
     InvalidOpcode,
@@ -52,7 +53,7 @@ pub const Errors = error{
     InvalidPrecompileInput,
     MissingAncestorHash,
     CreateCollision,
-} || @import("committed_state.zig").Errors || std.mem.Allocator.Error;
+} || HostErrors;
 
 pub const Context = struct {
     chainid: u64,
@@ -338,7 +339,7 @@ pub const EVM = struct {
     pub fn effectiveGasPrice(msg: *const Message, basefee: u256) u256 {
         const priority = msg.max_priority_fee_per_gas orelse 0;
         return if (msg.max_fee_per_gas) |mfpg|
-            @min(mfpg, basefee + priority)
+            @min(mfpg, basefee +| priority)
         else
             msg.gas_price orelse 0;
     }
@@ -365,7 +366,20 @@ pub const EVM = struct {
         return .{ 0, 0 };
     }
 
-    pub fn process(self: *Self, comptime cfg: Config, msg: *const Message, state: *State) !struct { u64, u64 } {
+    // Outcome of a transaction that is included in the block
+    pub const TxResult = struct {
+        // Gas counted against the block gas limit
+        regular_gas: u64,
+        state_gas: u64,
+        // Gas the sender paid for
+        gas_used: u64,
+        // null if execution succeeded, otherwise the EVM error that failed it
+        exec_error: ?Errors,
+    };
+
+    // Executes the transaction and returns an error only if it can't be included in the block,
+    // either because it is invalid or because of a host failure
+    pub fn process(self: *Self, comptime cfg: Config, msg: *const Message, state: *State) !TxResult {
         self.msg = msg;
         self.effective_gas_price = effectiveGasPrice(msg, self.context.basefee);
 
@@ -476,6 +490,7 @@ pub const EVM = struct {
         var state_gas_spillover: u64 = 0;
         var create_state_gas: u64 = 0;
         var err: ?Errors = null;
+        var exec_error: ?Errors = null;
         if (msg.target) |target| {
             if (self.prepareDispatch(cfg, state, msg, target, remaining_gas, state_gas_spillover)) |prep| {
                 remaining_gas, create_state_gas, state_gas_spillover = prep;
@@ -516,9 +531,11 @@ pub const EVM = struct {
                 state_gas_spillover += create_spillover;
             } else |_| {
                 remaining_gas = 0;
+                exec_error = Errors.OutOfGas;
             }
         }
         if (err) |e| {
+            exec_error = e;
             remaining_gas, state_gas_spillover = self.creditStateGasRefund(remaining_gas, state_gas_spillover, create_state_gas);
             if (e != Errors.Reverted) remaining_gas = 0;
         }
@@ -551,9 +568,9 @@ pub const EVM = struct {
         if (cfg.fork.isEnabled(.Amsterdam)) {
             const state_gas: u64 = @intCast(@max(@as(i64, 0), self.state_gas_used));
             const regular_gas = gas_used_before_refund - state_gas;
-            return .{ @max(regular_gas, floor_cost), state_gas };
+            return .{ .regular_gas = @max(regular_gas, floor_cost), .state_gas = state_gas, .gas_used = gas_used, .exec_error = exec_error };
         }
-        return .{ gas_used, 0 };
+        return .{ .regular_gas = gas_used, .state_gas = 0, .gas_used = gas_used, .exec_error = exec_error };
     }
 
     pub fn baseIntrinsicRegular(comptime cfg: Config, msg: *const Message) u64 {
@@ -694,6 +711,7 @@ pub const EVM = struct {
             defer frame.memory.deinit();
 
             frame.enter(cfg) catch |frameErr| {
+                try checkHostError(frameErr);
                 err = frameErr;
             };
             remaining_gas = frame.gas;
@@ -701,6 +719,7 @@ pub const EVM = struct {
         }
 
         if (err != null) {
+            try checkHostError(err.?);
             state.revert(state_snap);
             self.revert(evm_snap);
             remaining_gas += state_gas_spillover;
@@ -803,6 +822,7 @@ pub const EVM = struct {
         // Use write() (journaled) so the caller's revert can undo this entry if needed.
         _ = try self.created_accounts.write(new_addr, .Created);
         frame.enter(cfg) catch |err| {
+            try checkHostError(err);
             state.revert(state_snap);
             self.revert(evm_snap);
             frame.gas += frame.state_gas_spillover;
@@ -1015,6 +1035,12 @@ pub const EVM = struct {
     }
 };
 
+fn checkHostError(err: Errors) !void {
+    inline for (@typeInfo(HostErrors).error_set.error_names.?) |name| {
+        if (err == @field(HostErrors, name)) return err;
+    }
+}
+
 // EIP-7702: resolve delegation designator one level deep. Pure lookup with no gas side effects.
 fn resolveCode(code_addr: u160, state: *State, comptime cfg: Config) !?Bytecode {
     const code_hash = (try state.accounts.read(code_addr)).code_hash;
@@ -1159,4 +1185,76 @@ pub fn computeLogsHash(allocator: std.mem.Allocator, logs: *const std.DoublyLink
     try rlp.serialize([]Log, allocator, log_list, &encoded);
 
     return keccak256(encoded.items);
+}
+
+test "effective gas price remains bounded when base fee plus priority overflows" {
+    var msg: Message = .{ .caller = 0, .nonce = 0, .target = 0, .gas_limit = 21_000, .calldata = &.{}, .value = 0 };
+    msg.max_fee_per_gas = 100;
+    msg.max_priority_fee_per_gas = std.math.maxInt(u256);
+    try std.testing.expectEqual(100, EVM.effectiveGasPrice(&msg, 1));
+    msg.max_fee_per_gas = std.math.maxInt(u256);
+    try std.testing.expectEqual(std.math.maxInt(u256), EVM.effectiveGasPrice(&msg, 1));
+    msg.max_priority_fee_per_gas = 2;
+    try std.testing.expectEqual(3, EVM.effectiveGasPrice(&msg, 1));
+    msg.max_fee_per_gas = null;
+    msg.gas_price = 7;
+    try std.testing.expectEqual(7, EVM.effectiveGasPrice(&msg, 1));
+}
+
+test "nested CALL and CREATE propagate missing host code instead of an EVM failure" {
+    const cfg: Config = .{ .fork = comptime Spec.fromFork(.Amsterdam) };
+    // CALL address 0x1234 with all available gas, then STOP.
+    const call_code = [_]u8{ 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x61, 0x12, 0x34, 0x5a, 0xf1, 0x00 };
+    inline for (.{ false, true }) |create| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const committed: @import("committed_state.zig").CommittedState = .{};
+        var state = try State.init(a, &committed, cfg.fork.stateCapacities(1_000_000));
+        var context = std.mem.zeroes(Context);
+        context.gas_limit = 1_000_000;
+        var vm = try EVM.init(a, &context, cfg.fork.evmCapacities());
+        // The account exists but its nonempty bytecode is unavailable to the host.
+        var missing_code = types.EmptyAccount;
+        missing_code.code_hash = @splat(0xaa);
+        _ = try state.accounts.write(0x1234, missing_code);
+        const hash = keccak256(&call_code);
+        try state.deploy_code(hash, &call_code, cfg);
+        var caller_contract = types.EmptyAccount;
+        caller_contract.code_hash = hash;
+        _ = try state.accounts.write(0x2345, caller_contract);
+        const calldata = try a.dupe(u8, &call_code);
+        const msg: Message = .{ .caller = 0x3456, .nonce = 0, .target = if (create) null else 0x2345, .gas_limit = 1_000_000, .gas_price = 0, .calldata = if (create) calldata else &.{}, .value = 0 };
+        try std.testing.expectError(error.NotFound, vm.process(cfg, &msg, &state));
+    }
+}
+
+test "transaction status distinguishes valid reverts and resets for subsequent transactions" {
+    const cfg: Config = .{ .fork = comptime Spec.fromFork(.Amsterdam) };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const committed: @import("committed_state.zig").CommittedState = .{};
+    var state = try State.init(a, &committed, cfg.fork.stateCapacities(1_000_000));
+    var context = std.mem.zeroes(Context);
+    context.gas_limit = 1_000_000;
+    var vm = try EVM.init(a, &context, cfg.fork.evmCapacities());
+    const code = [_]u8{ 0x5f, 0x5f, 0xfd };
+    const hash = keccak256(&code);
+    try state.deploy_code(hash, &code, cfg);
+    var contract = types.EmptyAccount;
+    contract.code_hash = hash;
+    _ = try state.accounts.write(0x1234, contract);
+    var msg: Message = .{ .caller = 0x3456, .nonce = 0, .target = 0x1234, .gas_limit = 1_000_000, .gas_price = 0, .calldata = &.{}, .value = 0 };
+    const reverted = try vm.process(cfg, &msg, &state);
+    try std.testing.expectEqual(error.Reverted, reverted.exec_error.?);
+    try std.testing.expect(reverted.gas_used > 0 and reverted.gas_used < msg.gas_limit);
+    try std.testing.expectEqual(1, (try state.accounts.read(msg.caller)).nonce);
+    vm.reset();
+    msg.nonce = 1;
+    msg.target = 0x5678;
+    const succeeded = try vm.process(cfg, &msg, &state);
+    try std.testing.expectEqual(null, succeeded.exec_error);
+    vm.reset();
+    try std.testing.expectError(error.NonceMismatch, vm.process(cfg, &msg, &state));
 }
