@@ -46,9 +46,9 @@ const Shared = struct {
     /// One entry per page. Pages are allocated lazily and never moved.
     pages: []?[]Slot,
     /// One bit per byte position, set when the position starts an instruction
-    /// (not PUSH data or a consumed Amsterdam immediate). Final for every
-    /// position below `frontier`.
-    boundaries: []u8,
+    /// (not PUSH data or a consumed Amsterdam immediate): position `pc` is bit
+    /// `pc % 64` of word `pc / 64`. Final for every position below `frontier`.
+    boundaries: []u64,
     /// Lowest byte position not yet classified in `boundaries`. Always an
     /// instruction boundary or at least `bytes.len`.
     frontier: usize,
@@ -73,7 +73,7 @@ pub fn init(gpa: std.mem.Allocator, bytes: []const u8, comptime cfg: Config) !By
     const pages = try gpa.alloc(?[]Slot, @max(1, (bytes.len + page_size - 1) / page_size));
     errdefer gpa.free(pages);
     @memset(pages, null);
-    const boundaries = try gpa.alloc(u8, (bytes.len + 7) / 8);
+    const boundaries = try gpa.alloc(u64, (bytes.len + 63) / 64);
     errdefer gpa.free(boundaries);
     @memset(boundaries, 0);
     shared.* = .{ .gpa = gpa, .pages = pages, .boundaries = boundaries, .frontier = 0 };
@@ -179,22 +179,39 @@ pub fn programCounter(self: *const Bytecode, ip: InstructionPointer) u64 {
 }
 
 fn isBoundary(self: *const Bytecode, pc: usize) bool {
-    return (self.shared.boundaries[pc >> 3] >> @intCast(pc & 7)) & 1 == 1;
+    return (self.shared.boundaries[pc / 64] >> @intCast(pc % 64)) & 1 == 1;
 }
 
 /// Classifies every position below `limit`, continuing the sequential scan
-/// from the frontier. Cost is linear in the newly scanned bytes.
+/// from the frontier. Cost is linear in the newly scanned bytes. The bits of
+/// one bitmap word are accumulated in a register and merged with a single OR
+/// once the scan leaves the word, so resuming inside a word keeps the bits set
+/// below the frontier. The scan may stop past `limit` when an immediate
+/// straddles it; the frontier then records that position.
 fn analyzeTo(self: *const Bytecode, limit: usize, comptime cfg: Config) void {
     const shared = self.shared;
     var pc = shared.frontier;
     const end = @min(limit, self.bytes.len);
-    if (pc >= end) return;
     while (pc < end) {
-        shared.boundaries[pc >> 3] |= @as(u8, 1) << @intCast(pc & 7);
-        pc += instructionLength(self.bytes, pc, cfg);
+        const index = pc / 64;
+        const word_end = @min(end, (index + 1) * 64);
+        var word: u64 = 0;
+        while (pc < word_end) {
+            word |= @as(u64, 1) << @intCast(pc % 64);
+            pc += instructionLength(self.bytes, pc, cfg);
+        }
+        shared.boundaries[index] |= word;
     }
     shared.frontier = pc;
 }
+
+const instruction_lengths: [256]u8 = blk: {
+    var lengths: [256]u8 = @splat(1);
+    for (Opcode.PUSH1.byte()..Opcode.PUSH32.byte() + 1) |op| {
+        lengths[op] = @intCast(op - Opcode.PUSH1.byte() + 2);
+    }
+    break :blk lengths;
+};
 
 /// Bytes consumed by the instruction starting at `pc`, matching the runtime
 /// advance of its handler: PUSH data, and under Amsterdam a valid DUPN/SWAPN/
@@ -202,14 +219,13 @@ fn analyzeTo(self: *const Bytecode, limit: usize, comptime cfg: Config) void {
 /// INVALID), and a missing immediate reads as zero at runtime.
 fn instructionLength(bytes: []const u8, pc: usize, comptime cfg: Config) usize {
     const op = bytes[pc];
-    switch (op) {
-        Opcode.PUSH1.byte()...Opcode.PUSH32.byte() => return op - Opcode.PUSH1.byte() + 2,
-        Opcode.DUPN.byte(), Opcode.SWAPN.byte(), Opcode.EXCHANGE.byte() => if (cfg.fork.isEnabled(.Amsterdam)) {
+    if (cfg.fork.isEnabled(.Amsterdam)) switch (op) {
+        Opcode.DUPN.byte(), Opcode.SWAPN.byte(), Opcode.EXCHANGE.byte() => {
             if (pc + 1 < bytes.len and !invalidImmediate(op, bytes[pc + 1])) return 2;
         },
         else => {},
-    }
-    return 1;
+    };
+    return instruction_lengths[op];
 }
 
 fn invalidImmediate(op: u8, imm: u8) bool {
@@ -476,4 +492,280 @@ test "page allocation failure is OutOfMemory, leaks nothing and leaves decoded p
     const ip = (try bytecode.isValidJumpDest(far_tail_pc, amsterdam)).?;
     try testing.expectEqual(far_tail_pc, bytecode.programCounter(ip));
     try testing.expectEqual(2, bytecode.decodedPages());
+}
+
+/// Independent restatement of the instruction length rules, used to
+/// cross-check the scan: PUSHn consumes n data bytes; under Amsterdam DUPN,
+/// SWAPN and EXCHANGE consume a present, valid immediate (EIP-663 reserves
+/// 0x5b..0x7f for DUPN/SWAPN and 0x52..0x7f for EXCHANGE).
+fn referenceLength(bytes: []const u8, pc: usize, comptime cfg: Config) usize {
+    const op = bytes[pc];
+    if (op >= 0x60 and op <= 0x7f) return @as(usize, op) - 0x60 + 2;
+    if (!cfg.fork.isEnabled(.Amsterdam) or pc + 1 >= bytes.len) return 1;
+    const imm = bytes[pc + 1];
+    return switch (op) {
+        0xe6, 0xe7 => if (imm >= 0x5b and imm <= 0x7f) 1 else 2,
+        0xe8 => if (imm >= 0x52 and imm <= 0x7f) 1 else 2,
+        else => 1,
+    };
+}
+
+/// Scalar reference scan: one bool per position, true where an instruction starts.
+fn referenceBoundaries(allocator: std.mem.Allocator, bytes: []const u8, comptime cfg: Config) ![]bool {
+    const marks = try allocator.alloc(bool, bytes.len);
+    @memset(marks, false);
+    var pc: usize = 0;
+    while (pc < bytes.len) : (pc += referenceLength(bytes, pc, cfg)) marks[pc] = true;
+    return marks;
+}
+
+/// Positions below the frontier must match `expected`; positions at or above
+/// it, and the padding bits of the last word, must be unmarked.
+fn expectBoundariesUpToFrontier(bytecode: *const Bytecode, expected: []const bool) !void {
+    const frontier = bytecode.shared.frontier;
+    for (expected, 0..) |mark, pc| {
+        const want = pc < frontier and mark;
+        if (bytecode.isBoundary(pc) != want) {
+            std.debug.print("position {d} with frontier {d}: expected boundary {}\n", .{ pc, frontier, want });
+            return error.TestExpectedEqual;
+        }
+    }
+    if (expected.len % 64 != 0) {
+        try testing.expectEqual(0, bytecode.shared.boundaries[expected.len / 64] >> @intCast(expected.len % 64));
+    }
+}
+
+/// Code generators for the randomized scans: uniform bytes; a scan-hostile mix
+/// of PUSH1, JUMPDEST, the Amsterdam immediate opcodes and their edge
+/// immediates; and PUSH32-heavy code where most positions are data.
+fn fillRandomCode(random: std.Random, code: []u8, flavor: usize) void {
+    switch (flavor) {
+        0 => random.bytes(code),
+        1 => for (code) |*byte| {
+            byte.* = switch (random.uintLessThan(u8, 12)) {
+                0...3 => Opcode.PUSH1.byte(),
+                4...6 => Opcode.JUMPDEST.byte(),
+                7 => Opcode.DUPN.byte(),
+                8 => Opcode.SWAPN.byte(),
+                9 => Opcode.EXCHANGE.byte(),
+                10 => 0x7f, // PUSH32, or the last invalid immediate
+                else => 0x52, // MSTORE, or the first EXCHANGE-only invalid immediate
+            };
+        },
+        else => for (code) |*byte| {
+            byte.* = if (random.uintLessThan(u8, 4) == 0) Opcode.PUSH32.byte() else Opcode.JUMPDEST.byte();
+        },
+    }
+}
+
+test "randomized code scans like the scalar reference at every offset and resume limit, for both forks" {
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x626f756e64617279);
+    const random = prng.random();
+    const edge_lengths = [_]usize{ 1, 2, 33, 63, 64, 65, 127, 128, 129, page_size - 1, page_size, page_size + 1, page_size + 33, 2 * page_size + 65 };
+    for (0..240) |round| {
+        const len = if (round < edge_lengths.len) edge_lengths[round] else random.intRangeLessThan(usize, 1, 3 * page_size + 70);
+        const code = try a.alloc(u8, len);
+        defer a.free(code);
+        fillRandomCode(random, code, round % 3);
+        inline for (.{ osaka, amsterdam }) |cfg| {
+            const expected = try referenceBoundaries(a, code, cfg);
+            defer a.free(expected);
+
+            // Monotonic resumes at random limits, including no-op limits below
+            // the frontier and limits past the end of the code.
+            var bytecode = try Bytecode.init(a, code, cfg);
+            defer bytecode.deinit(a);
+            try testing.expect(bytecode.shared.frontier >= @min(len, page_size));
+            try expectBoundariesUpToFrontier(&bytecode, expected);
+            var limit: usize = 0;
+            while (limit < len + 40) : (limit += random.intRangeLessThan(usize, 1, 70)) {
+                bytecode.analyzeTo(limit, cfg);
+                try testing.expect(bytecode.shared.frontier >= @min(limit, len));
+                try expectBoundariesUpToFrontier(&bytecode, expected);
+            }
+            bytecode.analyzeTo(len, cfg);
+            try testing.expect(bytecode.shared.frontier >= len);
+            for (0..len + 2) |pc| {
+                const valid = pc < len and expected[pc] and code[pc] == Opcode.JUMPDEST.byte();
+                try testing.expectEqual(valid, (try bytecode.isValidJumpDest(pc, cfg)) != null);
+            }
+
+            // Jumps in arbitrary order drive the scan through the public API.
+            var jumping = try Bytecode.init(a, code, cfg);
+            defer jumping.deinit(a);
+            for (0..64) |_| {
+                const pc = random.uintLessThan(usize, len + 2);
+                const valid = pc < len and expected[pc] and code[pc] == Opcode.JUMPDEST.byte();
+                try testing.expectEqual(valid, (try jumping.isValidJumpDest(pc, cfg)) != null);
+                try expectBoundariesUpToFrontier(&jumping, expected);
+            }
+        }
+    }
+}
+
+test "instruction lengths follow the PUSH and Amsterdam immediate rules exactly" {
+    // PUSH1..PUSH32 consume their data even when it is missing.
+    for (1..33) |n| {
+        const op: u8 = @intCast(Opcode.PUSH1.byte() + n - 1);
+        try testing.expectEqual(n + 1, instructionLength(&.{op}, 0, amsterdam));
+        try testing.expectEqual(n + 1, instructionLength(&.{op}, 0, osaka));
+    }
+    const dupn = Opcode.DUPN.byte();
+    const swapn = Opcode.SWAPN.byte();
+    const exchange = Opcode.EXCHANGE.byte();
+    // Valid immediates are consumed under Amsterdam only. The invalid range
+    // starts at 0x5b for DUPN/SWAPN and at 0x52 for EXCHANGE.
+    for ([_]u8{ 0x00, 0x51, 0x5a, 0x80, 0xff }) |imm| {
+        try testing.expectEqual(2, instructionLength(&.{ dupn, imm }, 0, amsterdam));
+        try testing.expectEqual(2, instructionLength(&.{ swapn, imm }, 0, amsterdam));
+        try testing.expectEqual(1, instructionLength(&.{ dupn, imm }, 0, osaka));
+        try testing.expectEqual(1, instructionLength(&.{ swapn, imm }, 0, osaka));
+    }
+    for ([_]u8{ 0x00, 0x51, 0x80, 0xff }) |imm| {
+        try testing.expectEqual(2, instructionLength(&.{ exchange, imm }, 0, amsterdam));
+        try testing.expectEqual(1, instructionLength(&.{ exchange, imm }, 0, osaka));
+    }
+    // Invalid immediates are left in place so the opcode decodes as INVALID.
+    for ([_]u8{ 0x5b, 0x60, 0x7f }) |imm| {
+        try testing.expectEqual(1, instructionLength(&.{ dupn, imm }, 0, amsterdam));
+        try testing.expectEqual(1, instructionLength(&.{ swapn, imm }, 0, amsterdam));
+        try testing.expectEqual(1, instructionLength(&.{ exchange, imm }, 0, amsterdam));
+    }
+    for ([_]u8{ 0x52, 0x5a }) |imm| {
+        try testing.expectEqual(1, instructionLength(&.{ exchange, imm }, 0, amsterdam));
+        try testing.expectEqual(2, instructionLength(&.{ dupn, imm }, 0, amsterdam));
+    }
+    // A missing immediate is not consumed.
+    try testing.expectEqual(1, instructionLength(&.{ Opcode.JUMPDEST.byte(), dupn }, 1, amsterdam));
+    try testing.expectEqual(1, instructionLength(&.{exchange}, 0, amsterdam));
+    // The reference used by the randomized test agrees for every opcode and immediate.
+    for (0..256) |op| for ([_]u8{ 0x00, 0x51, 0x52, 0x5a, 0x5b, 0x7f, 0x80, 0xff }) |imm| {
+        const pair = [_]u8{ @intCast(op), imm };
+        inline for (.{ osaka, amsterdam }) |cfg| {
+            try testing.expectEqual(referenceLength(&pair, 0, cfg), instructionLength(&pair, 0, cfg));
+            try testing.expectEqual(referenceLength(pair[0..1], 0, cfg), instructionLength(pair[0..1], 0, cfg));
+        }
+    };
+}
+
+test "resuming a scan inside a word keeps the bits set below the frontier" {
+    const a = testing.allocator;
+    // Page 1 is JUMPDESTs except a PUSH1 whose data byte opens word 5 and a
+    // PUSH32 whose data crosses from word 5 into word 6.
+    var code: [2 * page_size]u8 = @splat(Opcode.JUMPDEST.byte());
+    code[319] = Opcode.PUSH1.byte();
+    code[370] = Opcode.PUSH32.byte();
+    var bytecode = try Bytecode.init(a, &code, amsterdam);
+    defer bytecode.deinit(a);
+    const expected = try referenceBoundaries(a, &code, amsterdam);
+    defer a.free(expected);
+    try testing.expectEqual(page_size, bytecode.shared.frontier);
+
+    // Stop inside word 4, then resume inside it: bits 0..10 must survive.
+    bytecode.analyzeTo(267, amsterdam);
+    try testing.expectEqual(267, bytecode.shared.frontier);
+    try testing.expectEqual(0x7ff, bytecode.shared.boundaries[4]);
+    bytecode.analyzeTo(319, amsterdam);
+    try testing.expectEqual(319, bytecode.shared.frontier);
+    try testing.expectEqual(std.math.maxInt(u64) >> 1, bytecode.shared.boundaries[4]);
+    try expectBoundariesUpToFrontier(&bytecode, expected);
+    // The PUSH1 at 319 completes word 4 and overshoots the limit into word 5,
+    // whose first position is data, so nothing is written to word 5 yet.
+    bytecode.analyzeTo(320, amsterdam);
+    try testing.expectEqual(321, bytecode.shared.frontier);
+    try testing.expectEqual(std.math.maxInt(u64), bytecode.shared.boundaries[4]);
+    try testing.expectEqual(0, bytecode.shared.boundaries[5]);
+    // The data byte looks like a JUMPDEST but is rejected without decoding anything.
+    try testing.expectEqual(null, try bytecode.isValidJumpDest(320, amsterdam));
+    try testing.expectEqual(321, bytecode.shared.frontier);
+    try testing.expectEqual(1, bytecode.decodedPages());
+    bytecode.analyzeTo(322, amsterdam);
+    try testing.expectEqual(0b10, bytecode.shared.boundaries[5]);
+    // A limit inside PUSH32 data: the scan runs to the instruction after it,
+    // leaving word 6 untouched because that instruction is not marked yet.
+    bytecode.analyzeTo(373, amsterdam);
+    try testing.expectEqual(403, bytecode.shared.frontier);
+    try testing.expectEqual(((@as(u64, 1) << 51) - 1) & ~@as(u64, 1), bytecode.shared.boundaries[5]);
+    try testing.expectEqual(0, bytecode.shared.boundaries[6]);
+    try expectBoundariesUpToFrontier(&bytecode, expected);
+    try testing.expectEqual(null, try bytecode.isValidJumpDest(372, amsterdam));
+    // A valid jump decodes page 1, which completes the scan of the page.
+    try testing.expect((try bytecode.isValidJumpDest(403, amsterdam)) != null);
+    try testing.expectEqual(2, bytecode.decodedPages());
+    try testing.expectEqual(2 * page_size, bytecode.shared.frontier);
+    try testing.expectEqual(std.math.maxInt(u64), bytecode.shared.boundaries[7]);
+    try expectBoundariesUpToFrontier(&bytecode, expected);
+    try testing.expect((try bytecode.isValidJumpDest(2 * page_size - 1, amsterdam)) != null);
+}
+
+test "a truncated PUSH leaves its data unmarked and parks the frontier past the code" {
+    const a = testing.allocator;
+    for ([_]usize{ 1, 4, 7, 63, 64, 65, 200, page_size + 1 }) |len| {
+        const code = try a.alloc(u8, len);
+        defer a.free(code);
+        @memset(code, Opcode.JUMPDEST.byte());
+        const push = len -| 4;
+        code[push] = Opcode.PUSH32.byte();
+        inline for (.{ osaka, amsterdam }) |cfg| {
+            var bytecode = try Bytecode.init(a, code, cfg);
+            defer bytecode.deinit(a);
+            const expected = try referenceBoundaries(a, code, cfg);
+            defer a.free(expected);
+            try testing.expectEqual(push + 33, bytecode.shared.frontier);
+            try expectBoundariesUpToFrontier(&bytecode, expected);
+            for (push + 1..len) |pc| try testing.expectEqual(null, try bytecode.isValidJumpDest(pc, cfg));
+            // Further limits, including far past the code, change nothing.
+            bytecode.analyzeTo(len + 1000, cfg);
+            bytecode.analyzeTo(std.math.maxInt(usize), cfg);
+            try testing.expectEqual(push + 33, bytecode.shared.frontier);
+            try expectBoundariesUpToFrontier(&bytecode, expected);
+        }
+    }
+}
+
+test "short final words are fully marked without touching padding bits" {
+    const a = testing.allocator;
+    for ([_]usize{ 1, 7, 8, 9, 63, 64, 65, 127, 128, 129, 255, 256, 257, 300, 2 * page_size + 63 }) |len| {
+        const code = try a.alloc(u8, len);
+        defer a.free(code);
+        @memset(code, Opcode.JUMPDEST.byte());
+        var bytecode = try Bytecode.init(a, code, amsterdam);
+        defer bytecode.deinit(a);
+        try testing.expectEqual((len + 63) / 64, bytecode.shared.boundaries.len);
+        try testing.expect((try bytecode.isValidJumpDest(len - 1, amsterdam)) != null);
+        try testing.expectEqual(len, bytecode.shared.frontier);
+        for (0..len) |pc| try testing.expect(bytecode.isBoundary(pc));
+        const last = bytecode.shared.boundaries[bytecode.shared.boundaries.len - 1];
+        const used = len % 64;
+        try testing.expectEqual(if (used == 0) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(used)) - 1, last);
+    }
+}
+
+test "scans resume across page boundaries after immediates overshoot them" {
+    const a = testing.allocator;
+    var code: [3 * page_size]u8 = @splat(Opcode.JUMPDEST.byte());
+    code[page_size - 1] = Opcode.PUSH32.byte();
+    code[2 * page_size - 1] = Opcode.PUSH1.byte();
+    var bytecode = try Bytecode.init(a, &code, amsterdam);
+    defer bytecode.deinit(a);
+    const expected = try referenceBoundaries(a, &code, amsterdam);
+    defer a.free(expected);
+    // Decoding page 0 scanned through the PUSH32 data in page 1.
+    try testing.expectEqual(page_size + 32, bytecode.shared.frontier);
+    try testing.expectEqual(1, bytecode.decodedPages());
+    try expectBoundariesUpToFrontier(&bytecode, expected);
+    for (page_size..page_size + 32) |pc| try testing.expectEqual(null, try bytecode.isValidJumpDest(pc, amsterdam));
+    try testing.expectEqual(1, bytecode.decodedPages());
+    // Activating page 1 scans it completely; its last PUSH1 overshoots into page 2.
+    try testing.expect((try bytecode.isValidJumpDest(page_size + 32, amsterdam)) != null);
+    try testing.expectEqual(2, bytecode.decodedPages());
+    try testing.expectEqual(2 * page_size + 1, bytecode.shared.frontier);
+    try expectBoundariesUpToFrontier(&bytecode, expected);
+    try testing.expectEqual(null, try bytecode.isValidJumpDest(2 * page_size, amsterdam));
+    try testing.expectEqual(2, bytecode.decodedPages());
+    try testing.expect((try bytecode.isValidJumpDest(2 * page_size + 1, amsterdam)) != null);
+    try testing.expectEqual(3, bytecode.decodedPages());
+    try testing.expectEqual(3 * page_size, bytecode.shared.frontier);
+    try expectBoundariesUpToFrontier(&bytecode, expected);
 }
