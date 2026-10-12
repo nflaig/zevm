@@ -344,9 +344,6 @@ pub const EVM = struct {
     pub fn effectiveGasPrice(msg: *const Message, basefee: u256) u256 {
         const priority = msg.max_priority_fee_per_gas orelse 0;
         return if (msg.max_fee_per_gas) |mfpg|
-            // The mathematical sum may exceed u256, but the
-            // effective price is bounded by maxFeePerGas. Saturation is exact
-            // after min() and lets invalid extreme fees reach validation.
             @min(mfpg, basefee +| priority)
         else
             msg.gas_price orelse 0;
