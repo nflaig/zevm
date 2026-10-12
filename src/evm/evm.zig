@@ -248,11 +248,6 @@ pub const EVM = struct {
     state_gas_reservoir: u64,
     state_gas_used: i64 = 0,
 
-    /// Execution status and charged gas after a successful process() return.
-    /// Transaction-validation and host failures still use the error return.
-    last_tx_error: ?Errors = null,
-    last_tx_gas_used: u64 = 0,
-
     pub fn init(
         gpa: std.mem.Allocator,
         context: *const Context,
@@ -371,9 +366,20 @@ pub const EVM = struct {
         return .{ 0, 0 };
     }
 
-    pub fn process(self: *Self, comptime cfg: Config, msg: *const Message, state: *State) !struct { u64, u64 } {
-        self.last_tx_error = null;
-        self.last_tx_gas_used = 0;
+    // Outcome of a transaction that is included in the block
+    pub const TxResult = struct {
+        // Gas counted against the block gas limit
+        regular_gas: u64,
+        state_gas: u64,
+        // Gas the sender paid for
+        gas_used: u64,
+        // null if execution succeeded, otherwise the EVM error that failed it
+        exec_error: ?Errors,
+    };
+
+    // Executes the transaction and returns an error only if it can't be included in the block,
+    // either because it is invalid or because of a host failure
+    pub fn process(self: *Self, comptime cfg: Config, msg: *const Message, state: *State) !TxResult {
         self.msg = msg;
         self.effective_gas_price = effectiveGasPrice(msg, self.context.basefee);
 
@@ -484,6 +490,7 @@ pub const EVM = struct {
         var state_gas_spillover: u64 = 0;
         var create_state_gas: u64 = 0;
         var err: ?Errors = null;
+        var exec_error: ?Errors = null;
         if (msg.target) |target| {
             if (self.prepareDispatch(cfg, state, msg, target, remaining_gas, state_gas_spillover)) |prep| {
                 remaining_gas, create_state_gas, state_gas_spillover = prep;
@@ -524,11 +531,11 @@ pub const EVM = struct {
                 state_gas_spillover += create_spillover;
             } else |_| {
                 remaining_gas = 0;
-                self.last_tx_error = Errors.OutOfGas;
+                exec_error = Errors.OutOfGas;
             }
         }
-        if (err) |e| self.last_tx_error = e;
         if (err) |e| {
+            exec_error = e;
             remaining_gas, state_gas_spillover = self.creditStateGasRefund(remaining_gas, state_gas_spillover, create_state_gas);
             if (e != Errors.Reverted) remaining_gas = 0;
         }
@@ -551,7 +558,6 @@ pub const EVM = struct {
         // EIP-1559: coinbase receives only the tip; the base fee is burned
         const tip = self.effective_gas_price - self.context.basefee;
         const gas_used = msg.gas_limit - remaining_gas;
-        self.last_tx_gas_used = gas_used;
         if (tip > 0) {
             (try state.accounts.update(self.context.coinbase)).balance += @as(u256, @intCast(gas_used)) * tip;
         } else {
@@ -562,9 +568,9 @@ pub const EVM = struct {
         if (cfg.fork.isEnabled(.Amsterdam)) {
             const state_gas: u64 = @intCast(@max(@as(i64, 0), self.state_gas_used));
             const regular_gas = gas_used_before_refund - state_gas;
-            return .{ @max(regular_gas, floor_cost), state_gas };
+            return .{ .regular_gas = @max(regular_gas, floor_cost), .state_gas = state_gas, .gas_used = gas_used, .exec_error = exec_error };
         }
-        return .{ gas_used, 0 };
+        return .{ .regular_gas = gas_used, .state_gas = 0, .gas_used = gas_used, .exec_error = exec_error };
     }
 
     pub fn baseIntrinsicRegular(comptime cfg: Config, msg: *const Message) u64 {
@@ -1240,16 +1246,15 @@ test "transaction status distinguishes valid reverts and resets for subsequent t
     contract.code_hash = hash;
     _ = try state.accounts.write(0x1234, contract);
     var msg: Message = .{ .caller = 0x3456, .nonce = 0, .target = 0x1234, .gas_limit = 1_000_000, .gas_price = 0, .calldata = &.{}, .value = 0 };
-    _ = try vm.process(cfg, &msg, &state);
-    try std.testing.expectEqual(error.Reverted, vm.last_tx_error.?);
-    try std.testing.expect(vm.last_tx_gas_used > 0 and vm.last_tx_gas_used < msg.gas_limit);
+    const reverted = try vm.process(cfg, &msg, &state);
+    try std.testing.expectEqual(error.Reverted, reverted.exec_error.?);
+    try std.testing.expect(reverted.gas_used > 0 and reverted.gas_used < msg.gas_limit);
     try std.testing.expectEqual(1, (try state.accounts.read(msg.caller)).nonce);
     vm.reset();
     msg.nonce = 1;
     msg.target = 0x5678;
-    _ = try vm.process(cfg, &msg, &state);
-    try std.testing.expectEqual(null, vm.last_tx_error);
+    const succeeded = try vm.process(cfg, &msg, &state);
+    try std.testing.expectEqual(null, succeeded.exec_error);
     vm.reset();
     try std.testing.expectError(error.NonceMismatch, vm.process(cfg, &msg, &state));
-    try std.testing.expectEqual(0, vm.last_tx_gas_used);
 }

@@ -113,9 +113,9 @@ pub fn processBlock(
             if (msg.gas_limit > p_block.block.header.gas_limit - block_state_used) return Errors.InsufficientGas;
         }
 
-        const tx_regular, const tx_state = try vm.process(.{ .fork = evm_spec }, &msg, state);
-        block_regular_used += tx_regular;
-        block_state_used += tx_state;
+        const result = try vm.process(.{ .fork = evm_spec }, &msg, state);
+        block_regular_used += result.regular_gas;
+        block_state_used += result.state_gas;
 
         const blobs_used = switch (tx.*) {
             .blob => |t| t.blob_hashes.len,
