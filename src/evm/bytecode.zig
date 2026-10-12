@@ -19,6 +19,11 @@
 //! regions are added. Page allocation failure is reported as `OutOfMemory`
 //! and leaves the shared metadata and all existing pages usable.
 //!
+//! A host that keeps a complete `Analysis` of the code can lend it through
+//! `initWithAnalysis`. The bitmap is then borrowed immutably, no position is
+//! ever scanned, and `deinit` leaves the bitmap to its owner. Pages stay
+//! per-value and lazily decoded either way.
+//!
 //! The shared metadata is mutated without synchronization: every copy of a
 //! value must be used from the thread that owns the `State` it came from.
 const std = @import("std");
@@ -48,11 +53,82 @@ const Shared = struct {
     /// One bit per byte position, set when the position starts an instruction
     /// (not PUSH data or a consumed Amsterdam immediate): position `pc` is bit
     /// `pc % 64` of word `pc / 64`. Final for every position below `frontier`.
-    boundaries: []u64,
+    /// Either the memory of `owned_boundaries` or borrowed from an `Analysis`.
+    boundaries: []const u64,
+    /// The bitmap this value allocated and fills lazily, freed by `deinit`;
+    /// null when `boundaries` is a complete bitmap borrowed from an `Analysis`.
+    owned_boundaries: ?[]u64,
     /// Lowest byte position not yet classified in `boundaries`. Always an
     /// instruction boundary or at least `bytes.len`.
     frontier: usize,
 };
+
+/// Instruction-length rule the boundary scan follows. Only this rule, not the
+/// whole fork, decides which positions start instructions, so an `Analysis`
+/// is valid for every fork that shares its rule.
+pub const ImmediateRule = enum {
+    /// Only PUSH1..PUSH32 carry immediates.
+    push_only,
+    /// Amsterdam additionally consumes a valid DUPN/SWAPN/EXCHANGE immediate.
+    amsterdam,
+
+    pub fn of(comptime cfg: Config) ImmediateRule {
+        return if (cfg.fork.isEnabled(.Amsterdam)) .amsterdam else .push_only;
+    }
+};
+
+/// Complete, immutable instruction-boundary bitmap of one contract, produced by
+/// the same scanner `init` runs lazily. A host can keep one per code hash and
+/// lend it to `initWithAnalysis`, so frames executing that code never scan.
+///
+/// The analysis describes only the bytes it was computed from: the host must
+/// key it by code hash, because code of equal length with different bytes has
+/// a different bitmap, and must keep it alive and unchanged while any
+/// `Bytecode` borrowing it, or any copy of such a value, exists. `Bytecode`
+/// never frees it.
+pub const Analysis = struct {
+    /// Bitmap in the layout of `Shared.boundaries`: `(code_len + 63) / 64`
+    /// words, with the padding bits of the last word clear.
+    boundaries: []const u64,
+    /// Length of the analyzed code.
+    code_len: usize,
+    /// Rule the scan followed; see `ImmediateRule`.
+    immediate_rule: ImmediateRule,
+
+    /// Scans all of `bytes`. Allocates exactly the bitmap, which `deinit`
+    /// frees; `bytes` is not retained.
+    pub fn init(gpa: std.mem.Allocator, bytes: []const u8, comptime cfg: Config) std.mem.Allocator.Error!Analysis {
+        const boundaries = try gpa.alloc(u64, boundaryWords(bytes.len));
+        @memset(boundaries, 0);
+        const frontier = scanBoundaries(bytes, boundaries, 0, bytes.len, cfg);
+        std.debug.assert(frontier >= bytes.len);
+        return .{ .boundaries = boundaries, .code_len = bytes.len, .immediate_rule = ImmediateRule.of(cfg) };
+    }
+
+    /// Frees the bitmap. No `Bytecode` borrowing this analysis may remain.
+    pub fn deinit(self: *const Analysis, gpa: std.mem.Allocator) void {
+        gpa.free(self.boundaries);
+    }
+
+    /// Whether `initWithAnalysis` borrows this analysis for `code_len` bytes
+    /// decoded under `cfg`.
+    pub fn isCompatible(self: *const Analysis, code_len: usize, comptime cfg: Config) bool {
+        return self.code_len == code_len and
+            self.immediate_rule == ImmediateRule.of(cfg) and
+            self.boundaries.len == boundaryWords(code_len);
+    }
+};
+
+fn boundaryWords(code_len: usize) usize {
+    return (code_len + 63) / 64;
+}
+
+/// Bitmap of `analysis` if it may stand in for a scan of `code_len` bytes
+/// under `cfg`.
+fn compatibleBitmap(analysis: ?*const Analysis, code_len: usize, comptime cfg: Config) ?[]const u64 {
+    const candidate = analysis orelse return null;
+    return if (candidate.isCompatible(code_len, cfg)) candidate.boundaries else null;
+}
 
 // Raw bytecode of the contract
 bytes: []const u8,
@@ -68,15 +144,31 @@ shared: *Shared,
 /// Creates a new Bytecode. Only the first page is decoded; the boundary bitmap
 /// is sized for the whole code but filled lazily.
 pub fn init(gpa: std.mem.Allocator, bytes: []const u8, comptime cfg: Config) !Bytecode {
+    return initWithAnalysis(gpa, bytes, cfg, null);
+}
+
+/// Like `init`, but borrows the bitmap of `analysis` when it was computed for
+/// code of this length under the immediate rule of `cfg` (see `Analysis` for
+/// what the caller guarantees), so the scan is complete from the start. An
+/// absent or incompatible analysis yields an ordinary owned, lazily filled
+/// bitmap. On failure nothing stays allocated and the analysis is untouched.
+pub fn initWithAnalysis(gpa: std.mem.Allocator, bytes: []const u8, comptime cfg: Config, analysis: ?*const Analysis) !Bytecode {
     const shared = try gpa.create(Shared);
     errdefer gpa.destroy(shared);
     const pages = try gpa.alloc(?[]Slot, @max(1, (bytes.len + page_size - 1) / page_size));
     errdefer gpa.free(pages);
     @memset(pages, null);
-    const boundaries = try gpa.alloc(u64, (bytes.len + 63) / 64);
-    errdefer gpa.free(boundaries);
-    @memset(boundaries, 0);
-    shared.* = .{ .gpa = gpa, .pages = pages, .boundaries = boundaries, .frontier = 0 };
+    shared.* = .{ .gpa = gpa, .pages = pages, .boundaries = &.{}, .owned_boundaries = null, .frontier = 0 };
+    if (compatibleBitmap(analysis, bytes.len, cfg)) |borrowed| {
+        shared.boundaries = borrowed;
+        shared.frontier = bytes.len;
+    } else {
+        const boundaries = try gpa.alloc(u64, boundaryWords(bytes.len));
+        @memset(boundaries, 0);
+        shared.boundaries = boundaries;
+        shared.owned_boundaries = boundaries;
+    }
+    errdefer if (shared.owned_boundaries) |boundaries| gpa.free(boundaries);
 
     var self: Bytecode = .{ .bytes = bytes, .threaded_code = &.{}, .page_base = 0, .shared = shared };
     self.threaded_code = @ptrCast(try self.decodePage(0, cfg));
@@ -84,14 +176,21 @@ pub fn init(gpa: std.mem.Allocator, bytes: []const u8, comptime cfg: Config) !By
 }
 
 /// Frees all pages and metadata. `gpa` must be the allocator given to `init`.
-/// Every copy of this value becomes invalid.
+/// Every copy of this value becomes invalid. A borrowed `Analysis` bitmap is
+/// left to its owner.
 pub fn deinit(self: *const Bytecode, gpa: std.mem.Allocator) void {
     const shared = self.shared;
     std.debug.assert(std.meta.eql(gpa, shared.gpa));
     for (shared.pages) |maybe_page| if (maybe_page) |page| gpa.free(page);
     gpa.free(shared.pages);
-    gpa.free(shared.boundaries);
+    if (shared.owned_boundaries) |boundaries| gpa.free(boundaries);
     gpa.destroy(shared);
+}
+
+/// Whether the boundary bitmap is borrowed from an `Analysis` rather than
+/// owned and scanned lazily.
+pub fn borrowsAnalysis(self: *const Bytecode) bool {
+    return self.shared.owned_boundaries == null;
 }
 
 /// Instruction pointer for byte offset 0. Resets this copy's view to the first
@@ -183,26 +282,37 @@ fn isBoundary(self: *const Bytecode, pc: usize) bool {
 }
 
 /// Classifies every position below `limit`, continuing the sequential scan
-/// from the frontier. Cost is linear in the newly scanned bytes. The bits of
-/// one bitmap word are accumulated in a register and merged with a single OR
-/// once the scan leaves the word, so resuming inside a word keeps the bits set
-/// below the frontier. The scan may stop past `limit` when an immediate
-/// straddles it; the frontier then records that position.
+/// from the frontier. A borrowed bitmap is complete, so its frontier never
+/// admits a scan.
 fn analyzeTo(self: *const Bytecode, limit: usize, comptime cfg: Config) void {
     const shared = self.shared;
-    var pc = shared.frontier;
-    const end = @min(limit, self.bytes.len);
+    if (shared.frontier >= @min(limit, self.bytes.len)) return;
+    const boundaries = shared.owned_boundaries orelse unreachable;
+    shared.frontier = scanBoundaries(self.bytes, boundaries, shared.frontier, limit, cfg);
+}
+
+/// The scanner behind both the lazy `analyzeTo` and `Analysis.init`: marks
+/// every instruction start from `frontier` below `limit`, continuing the
+/// sequential walk, and returns the new frontier. Cost is linear in the newly
+/// scanned bytes. The bits of one bitmap word are accumulated in a register
+/// and merged with a single OR once the scan leaves the word, so resuming
+/// inside a word keeps the bits set below the frontier. The scan may stop past
+/// `limit` when an immediate straddles it; the returned frontier records that
+/// position.
+fn scanBoundaries(bytes: []const u8, boundaries: []u64, frontier: usize, limit: usize, comptime cfg: Config) usize {
+    var pc = frontier;
+    const end = @min(limit, bytes.len);
     while (pc < end) {
         const index = pc / 64;
         const word_end = @min(end, (index + 1) * 64);
         var word: u64 = 0;
         while (pc < word_end) {
             word |= @as(u64, 1) << @intCast(pc % 64);
-            pc += instructionLength(self.bytes, pc, cfg);
+            pc += instructionLength(bytes, pc, cfg);
         }
-        shared.boundaries[index] |= word;
+        boundaries[index] |= word;
     }
-    shared.frontier = pc;
+    return pc;
 }
 
 const instruction_lengths: [256]u8 = blk: {
@@ -216,15 +326,19 @@ const instruction_lengths: [256]u8 = blk: {
 /// Bytes consumed by the instruction starting at `pc`, matching the runtime
 /// advance of its handler: PUSH data, and under Amsterdam a valid DUPN/SWAPN/
 /// EXCHANGE immediate. An invalid immediate is not consumed (the opcode becomes
-/// INVALID), and a missing immediate reads as zero at runtime.
+/// INVALID), and a missing immediate reads as zero at runtime. Every rule the
+/// scan depends on is keyed through `ImmediateRule`, which `Analysis` records.
 fn instructionLength(bytes: []const u8, pc: usize, comptime cfg: Config) usize {
     const op = bytes[pc];
-    if (cfg.fork.isEnabled(.Amsterdam)) switch (op) {
-        Opcode.DUPN.byte(), Opcode.SWAPN.byte(), Opcode.EXCHANGE.byte() => {
-            if (pc + 1 < bytes.len and !invalidImmediate(op, bytes[pc + 1])) return 2;
+    switch (comptime ImmediateRule.of(cfg)) {
+        .amsterdam => switch (op) {
+            Opcode.DUPN.byte(), Opcode.SWAPN.byte(), Opcode.EXCHANGE.byte() => {
+                if (pc + 1 < bytes.len and !invalidImmediate(op, bytes[pc + 1])) return 2;
+            },
+            else => {},
         },
-        else => {},
-    };
+        .push_only => {},
+    }
     return instruction_lengths[op];
 }
 
@@ -293,12 +407,30 @@ fn farJumpCode(allocator: std.mem.Allocator, tail: []const u8) ![]u8 {
     return code;
 }
 
-/// Replaces the filler PUSH32 word containing `pc` with STOPs and plants
-/// `routine` at `pc`, so that `pc` is an instruction boundary.
+/// Replaces the filler PUSH32 words touched by `pc .. pc + routine.len` with
+/// STOPs and plants `routine` at `pc`, so that `pc` is an instruction boundary.
 fn plantRoutine(code: []u8, pc: usize, routine: []const u8) void {
-    const word = 4 + ((pc - 4) / 33) * 33;
-    @memset(code[word .. word + 33], Opcode.STOP.byte());
+    const first = 4 + ((pc - 4) / 33) * 33;
+    const last = 4 + ((pc + routine.len - 1 - 4) / 33) * 33;
+    @memset(code[first .. last + 33], Opcode.STOP.byte());
     @memcpy(code[pc .. pc + routine.len], routine);
+}
+
+/// One JUMPDEST, then `op imm JUMPDEST` for every immediate opcode and edge
+/// immediate, so that each JUMPDEST is a boundary only if the immediate was
+/// classified right, then a PUSH1 whose data byte looks like JUMPDEST.
+fn immediateRoutine() [68]u8 {
+    var routine: [68]u8 = undefined;
+    routine[0] = Opcode.JUMPDEST.byte();
+    var cursor: usize = 1;
+    for ([_]u8{ Opcode.DUPN.byte(), Opcode.SWAPN.byte(), Opcode.EXCHANGE.byte() }) |op| {
+        for ([_]u8{ 0x00, 0x51, 0x52, 0x5a, 0x5b, 0x7f, 0x80 }) |imm| {
+            @memcpy(routine[cursor .. cursor + 3], &[_]u8{ op, imm, Opcode.JUMPDEST.byte() });
+            cursor += 3;
+        }
+    }
+    @memcpy(routine[cursor..], &[_]u8{ Opcode.PUSH1.byte(), Opcode.JUMPDEST.byte(), Opcode.JUMPDEST.byte(), Opcode.STOP.byte() });
+    return routine;
 }
 
 fn handler(comptime cfg: Config, comptime op: Opcode) ?ops.FnOpaquePtr {
@@ -463,6 +595,16 @@ test "empty code decodes a single page of STOP slots" {
     try testing.expectEqual(handler(amsterdam, .STOP), bytecode.entry()[0]);
     try testing.expectEqual(null, try bytecode.isValidJumpDest(0, amsterdam));
     try testing.expectEqual(0, bytecode.readByte(bytecode.entry()));
+    // An empty analysis has no words and is borrowed like any other.
+    const analysis = try Analysis.init(a, &.{}, amsterdam);
+    defer analysis.deinit(a);
+    try testing.expectEqual(0, analysis.boundaries.len);
+    var borrowed = try Bytecode.initWithAnalysis(a, &.{}, amsterdam, &analysis);
+    defer borrowed.deinit(a);
+    try testing.expect(borrowed.borrowsAnalysis());
+    try testing.expectEqual(page_tail, borrowed.threaded_code.len);
+    try testing.expectEqual(handler(amsterdam, .STOP), borrowed.entry()[0]);
+    try testing.expectEqual(null, try borrowed.isValidJumpDest(0, amsterdam));
 }
 
 fn activateTail(allocator: std.mem.Allocator, code: []const u8) !void {
@@ -586,10 +728,20 @@ test "randomized code scans like the scalar reference at every offset and resume
             }
             bytecode.analyzeTo(len, cfg);
             try testing.expect(bytecode.shared.frontier >= len);
+            // A one-shot analysis is bit-identical to the completed lazy scan,
+            // and a value borrowing it validates jumps identically.
+            const analysis = try Analysis.init(a, code, cfg);
+            defer analysis.deinit(a);
+            try testing.expectEqualSlices(u64, bytecode.shared.boundaries, analysis.boundaries);
+            var borrowed = try Bytecode.initWithAnalysis(a, code, cfg, &analysis);
+            defer borrowed.deinit(a);
+            try testing.expect(borrowed.borrowsAnalysis());
             for (0..len + 2) |pc| {
                 const valid = pc < len and expected[pc] and code[pc] == Opcode.JUMPDEST.byte();
                 try testing.expectEqual(valid, (try bytecode.isValidJumpDest(pc, cfg)) != null);
+                try testing.expectEqual(valid, (try borrowed.isValidJumpDest(pc, cfg)) != null);
             }
+            try testing.expectEqual(len, borrowed.shared.frontier);
 
             // Jumps in arbitrary order drive the scan through the public API.
             var jumping = try Bytecode.init(a, code, cfg);
@@ -720,6 +872,10 @@ test "a truncated PUSH leaves its data unmarked and parks the frontier past the 
             bytecode.analyzeTo(std.math.maxInt(usize), cfg);
             try testing.expectEqual(push + 33, bytecode.shared.frontier);
             try expectBoundariesUpToFrontier(&bytecode, expected);
+            // The one-shot scan overshoots the same way and leaves the data unmarked.
+            const analysis = try Analysis.init(a, code, cfg);
+            defer analysis.deinit(a);
+            try testing.expectEqualSlices(u64, bytecode.shared.boundaries, analysis.boundaries);
         }
     }
 }
@@ -739,6 +895,9 @@ test "short final words are fully marked without touching padding bits" {
         const last = bytecode.shared.boundaries[bytecode.shared.boundaries.len - 1];
         const used = len % 64;
         try testing.expectEqual(if (used == 0) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(used)) - 1, last);
+        const analysis = try Analysis.init(a, code, amsterdam);
+        defer analysis.deinit(a);
+        try testing.expectEqualSlices(u64, bytecode.shared.boundaries, analysis.boundaries);
     }
 }
 
@@ -768,4 +927,219 @@ test "scans resume across page boundaries after immediates overshoot them" {
     try testing.expectEqual(3, bytecode.decodedPages());
     try testing.expectEqual(3 * page_size, bytecode.shared.frontier);
     try expectBoundariesUpToFrontier(&bytecode, expected);
+}
+
+/// Bitmap in the `Shared.boundaries` layout for the scalar reference scan.
+fn referenceBitmap(allocator: std.mem.Allocator, bytes: []const u8, comptime cfg: Config) ![]u64 {
+    const marks = try referenceBoundaries(allocator, bytes, cfg);
+    defer allocator.free(marks);
+    const words = try allocator.alloc(u64, boundaryWords(bytes.len));
+    @memset(words, 0);
+    for (marks, 0..) |mark, pc| {
+        if (mark) words[pc / 64] |= @as(u64, 1) << @intCast(pc % 64);
+    }
+    return words;
+}
+
+/// Page `index` of `bytecode`, decoded on demand without changing any view.
+fn decodedPage(bytecode: *const Bytecode, index: usize, comptime cfg: Config) ![]Slot {
+    return bytecode.shared.pages[index] orelse try bytecode.decodePage(index, cfg);
+}
+
+fn expectEqualPages(expected: []const Slot, actual: []const Slot) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual, 0..) |want, got, slot| {
+        if (!std.meta.eql(want, got)) {
+            std.debug.print("slot {d} differs\n", .{slot});
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+/// Decodes every page of both values and checks that they are slot-for-slot
+/// identical, that the completed bitmaps agree, and that every position agrees
+/// on jump validity and absolute program counter.
+fn expectEquivalentDecoding(reference: *Bytecode, candidate: *Bytecode, comptime cfg: Config) !void {
+    try testing.expectEqual(reference.shared.pages.len, candidate.shared.pages.len);
+    for (0..reference.shared.pages.len) |index| {
+        try expectEqualPages(try decodedPage(reference, index, cfg), try decodedPage(candidate, index, cfg));
+    }
+    try testing.expectEqualSlices(u64, reference.shared.boundaries, candidate.shared.boundaries);
+    for (0..reference.bytes.len + 2) |pc| {
+        const want = try reference.isValidJumpDest(pc, cfg);
+        const got = try candidate.isValidJumpDest(pc, cfg);
+        try testing.expectEqual(want == null, got == null);
+        if (want) |ip| try testing.expectEqual(reference.programCounter(ip), candidate.programCounter(got.?));
+    }
+}
+
+test "a borrowed analysis decodes exactly like an owned scan for both forks" {
+    const a = testing.allocator;
+    // 64 KiB: a far jump to the tail, every immediate rule straddling bitmap
+    // words in the middle, and PUSH data crossing the page boundary at 0x8000.
+    const code = try farJumpCode(a, &.{ Opcode.JUMPDEST.byte(), Opcode.PC.byte(), Opcode.STOP.byte() });
+    defer a.free(code);
+    const routine = immediateRoutine();
+    plantRoutine(code, 0x4000 + 61, &routine);
+    plantRoutine(code, 0x8000 - 1, &[_]u8{ Opcode.PUSH1.byte(), Opcode.JUMPDEST.byte(), Opcode.JUMPDEST.byte() });
+    inline for (.{ osaka, amsterdam }) |cfg| {
+        const analysis = try Analysis.init(a, code, cfg);
+        defer analysis.deinit(a);
+        const expected = try referenceBitmap(a, code, cfg);
+        defer a.free(expected);
+        try testing.expectEqualSlices(u64, expected, analysis.boundaries);
+        try testing.expectEqual(code.len, analysis.code_len);
+        try testing.expectEqual(ImmediateRule.of(cfg), analysis.immediate_rule);
+        try testing.expect(analysis.isCompatible(code.len, cfg));
+
+        var owned = try Bytecode.init(a, code, cfg);
+        defer owned.deinit(a);
+        var borrowed = try Bytecode.initWithAnalysis(a, code, cfg, &analysis);
+        defer borrowed.deinit(a);
+        try testing.expect(!owned.borrowsAnalysis());
+        try testing.expect(borrowed.borrowsAnalysis());
+        try testing.expectEqual(analysis.boundaries.ptr, borrowed.shared.boundaries.ptr);
+        try testing.expectEqual(code.len, borrowed.shared.frontier);
+        try testing.expectEqual(1, borrowed.decodedPages());
+        // The far JUMPDEST is accepted and PUSH data rejected without any
+        // scan: the frontier never moves and only the target page is decoded.
+        try testing.expect((try borrowed.isValidJumpDest(far_tail_pc, cfg)) != null);
+        try testing.expectEqual(null, try borrowed.isValidJumpDest(5, cfg));
+        try testing.expectEqual(null, try borrowed.isValidJumpDest(0x8000, cfg));
+        try testing.expect((try borrowed.isValidJumpDest(0x8001, cfg)) != null);
+        try testing.expectEqual(code.len, borrowed.shared.frontier);
+        try testing.expectEqual(3, borrowed.decodedPages());
+        try expectEquivalentDecoding(&owned, &borrowed, cfg);
+    }
+}
+
+test "values borrowing one analysis keep independent pages and views and outlive each other" {
+    const a = testing.allocator;
+    const code = try farJumpCode(a, &.{ Opcode.JUMPDEST.byte(), Opcode.STOP.byte() });
+    defer a.free(code);
+    plantRoutine(code, 0x8000, &.{ Opcode.JUMPDEST.byte(), Opcode.STOP.byte() });
+    const analysis = try Analysis.init(a, code, amsterdam);
+    defer analysis.deinit(a);
+
+    var first = try Bytecode.initWithAnalysis(a, code, amsterdam, &analysis);
+    var second = try Bytecode.initWithAnalysis(a, code, amsterdam, &analysis);
+    defer second.deinit(a);
+    try testing.expect(first.borrowsAnalysis() and second.borrowsAnalysis());
+    try testing.expect(first.shared != second.shared);
+    // Copies of one value share its pages but keep their own view.
+    var parent = first;
+    var child = first;
+    const parent_ip = (try parent.isValidJumpDest(far_tail_pc, amsterdam)).?;
+    const child_ip = (try child.isValidJumpDest(0x8000, amsterdam)).?;
+    try testing.expectEqual(far_tail_pc, parent.programCounter(parent_ip));
+    try testing.expectEqual(0x8000, child.programCounter(child_ip));
+    try testing.expectEqual(0, first.programCounter(first.entry()));
+    try testing.expectEqual(3, first.decodedPages());
+    try testing.expectEqual(parent_ip, (try child.isValidJumpDest(far_tail_pc, amsterdam)).?);
+    // Another value decodes its own pages even though the bitmap is shared.
+    try testing.expectEqual(1, second.decodedPages());
+    const second_ip = (try second.isValidJumpDest(far_tail_pc, amsterdam)).?;
+    try testing.expect(second_ip != parent_ip);
+    try testing.expectEqual(2, second.decodedPages());
+    // Releasing one value leaves the bitmap intact for the other and for new values.
+    first.deinit(a);
+    try testing.expectEqual(far_tail_pc, second.programCounter(second_ip));
+    try testing.expect((try second.isValidJumpDest(0x8000, amsterdam)) != null);
+    var third = try Bytecode.initWithAnalysis(a, code, amsterdam, &analysis);
+    defer third.deinit(a);
+    try testing.expect((try third.isValidJumpDest(far_tail_pc, amsterdam)) != null);
+}
+
+test "an analysis for another immediate rule or length falls back to an owned scan" {
+    const a = testing.allocator;
+    var code: [page_size + 4]u8 = undefined;
+    @memset(&code, Opcode.PUSH0.byte());
+    @memcpy(code[page_size - 1 ..], &[_]u8{ Opcode.DUPN.byte(), 0x00, Opcode.JUMPDEST.byte(), Opcode.STOP.byte(), Opcode.STOP.byte() });
+    const amsterdam_analysis = try Analysis.init(a, &code, amsterdam);
+    defer amsterdam_analysis.deinit(a);
+    const osaka_analysis = try Analysis.init(a, &code, osaka);
+    defer osaka_analysis.deinit(a);
+    // The rules disagree on the DUPN immediate, so the bitmaps differ.
+    try testing.expect(!std.mem.eql(u64, amsterdam_analysis.boundaries, osaka_analysis.boundaries));
+    try testing.expect(!amsterdam_analysis.isCompatible(code.len, osaka));
+    try testing.expect(!osaka_analysis.isCompatible(code.len, amsterdam));
+
+    inline for (.{ osaka, amsterdam }) |cfg| {
+        const foreign = if (ImmediateRule.of(cfg) == .amsterdam) &osaka_analysis else &amsterdam_analysis;
+        var owned = try Bytecode.init(a, &code, cfg);
+        defer owned.deinit(a);
+        var fallback = try Bytecode.initWithAnalysis(a, &code, cfg, foreign);
+        defer fallback.deinit(a);
+        try testing.expect(!fallback.borrowsAnalysis());
+        try testing.expect(fallback.shared.boundaries.ptr != foreign.boundaries.ptr);
+        try testing.expectEqual(owned.shared.frontier, fallback.shared.frontier);
+        try expectEquivalentDecoding(&owned, &fallback, cfg);
+        // The byte after DUPN is a consumed immediate under Amsterdam only.
+        try testing.expectEqual(ImmediateRule.of(cfg) == .push_only, fallback.isBoundary(page_size));
+    }
+    // A prefix analysis has the wrong length and is never borrowed.
+    const prefix = try Analysis.init(a, code[0 .. code.len - 1], amsterdam);
+    defer prefix.deinit(a);
+    try testing.expect(!prefix.isCompatible(code.len, amsterdam));
+    var longer = try Bytecode.initWithAnalysis(a, &code, amsterdam, &prefix);
+    defer longer.deinit(a);
+    try testing.expect(!longer.borrowsAnalysis());
+    try testing.expect((try longer.isValidJumpDest(page_size + 1, amsterdam)) != null);
+    // A bitmap whose size does not match the declared length is malformed and ignored.
+    const malformed: Analysis = .{ .boundaries = amsterdam_analysis.boundaries[1..], .code_len = code.len, .immediate_rule = .amsterdam };
+    try testing.expect(!malformed.isCompatible(code.len, amsterdam));
+    var guarded = try Bytecode.initWithAnalysis(a, &code, amsterdam, &malformed);
+    defer guarded.deinit(a);
+    try testing.expect(!guarded.borrowsAnalysis());
+}
+
+fn analyzeRoundTrip(allocator: std.mem.Allocator, code: []const u8) !void {
+    const analysis = try Analysis.init(allocator, code, amsterdam);
+    defer analysis.deinit(allocator);
+    try testing.expectEqual(code.len, analysis.code_len);
+}
+
+fn activateTailWith(allocator: std.mem.Allocator, code: []const u8, analysis: *const Analysis) !void {
+    var bytecode = try Bytecode.initWithAnalysis(allocator, code, amsterdam, analysis);
+    defer bytecode.deinit(allocator);
+    try testing.expect((try bytecode.isValidJumpDest(far_tail_pc, amsterdam)) != null);
+    try testing.expect((try bytecode.isValidJumpDest(0x8000, amsterdam)) != null);
+}
+
+test "allocation failures around a borrowed analysis leak nothing and leave the bitmap untouched" {
+    const a = testing.allocator;
+    const code = try farJumpCode(a, &.{ Opcode.JUMPDEST.byte(), Opcode.STOP.byte() });
+    defer a.free(code);
+    plantRoutine(code, 0x8000, &.{Opcode.JUMPDEST.byte()});
+    try testing.checkAllAllocationFailures(a, analyzeRoundTrip, .{code});
+
+    const analysis = try Analysis.init(a, code, amsterdam);
+    defer analysis.deinit(a);
+    const snapshot = try a.dupe(u64, analysis.boundaries);
+    defer a.free(snapshot);
+    try testing.checkAllAllocationFailures(a, activateTailWith, .{ code, &analysis });
+    // An incompatible analysis takes the owned path, which allocates its own bitmap.
+    const stale = try Analysis.init(a, code[0 .. code.len - 1], amsterdam);
+    defer stale.deinit(a);
+    try testing.checkAllAllocationFailures(a, activateTailWith, .{ code, &stale });
+    try testing.expectEqualSlices(u64, snapshot, analysis.boundaries);
+
+    // Borrowing skips the bitmap allocation. A page allocation failing later
+    // reports OutOfMemory, keeps the bitmap and the existing page, and the
+    // same jump succeeds afterwards.
+    var failing = testing.FailingAllocator.init(a, .{});
+    var bytecode = try Bytecode.initWithAnalysis(failing.allocator(), code, amsterdam, &analysis);
+    defer bytecode.deinit(failing.allocator());
+    try testing.expectEqual(3, failing.alloc_index);
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, bytecode.isValidJumpDest(far_tail_pc, amsterdam));
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqual(0, bytecode.page_base);
+    try testing.expectEqual(1, bytecode.decodedPages());
+    try testing.expectEqual(analysis.boundaries.ptr, bytecode.shared.boundaries.ptr);
+    try testing.expectEqualSlices(u64, snapshot, analysis.boundaries);
+    failing.fail_index = std.math.maxInt(usize);
+    const ip = (try bytecode.isValidJumpDest(far_tail_pc, amsterdam)).?;
+    try testing.expectEqual(far_tail_pc, bytecode.programCounter(ip));
+    try testing.expectEqual(2, bytecode.decodedPages());
 }

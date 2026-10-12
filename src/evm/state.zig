@@ -39,6 +39,12 @@ pub const State = struct {
     /// alive until `code_storage` is cleared and every active frame has
     /// returned; `get_code` then references them instead of copying. Newly
     /// deployed code is always copied because its source is EVM scratch.
+    ///
+    /// Under the same promise, a committed state that declares
+    /// `codeAnalysis(hash) ?*const Bytecode.Analysis` lends its precomputed
+    /// instruction analysis to `get_code`, which then never scans the code
+    /// (see `Bytecode.initWithAnalysis`). The analysis must be bound to the
+    /// hash it is returned for and must outlive every frame as the bytes do.
     borrow_committed_code: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, committed_state: *const CommittedState, caps: Capacities) !Self {
@@ -112,15 +118,18 @@ pub const State = struct {
             return b;
         }
         const code = try self.committed_state.code(hash);
-        try self.cacheCode(hash, code, !self.borrow_committed_code, cfg);
+        // The host's analysis shares the lifetime promise of its borrowed
+        // bytes, so it is consulted only while borrowing.
+        const analysis = if (self.borrow_committed_code) hostAnalysis(CommittedState, self.committed_state, hash) else null;
+        try self.cacheCode(hash, code, !self.borrow_committed_code, analysis, cfg);
         return self.code_storage.get(hash) orelse unreachable;
     }
 
     pub fn deploy_code(self: *Self, hash: [32]u8, code: []const u8, comptime cfg: Config) !void {
-        return self.cacheCode(hash, code, true, cfg);
+        return self.cacheCode(hash, code, true, null, cfg);
     }
 
-    fn cacheCode(self: *Self, hash: [32]u8, code: []const u8, copy: bool, comptime cfg: Config) !void {
+    fn cacheCode(self: *Self, hash: [32]u8, code: []const u8, copy: bool, analysis: ?*const Bytecode.Analysis, comptime cfg: Config) !void {
         if (self.code_storage.contains(hash)) return;
         // Exhaust the bounded cache with an error, never an
         // assume-capacity assertion or an out-of-bounds write.
@@ -129,10 +138,19 @@ pub const State = struct {
 
         const allocator = self.code_allocator orelse self.deployed_bytecode_allocator.allocator();
         const code_bytes = if (copy) try allocator.dupe(u8, code) else code;
-        const bytecode = try Bytecode.init(allocator, code_bytes, cfg);
+        const bytecode = try Bytecode.initWithAnalysis(allocator, code_bytes, cfg, analysis);
         self.code_storage.putAssumeCapacity(hash, bytecode);
     }
 };
+
+/// Precomputed `Bytecode.Analysis` that `host` keeps for the committed code
+/// under `hash`, if `Host` declares `codeAnalysis`; null otherwise or on a
+/// miss. The host binds the result to that hash and keeps it alive and
+/// unchanged as long as the borrowed code bytes.
+fn hostAnalysis(comptime Host: type, host: *const Host, hash: [32]u8) ?*const Bytecode.Analysis {
+    if (@hasDecl(Host, "codeAnalysis")) return host.codeAnalysis(hash);
+    return null;
+}
 
 test "external code allocator owns decoded code and deployment always copies" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -206,4 +224,69 @@ test "full decoded code map rejects new code without consuming bytecode capacity
     try std.testing.expectError(error.OutOfMemory, state.deploy_code(@splat(0xff), &.{0}, cfg));
     try std.testing.expectEqual(limit, state.code_storage.size);
     try std.testing.expectEqual(used, state.deployed_bytecode_allocator.end_index);
+}
+
+/// Host that lends one analysis for a single hash, as a code cache would.
+const AnalysisHost = struct {
+    analysis: Bytecode.Analysis,
+    bound_hash: [32]u8,
+
+    pub fn codeAnalysis(self: *const @This(), hash: [32]u8) ?*const Bytecode.Analysis {
+        return if (std.mem.eql(u8, &hash, &self.bound_hash)) &self.analysis else null;
+    }
+};
+
+test "a host analysis is found through codeAnalysis for its hash only" {
+    const a = std.testing.allocator;
+    const cfg: Config = .{ .fork = comptime Spec.fromFork(.Amsterdam) };
+    const code = [_]u8{ 0x60, 0x5b, 0x5b, 0x00 };
+    var host: AnalysisHost = .{ .analysis = try Bytecode.Analysis.init(a, &code, cfg), .bound_hash = @splat(0xaa) };
+    defer host.analysis.deinit(a);
+    try std.testing.expectEqual(&host.analysis, hostAnalysis(AnalysisHost, &host, @splat(0xaa)));
+    try std.testing.expectEqual(null, hostAnalysis(AnalysisHost, &host, @splat(0xab)));
+    // A host without the declaration, like the empty committed state, lends nothing.
+    const bare: struct {} = .{};
+    try std.testing.expectEqual(null, hostAnalysis(@TypeOf(bare), &bare, @splat(0xaa)));
+}
+
+test "committed code borrows a compatible host analysis and deployed code never does" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg: Config = .{ .fork = comptime Spec.fromFork(.Amsterdam) };
+    const committed: CommittedState = .{};
+    var code_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer code_arena.deinit();
+    // PUSH1 of a byte that looks like JUMPDEST, a real JUMPDEST, STOP. The
+    // analysis outlives the state, as a host cache entry would.
+    const code = [_]u8{ 0x60, 0x5b, 0x5b, 0x00 };
+    const analysis = try Bytecode.Analysis.init(std.testing.allocator, &code, cfg);
+    defer analysis.deinit(std.testing.allocator);
+    var state = try State.initWithCodeAllocator(a, &committed, cfg.fork.stateCapacities(1_000_000), code_arena.allocator());
+    defer state.deinit(a);
+    state.borrow_committed_code = true;
+
+    // The committed path with a provider borrows both the bytes and the bitmap.
+    const hash: [32]u8 = @splat(0x44);
+    try state.cacheCode(hash, &code, false, &analysis, cfg);
+    var borrowed = try state.get_code(hash, cfg);
+    try std.testing.expect(borrowed.bytes.ptr == &code);
+    try std.testing.expect(borrowed.borrowsAnalysis());
+    try std.testing.expectEqual(null, try borrowed.isValidJumpDest(1, cfg));
+    try std.testing.expect((try borrowed.isValidJumpDest(2, cfg)) != null);
+    // Deployment copies the bytes and always scans on its own.
+    const deployed_hash: [32]u8 = @splat(0x55);
+    try state.deploy_code(deployed_hash, &code, cfg);
+    var deployed = try state.get_code(deployed_hash, cfg);
+    try std.testing.expect(deployed.bytes.ptr != &code);
+    try std.testing.expect(!deployed.borrowsAnalysis());
+    try std.testing.expectEqual(null, try deployed.isValidJumpDest(1, cfg));
+    try std.testing.expect((try deployed.isValidJumpDest(2, cfg)) != null);
+    // An analysis computed under another immediate rule is offered but not borrowed.
+    const osaka: Config = .{ .fork = comptime Spec.fromFork(.Osaka) };
+    const foreign_hash: [32]u8 = @splat(0x66);
+    try state.cacheCode(foreign_hash, &code, false, &analysis, osaka);
+    var foreign = try state.get_code(foreign_hash, osaka);
+    try std.testing.expect(!foreign.borrowsAnalysis());
+    try std.testing.expect((try foreign.isValidJumpDest(2, osaka)) != null);
 }
