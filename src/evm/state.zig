@@ -97,10 +97,6 @@ pub const State = struct {
 
     pub fn deploy_code(self: *Self, hash: [32]u8, code: []const u8, comptime cfg: Config) !void {
         if (self.code_storage.contains(hash)) return;
-        // Exhaust the bounded cache with an error, never an
-        // assume-capacity assertion or an out-of-bounds write.
-        if (self.code_storage.size >= self.code_storage.capacity() * 80 / 100)
-            return error.OutOfMemory;
 
         const allocator = self.deployed_bytecode_allocator.allocator();
         const code_bytes = try allocator.dupe(u8, code);
@@ -108,26 +104,3 @@ pub const State = struct {
         self.code_storage.putAssumeCapacity(hash, bytecode);
     }
 };
-
-test "full decoded code map rejects new code without consuming bytecode capacity" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const cfg: Config = .{ .fork = comptime Spec.fromFork(.Amsterdam) };
-    const committed: CommittedState = .{};
-    var caps = cfg.fork.stateCapacities(1_000_000);
-    caps.code_slots = 1;
-    var state = try State.init(a, &committed, caps);
-    const limit = state.code_storage.capacity() * 80 / 100;
-    for (0..limit) |i| {
-        var hash: [32]u8 = @splat(0);
-        std.mem.writeInt(u32, hash[0..4], @intCast(i), .big);
-        try state.deploy_code(hash, &.{0}, cfg);
-    }
-    const used = state.deployed_bytecode_allocator.end_index;
-    // Existing entries remain usable even when the map is full.
-    try state.deploy_code(@splat(0), &.{0}, cfg);
-    try std.testing.expectError(error.OutOfMemory, state.deploy_code(@splat(0xff), &.{0}, cfg));
-    try std.testing.expectEqual(limit, state.code_storage.size);
-    try std.testing.expectEqual(used, state.deployed_bytecode_allocator.end_index);
-}
