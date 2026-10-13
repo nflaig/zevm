@@ -281,7 +281,7 @@ pub const Downloader = struct {
                 else => unreachable,
             },
         };
-        validated.verify_seconds = secondsSince(self.io, start);
+        self.metrics.verify_seconds.observe(.{ .msg = validated.msgName() }, secondsSince(self.io, start)) catch {};
         self.validated_responses.putOneUncancelable(self.io, validated) catch unreachable;
     }
 
@@ -293,7 +293,6 @@ pub const Downloader = struct {
             var arena = validated.arena;
             arena.deinit();
         }
-        self.metrics.verify_seconds.observe(.{ .msg = validated.msgName() }, validated.verify_seconds) catch {};
 
         if (validated.outcome) |_| {} else |err| switch (validated.resp) {
             inline else => |resp, proto| {
@@ -1625,7 +1624,6 @@ const ValidatedResponse = struct {
         eth: struct { msg: eth.Provider.ParsedMessage, req: *Request(eth.Message) },
         snap: struct { msg: snap.Provider.ParsedMessage, req: *Request(snap.Message) },
     },
-    verify_seconds: f64 = 0,
     outcome: anyerror!ValidationOutcome = error.NotValidated,
 
     fn msgName(self: *const ValidatedResponse) []const u8 {
