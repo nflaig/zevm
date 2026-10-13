@@ -26,73 +26,8 @@ const arena_retain_limit = (32 << 20) - 64;
 
 const log = std.log.scoped(.downloader);
 
-fn secondsSince(io: std.Io, start: std.Io.Timestamp) f64 {
-    const ns = start.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds();
-    return @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
-}
-
-fn Request(comptime msg: type) type {
-    return struct {
-        id: u64,
-        peer: rlpx.Server.PeerId,
-        msg: msg,
-        sent_at: std.Io.Timestamp,
-        deadline: std.Io.Timestamp,
-        keyspace: [2]u256 = .{ 0, 0 },
-        storage_roots: [][32]u8 = &.{},
-
-        fn lessThan(ctx: void, left: @This(), right: @This()) bool {
-            return msg.lessThan(ctx, left.msg, right.msg);
-        }
-    };
-}
-
 pub const Downloader = struct {
     const Self = @This();
-    pub const SyncTarget = struct {
-        paused: bool = false,
-
-        number: u64,
-        hash: [32]u8,
-
-        cutoff_number: u64, // last header to fetch, inclusive
-        cutoff_hash: [32]u8,
-    };
-    const PeerRange = struct {
-        id: rlpx.Server.PeerId,
-        range: eth.BlockRangeUpdate,
-    };
-    const ValidatedResponse = struct {
-        arena: std.heap.ArenaAllocator,
-        resp: union(enum) {
-            eth: struct { msg: eth.Provider.ParsedMessage, req: *Request(eth.Message) },
-            snap: struct { msg: snap.Provider.ParsedMessage, req: *Request(snap.Message) },
-        },
-        verify_seconds: f64 = 0,
-        outcome: anyerror!Outcome = error.NotValidated,
-
-        fn msgName(self: *const ValidatedResponse) []const u8 {
-            return switch (self.resp) {
-                inline else => |resp| @tagName(resp.msg.msg),
-            };
-        }
-    };
-    const Outcome = union(enum) {
-        headers: struct { hashes: [][32]u8, headers: []types.BlockHeader },
-        bal: struct { hash: [32]u8, parsed: types.BlockAccessLists },
-        accounts: VerifiedAccounts,
-        storage: VerifiedStorage,
-        codes: [][32]u8,
-    };
-    const VerifiedAccounts = struct {
-        hashes: [][32]u8,
-        has_more: bool,
-    };
-    const VerifiedStorage = struct {
-        keys: [][][32]u8 = &.{},
-        values: [][][]const u8 = &.{},
-        continue_from_slot: ?[32]u8 = null,
-    };
 
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -395,7 +330,7 @@ pub const Downloader = struct {
         }
     }
 
-    fn validateHeaders(allocator: std.mem.Allocator, request: eth.GetBlockHeaders, response: eth.BlockHeaders) !Outcome {
+    fn validateHeaders(allocator: std.mem.Allocator, request: eth.GetBlockHeaders, response: eth.BlockHeaders) !ValidationOutcome {
         if (response.rlps.len == 0) return .{ .headers = .{ .hashes = &.{}, .headers = &.{} } };
 
         var headers: []types.BlockHeader = try allocator.alloc(types.BlockHeader, response.rlps.len);
@@ -424,7 +359,7 @@ pub const Downloader = struct {
         return .{ .headers = .{ .hashes = hashes, .headers = headers } };
     }
 
-    fn validateBal(allocator: std.mem.Allocator, response: eth.BlockAccessLists) !Outcome {
+    fn validateBal(allocator: std.mem.Allocator, response: eth.BlockAccessLists) !ValidationOutcome {
         if (response.rlps.len == 0) return error.EmptyResponse;
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha3.Keccak256.hash(response.rlps[0].value, &hash, .{});
@@ -433,7 +368,7 @@ pub const Downloader = struct {
         return .{ .bal = .{ .hash = hash, .parsed = parsed } };
     }
 
-    fn verifyAccounts(allocator: std.mem.Allocator, request: snap.GetAccountRange, response: *const snap.AccountRange) !Outcome {
+    fn verifyAccounts(allocator: std.mem.Allocator, request: snap.GetAccountRange, response: *const snap.AccountRange) !ValidationOutcome {
         if (response.accounts.len == 0 and response.proof.len == 0) return error.EmptyAccountRange;
         const hashes = try allocator.alloc([32]u8, response.accounts.len);
         const accounts = try allocator.alloc([]const u8, response.accounts.len);
@@ -465,7 +400,7 @@ pub const Downloader = struct {
         request: snap.GetStorageRanges,
         storage_roots: []const [32]u8,
         response: *const snap.StorageRanges,
-    ) !Outcome {
+    ) !ValidationOutcome {
         if (response.slots.len == 0) return error.EmptyStorageRanges;
         const proof = try proofNodes(allocator, response.proof);
 
@@ -515,7 +450,7 @@ pub const Downloader = struct {
         return .{ .storage = result };
     }
 
-    fn hashCodes(allocator: std.mem.Allocator, response: snap.ByteCodes) !Outcome {
+    fn hashCodes(allocator: std.mem.Allocator, response: snap.ByteCodes) !ValidationOutcome {
         const hashes = try allocator.alloc([32]u8, response.bytecodes.len);
         for (response.bytecodes, hashes) |code, *hash|
             std.crypto.hash.sha3.Keccak256.hash(code, hash, .{});
@@ -812,7 +747,7 @@ pub const Downloader = struct {
         log.debug("requesting headers origin {} amount {}", .{ origin, amount });
     }
 
-    fn handleHeaders(self: *Self, matched_request: *Request(eth.Message), outcome: anyerror!Outcome) !void {
+    fn handleHeaders(self: *Self, matched_request: *Request(eth.Message), outcome: anyerror!ValidationOutcome) !void {
         const headers_request = matched_request.msg.get_block_headers;
 
         const hashes, const headers = if (outcome) |result| .{ result.headers.hashes, result.headers.headers } else |e| {
@@ -1081,12 +1016,12 @@ pub const Downloader = struct {
         self.sendSnapRequest(req) catch {};
     }
 
-    fn handleAccounts(self: *Self, request: *Request(snap.Message), response: *const snap.AccountRange, outcome: anyerror!Outcome) !void {
+    fn handleAccounts(self: *Self, request: *Request(snap.Message), response: *const snap.AccountRange, outcome: anyerror!ValidationOutcome) !void {
         const get_accounts_range = request.msg.get_account_range;
-        const verified: ?VerifiedAccounts = if (outcome) |result| result.accounts else |_| null;
 
         var continue_from_account: ?[32]u8 = null;
-        if (verified) |accounts| {
+        if (outcome) |result| {
+            const accounts = result.accounts;
             const hashes = accounts.hashes;
             const last = if (hashes.len > 0) hashes[hashes.len - 1] else get_accounts_range.limit;
             log.debug("verified account range {x}-{x}", .{ get_accounts_range.origin, last });
@@ -1095,7 +1030,7 @@ pub const Downloader = struct {
             try self.persistAccounts(get_accounts_range, hashes, response);
             const covered_until = if (accounts.has_more) last else get_accounts_range.limit;
             self.progress.account_keyspace +|= std.mem.readInt(u256, &covered_until, .big) - std.mem.readInt(u256, &get_accounts_range.origin, .big);
-        } else {
+        } else |_| {
             continue_from_account = get_accounts_range.origin;
         }
 
@@ -1273,7 +1208,7 @@ pub const Downloader = struct {
         self.sendSnapRequest(req) catch {};
     }
 
-    fn handleStorage(self: *Self, req: *Request(snap.Message), outcome: anyerror!Outcome) !void {
+    fn handleStorage(self: *Self, req: *Request(snap.Message), outcome: anyerror!ValidationOutcome) !void {
         const result: VerifiedStorage = if (outcome) |verified| verified.storage else |_| .{};
         const request = &req.msg.get_storage_ranges;
         const requested_accounts = request.account_hashes;
@@ -1357,7 +1292,7 @@ pub const Downloader = struct {
         self.sendSnapRequest(req) catch {};
     }
 
-    fn handleCodes(self: *Self, req: *Request(snap.Message), codes: snap.ByteCodes, outcome: anyerror!Outcome) !void {
+    fn handleCodes(self: *Self, req: *Request(snap.Message), codes: snap.ByteCodes, outcome: anyerror!ValidationOutcome) !void {
         const code_hashes: ?[][32]u8 = if (outcome) |result| result.codes else |_| null;
         const txn_start = std.Io.Timestamp.now(self.io, .awake);
         const txn = try self.eth_db.kv_store.transaction_rw();
@@ -1439,7 +1374,7 @@ pub const Downloader = struct {
         self.sendEthRequest(req, true);
     }
 
-    fn handleBals(self: *Self, req: *Request(eth.Message), outcome: anyerror!Outcome) !void {
+    fn handleBals(self: *Self, req: *Request(eth.Message), outcome: anyerror!ValidationOutcome) !void {
         if (self.state_heal) |*state_heal| {
             if (outcome) |result| {
                 if (std.meta.eql(result.bal.hash, state_heal.next_pivot.block_access_list_hash.?)) {
@@ -1653,6 +1588,72 @@ pub const Downloader = struct {
     }
 };
 
+fn Request(comptime msg: type) type {
+    return struct {
+        id: u64,
+        peer: rlpx.Server.PeerId,
+        msg: msg,
+        sent_at: std.Io.Timestamp,
+        deadline: std.Io.Timestamp,
+        keyspace: [2]u256 = .{ 0, 0 },
+        storage_roots: [][32]u8 = &.{},
+
+        fn lessThan(ctx: void, left: @This(), right: @This()) bool {
+            return msg.lessThan(ctx, left.msg, right.msg);
+        }
+    };
+}
+
+pub const SyncTarget = struct {
+    paused: bool = false,
+
+    number: u64,
+    hash: [32]u8,
+
+    cutoff_number: u64, // last header to fetch, inclusive
+    cutoff_hash: [32]u8,
+};
+
+const PeerRange = struct {
+    id: rlpx.Server.PeerId,
+    range: eth.BlockRangeUpdate,
+};
+
+const ValidatedResponse = struct {
+    arena: std.heap.ArenaAllocator,
+    resp: union(enum) {
+        eth: struct { msg: eth.Provider.ParsedMessage, req: *Request(eth.Message) },
+        snap: struct { msg: snap.Provider.ParsedMessage, req: *Request(snap.Message) },
+    },
+    verify_seconds: f64 = 0,
+    outcome: anyerror!ValidationOutcome = error.NotValidated,
+
+    fn msgName(self: *const ValidatedResponse) []const u8 {
+        return switch (self.resp) {
+            inline else => |resp| @tagName(resp.msg.msg),
+        };
+    }
+};
+
+const ValidationOutcome = union(enum) {
+    headers: struct { hashes: [][32]u8, headers: []types.BlockHeader },
+    bal: struct { hash: [32]u8, parsed: types.BlockAccessLists },
+    accounts: VerifiedAccounts,
+    storage: VerifiedStorage,
+    codes: [][32]u8,
+};
+
+const VerifiedAccounts = struct {
+    hashes: [][32]u8,
+    has_more: bool,
+};
+
+const VerifiedStorage = struct {
+    keys: [][][32]u8 = &.{},
+    values: [][][]const u8 = &.{},
+    continue_from_slot: ?[32]u8 = null,
+};
+
 const invalid_peer: rlpx.Server.PeerId = .{
     .peer_index = std.math.maxInt(usize),
     .peer_epoch = std.math.maxInt(usize),
@@ -1774,3 +1775,8 @@ const Metrics = struct {
         };
     }
 };
+
+fn secondsSince(io: std.Io, start: std.Io.Timestamp) f64 {
+    const ns = start.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds();
+    return @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
+}
