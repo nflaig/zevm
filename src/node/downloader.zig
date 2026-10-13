@@ -1207,15 +1207,7 @@ pub const Downloader = struct {
         const requested_accounts = request.account_hashes;
         const storage_roots = req.storage_roots;
         const verified = result.keys.len;
-
-        const txn_start = std.Io.Timestamp.now(self.io, .awake);
-        const txn = try self.eth_db.kv_store.transaction_rw();
-        errdefer _ = txn.abort() catch |e| {
-            log.err("failed to abort txn {}", .{e});
-        };
-        for (requested_accounts[0..verified], result.keys, result.values) |account_hash, keys, values|
-            try self.eth_db.insertStorage(txn, account_hash, keys, values);
-        try self.commitTxn(txn, "storage", txn_start);
+        try self.persistStorage(requested_accounts[0..verified], result);
 
         const continue_from_slot = if (result.continue_from_slot) |from| try self.splitLargeAccount(req, verified, from) else null;
         const unserved = requested_accounts[verified..];
@@ -1242,6 +1234,17 @@ pub const Downloader = struct {
             self.progress.storage_keyspace +|= req.keyspace[1] - req.keyspace[0];
             self.free_snap_requests.push(req);
         }
+    }
+
+    fn persistStorage(self: *Self, account_hashes: []const [32]u8, storage: VerifiedStorage) !void {
+        const txn_start = std.Io.Timestamp.now(self.io, .awake);
+        const txn = try self.eth_db.kv_store.transaction_rw();
+        errdefer _ = txn.abort() catch |e| {
+            log.err("failed to abort txn {}", .{e});
+        };
+        for (account_hashes, storage.keys, storage.values) |account_hash, keys, values|
+            try self.eth_db.insertStorage(txn, account_hash, keys, values);
+        try self.commitTxn(txn, "storage", txn_start);
     }
 
     fn splitLargeAccount(self: *Self, req: *Request(snap.Message), verified: usize, from: [32]u8) !?[32]u8 {
@@ -1286,29 +1289,23 @@ pub const Downloader = struct {
     }
 
     fn handleCodes(self: *Self, req: *Request(snap.Message), codes: snap.ByteCodes, outcome: anyerror!ValidationOutcome) !void {
-        const code_hashes: ?[][32]u8 = if (outcome) |result| result.codes else |_| null;
-        const txn_start = std.Io.Timestamp.now(self.io, .awake);
-        const txn = try self.eth_db.kv_store.transaction_rw();
-        defer self.commitTxn(txn, "codes", txn_start) catch unreachable;
-        const table = self.eth_db.kv_store.table(txn, .codes);
+        const code_hashes: [][32]u8 = if (outcome) |result| result.codes else |_| &.{};
+        const served_codes = if (outcome) |_| codes.bytecodes else |_| &.{};
 
         const requested_hashes = req.msg.get_byte_codes.hashes;
 
         var retry_count: usize = 0;
         var next_hash_index: usize = 0;
-        const served_codes = if (code_hashes != null) codes.bytecodes else &.{};
-        for (served_codes, code_hashes orelse &.{}) |code, code_hash| {
+        const matched = for (code_hashes, 0..) |code_hash, index| {
             while (next_hash_index < requested_hashes.len and !std.meta.eql(requested_hashes[next_hash_index], code_hash)) : (next_hash_index += 1) {
                 requested_hashes[retry_count] = requested_hashes[next_hash_index];
                 retry_count += 1;
             }
-            if (next_hash_index == requested_hashes.len) break;
-
-            table.set(&code_hash, code, .Create) catch |e| {
-                if (e != lmdbx.Error.MDBX_KEYEXIST) return e;
-            };
+            if (next_hash_index == requested_hashes.len) break index;
             next_hash_index += 1;
-        }
+        } else code_hashes.len;
+        try self.persistCodes(code_hashes[0..matched], served_codes[0..matched]);
+
         const unserved = requested_hashes[next_hash_index..];
         std.mem.copyForwards([32]u8, requested_hashes[retry_count..][0..unserved.len], unserved);
         retry_count += unserved.len;
@@ -1320,6 +1317,21 @@ pub const Downloader = struct {
             self.progress.code_keyspace +|= req.keyspace[1] - req.keyspace[0];
             self.free_snap_requests.push(req);
         }
+    }
+
+    fn persistCodes(self: *Self, hashes: []const [32]u8, codes: []const []const u8) !void {
+        const txn_start = std.Io.Timestamp.now(self.io, .awake);
+        const txn = try self.eth_db.kv_store.transaction_rw();
+        errdefer _ = txn.abort() catch |e| {
+            log.err("failed to abort txn {}", .{e});
+        };
+        const table = self.eth_db.kv_store.table(txn, .codes);
+        for (hashes, codes) |hash, code| {
+            table.set(&hash, code, .Create) catch |e| {
+                if (e != lmdbx.Error.MDBX_KEYEXIST) return e;
+            };
+        }
+        try self.commitTxn(txn, "codes", txn_start);
     }
 
     fn advanceStateHeal(self: *Self) !void {
