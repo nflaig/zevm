@@ -286,13 +286,7 @@ pub const Downloader = struct {
     }
 
     fn handleValidated(self: *Self, validated: *ValidatedResponse) !void {
-        defer {
-            switch (validated.resp) {
-                inline else => |resp| self.allocator.free(resp.msg.read.payload),
-            }
-            var arena = validated.arena;
-            arena.deinit();
-        }
+        defer validated.deinit(self.allocator);
 
         if (validated.outcome) |_| {} else |err| switch (validated.resp) {
             inline else => |resp, proto| {
@@ -1625,6 +1619,13 @@ const ValidatedResponse = struct {
         snap: struct { msg: snap.Provider.ParsedMessage, req: *Request(snap.Message) },
     },
     outcome: anyerror!ValidationOutcome = error.NotValidated,
+
+    fn deinit(self: *ValidatedResponse, allocator: std.mem.Allocator) void {
+        switch (self.resp) {
+            inline else => |resp| allocator.free(resp.msg.read.payload),
+        }
+        self.arena.deinit();
+    }
 
     fn msgName(self: *const ValidatedResponse) []const u8 {
         return switch (self.resp) {
