@@ -213,6 +213,8 @@ pub const Downloader = struct {
         }
         try self.checkEthRequestTimeouts();
         try self.checkSnapRequestTimeouts();
+        self.drainPendingEthRequests();
+        self.drainPendingSnapRequests();
     }
 
     fn handleEth(self: *Self, received: eth.Provider.ParsedMessage) !bool {
