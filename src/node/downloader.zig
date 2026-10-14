@@ -1127,9 +1127,10 @@ pub const Downloader = struct {
             log.err("failed to abort txn {}", .{e});
         };
 
+        const write_op: lmdbx.Database.SetFlag = if (std.meta.eql(accounts.origin, accounts.limit)) .Upsert else .Append;
         const table = self.eth_db.kv_store.table(txn, .accounts);
         for (accounts.hashes, 0..) |hash, index| {
-            try table.set(&hash, response.accounts[index].account.value, .Upsert);
+            try table.set(&hash, response.accounts[index].account.value, write_op);
         }
         // a proven single account query that doesn't return the account means it no longer exists
         if (std.meta.eql(accounts.origin, accounts.limit) and (accounts.hashes.len == 0 or !std.meta.eql(accounts.hashes[0], accounts.origin))) {
@@ -1464,6 +1465,7 @@ pub const Downloader = struct {
             std.mem.writeInt(u160, &addr_buf, changes.addr, .big);
             var addr_hash: [32]u8 = undefined;
             std.crypto.hash.sha3.Keccak256.hash(&addr_buf, &addr_hash, .{});
+            if (!self.isAccountFetched(addr_hash)) continue;
             var code_hash: [32]u8 = types.empty_code_hash;
             if (changes.code_changes.len > 0) {
                 const code = changes.code_changes[changes.code_changes.len - 1].code;
@@ -1500,6 +1502,21 @@ pub const Downloader = struct {
                 } else try self.eth_db.writeAccount(self.allocator, txn, addr_hash, updated_account);
             }
         }
+    }
+
+    fn isAccountFetched(self: *Self, account_hash: [32]u8) bool {
+        std.debug.assert(self.state_heal != null);
+        const state = &self.state.?;
+        if (state.accounts_done) return true;
+
+        var fetched_until: [32]u8 = undefined;
+        std.mem.writeInt(u256, &fetched_until, state.account_fetch_head, .big);
+        for (self.stashed_snap_requests) |request| {
+            if (request.msg != .get_account_range) continue;
+            const origin = request.msg.get_account_range.origin;
+            if (std.mem.order(u8, &origin, &fetched_until) == .lt) fetched_until = origin;
+        }
+        return std.mem.order(u8, &account_hash, &fetched_until) == .lt;
     }
 
     fn isStorageFetched(self: *Self, account_hash: [32]u8, slot_hash: ?[32]u8) bool {
