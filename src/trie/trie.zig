@@ -100,8 +100,14 @@ pub const Trie = struct {
 
     allocator: std.mem.Allocator,
 
+    /// Unresolved sibling from the latest failed update. The full root-relative
+    /// nibble path is copied; no scratch or node allocation is borrowed.
+    missing_node: ?MissingNode = null,
+
     skip: enum { none, deletions, writes } = .none,
     skipped_deletions: bool = false,
+
+    pub const MissingNode = struct { hash: [32]u8, path: [64]u8, depth: u8 };
 
     pub fn init(allocator: std.mem.Allocator) !Self {
         const root = try allocator.create(Node);
@@ -141,6 +147,7 @@ pub const Trie = struct {
     }
 
     pub fn update(self: *Self, keys: []const [32]u8, values: [][]const u8) !void {
+        self.missing_node = null;
         std.debug.assert(keys.len != 0);
         std.debug.assert(keys.len == values.len);
 
@@ -172,6 +179,7 @@ pub const Trie = struct {
     }
 
     pub fn put(self: *Self, key_bytes: []const u8, value: []const u8) !void {
+        self.missing_node = null;
         var key_buf: [64]u8 = undefined;
         const nibbles = writeHexKey(key_bytes, &key_buf);
         var path_buf: [64]u8 = undefined;
@@ -234,7 +242,7 @@ pub const Trie = struct {
                     try self.insert(branch.children[idx].?, key[1..], path.append(key[0]), value, key_buf, keys, values);
                     if (branch.children[idx].?.* == .empty) {
                         branch.children[idx] = null;
-                        try collapseBranch(node, branch);
+                        try self.collapseBranch(node, branch, path);
                     }
                 }
                 branch.hash = null;
@@ -373,7 +381,7 @@ pub const Trie = struct {
     }
 
     // Collapse a branch that has dropped to 0 or 1 live children after a deletion.
-    fn collapseBranch(node: *Node, branch: *Node.Branch) !void {
+    fn collapseBranch(self: *Self, node: *Node, branch: *Node.Branch, path: Path) !void {
         var count: usize = 0;
         var remaining_nibble: u8 = 0;
         var remaining_child: *Node = undefined;
@@ -411,7 +419,15 @@ pub const Trie = struct {
             },
             // A hash alone cannot tell whether a sibling's path
             // must merge with this branch's final nibble. Never guess a root.
-            .hashed => return error.SubTrieNotAvailable,
+            .hashed => |hashed| {
+                if (hashed.len == 32 and path.len < 64) {
+                    var missing: MissingNode = .{ .hash = hashed.data, .path = @splat(0), .depth = @intCast(path.len + 1) };
+                    @memcpy(missing.path[0..path.len], path.slice());
+                    missing.path[path.len] = remaining_nibble;
+                    self.missing_node = missing;
+                }
+                return error.SubTrieNotAvailable;
+            },
             .empty => unreachable,
         }
     }
@@ -874,6 +890,8 @@ test "deleting a leaf requires its remaining sibling preimage" {
     const key_a: [32]u8 = @splat(0);
     var values = [_][]const u8{&.{}};
     try std.testing.expectError(error.SubTrieNotAvailable, incomplete.update(&.{key_a}, &values));
+    try std.testing.expectEqual(hash_b, incomplete.missing_node.?.hash);
+    try std.testing.expectEqualSlices(u8, &.{1}, incomplete.missing_node.?.path[0..incomplete.missing_node.?.depth]);
 
     try nodes.put(a, hash_b, encoded_b.items);
     var complete = try loadFromNodesMap(a, root, &nodes);
@@ -931,4 +949,53 @@ test "a write in the same batch keeps the branch from collapsing onto a missing 
     var expected = std.array_list.Managed(u8).init(a);
     try rlp.serialize([17][]const u8, a, expected_branch, &expected);
     try std.testing.expectEqualSlices(u8, &keccak256(expected.items), &try t.rootHash());
+}
+
+test "missing sibling diagnostics include extension paths and clear on update" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var leaf_path: [30]u8 = @splat(0);
+    leaf_path[0] = 0x30; // 59 nibbles after the extension and branch
+    const value_a: [32]u8 = @splat(0xaa);
+    const value_b: [32]u8 = @splat(0xbb);
+    var leaf_a = std.array_list.Managed(u8).init(alloc);
+    var leaf_b = std.array_list.Managed(u8).init(alloc);
+    try rlp.serialize([2][]const u8, alloc, .{ &leaf_path, &value_a }, &leaf_a);
+    try rlp.serialize([2][]const u8, alloc, .{ &leaf_path, &value_b }, &leaf_b);
+    const hash_a = keccak256(leaf_a.items);
+    const hash_b = keccak256(leaf_b.items);
+    var children: [17][]const u8 = @splat(&.{});
+    children[0] = &hash_a;
+    children[1] = &hash_b;
+    var branch = std.array_list.Managed(u8).init(alloc);
+    try rlp.serialize([17][]const u8, alloc, children, &branch);
+    const branch_hash = keccak256(branch.items);
+    var extension = std.array_list.Managed(u8).init(alloc);
+    try rlp.serialize([2][]const u8, alloc, .{ &.{ 0x00, 0x0a, 0x0b }, &branch_hash }, &extension);
+    const root = keccak256(extension.items);
+    var nodes: NodesHashMap = .empty;
+    try nodes.put(alloc, root, extension.items);
+    try nodes.put(alloc, branch_hash, branch.items);
+    try nodes.put(alloc, hash_a, leaf_a.items);
+    const path = [_]u8{ 0, 10, 0, 11, 1 };
+    var key: [32]u8 = @splat(0);
+    key[0] = 0x0a;
+    key[1] = 0x0b;
+    var incomplete = try loadFromNodesMap(alloc, root, &nodes);
+    var deletion = [_][]const u8{&.{}};
+    try std.testing.expectError(error.SubTrieNotAvailable, incomplete.update(&.{key}, &deletion));
+    const missing = incomplete.missing_node.?;
+    try std.testing.expectEqual(hash_b, missing.hash);
+    try std.testing.expectEqualSlices(u8, &path, missing.path[0..missing.depth]);
+    try nodes.put(alloc, hash_b, leaf_b.items);
+    var complete = try loadFromNodesMap(alloc, root, &nodes);
+    complete.missing_node = missing;
+    try complete.update(&.{key}, &deletion);
+    try std.testing.expect(complete.missing_node == null);
+    var remaining_path: [33]u8 = @splat(0);
+    remaining_path[0..4].* = .{ 0x20, 0x0a, 0x0b, 0x10 };
+    var expected = std.array_list.Managed(u8).init(alloc);
+    try rlp.serialize([2][]const u8, alloc, .{ &remaining_path, &value_b }, &expected);
+    try std.testing.expectEqual(keccak256(expected.items), try complete.rootHash());
 }
