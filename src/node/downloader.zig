@@ -345,9 +345,13 @@ pub const Downloader = struct {
     }
 
     fn drainSnapFlushQueue(self: *Self) !void {
-        while (self.snap_flush_queue.pop()) |flush| {
-            if (self.hasPrecedingSnapRequest(flush)) return self.snap_flush_queue.prepend(flush);
+        var current_node = self.snap_flush_queue.inner.first;
+        while (current_node) |list_node| {
+            current_node = list_node.next;
+            const flush = &@as(*List(QueuedSnapFlush).Node, @alignCast(@fieldParentPtr("node", list_node))).elem;
+            if (self.hasPrecedingSnapRequest(flush)) continue;
 
+            self.snap_flush_queue.remove(flush);
             self.snap_flush_queue_bytes -= flush.size();
             defer flush.deinit(self.allocator);
             switch (flush.response.msg) {
@@ -459,6 +463,7 @@ pub const Downloader = struct {
 
         const served = response.slots[0..@min(response.slots.len, request.account_hashes.len)];
         var result: VerifiedStorage = .{
+            .chunk = isStorageChunk(request),
             .keys = try allocator.alloc([][32]u8, served.len),
             .values = try allocator.alloc([][]const u8, served.len),
         };
@@ -1330,7 +1335,7 @@ pub const Downloader = struct {
             log.err("failed to abort txn {}", .{e});
         };
         for (storage.account_hashes, storage.keys, storage.values) |account_hash, keys, values|
-            try self.eth_db.appendStorage(txn, account_hash, keys, values);
+            try self.eth_db.appendStorage(txn, account_hash, keys, values, !storage.chunk);
         try self.commitTxn(txn, "storage", txn_start);
     }
 
@@ -1747,7 +1752,12 @@ const VerifiedAccounts = struct {
     has_more: bool,
 };
 
+fn isStorageChunk(request: snap.GetStorageRanges) bool {
+    return request.account_hashes.len == 1 and !std.mem.allEqual(u8, &request.starting_hash, 0);
+}
+
 const VerifiedStorage = struct {
+    chunk: bool = false,
     account_hashes: [][32]u8 = &.{},
     keys: [][][32]u8 = &.{},
     values: [][][]const u8 = &.{},
@@ -1800,7 +1810,7 @@ const QueuedSnapFlush = struct {
             .get_storage_ranges => |request| {
                 if (self.validation_outcome != .storage or request.account_hashes.len == 0) return false;
                 return switch (std.mem.order(u8, &request.account_hashes[0], &self.firstKey())) {
-                    .lt => true,
+                    .lt => !isStorageChunk(request),
                     .gt => false,
                     .eq => std.mem.order(u8, &request.starting_hash, &firstSlot(self.validation_outcome.storage)) == .lt,
                 };
