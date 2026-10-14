@@ -23,7 +23,7 @@ const batch_storage_code_req_size = 256;
 const min_split_range = std.math.maxInt(u256) / (1 << 16);
 const progress_log_interval: std.Io.Duration = .fromSeconds(8);
 const arena_retain_limit = (32 << 20) - 64;
-const max_snap_flush_queue_bytes = 1024 << 20;
+const max_snap_flush_queue_bytes = 2048 << 20;
 
 const log = std.log.scoped(.downloader);
 
