@@ -1278,24 +1278,42 @@ pub const Downloader = struct {
         const storage_roots = req.storage_roots;
         const verified = result.keys.len;
 
-        const continue_from_slot = if (result.continue_from_slot) |from| try self.splitLargeAccount(req, verified, from) else null;
-        const unserved = requested_accounts[verified..];
-        var remaining: usize = 0;
-        var next_start: [32]u8 = if (verified == 0) request.starting_hash else @splat(0);
-        if (continue_from_slot) |slot| {
-            requested_accounts[0] = requested_accounts[verified - 1];
-            storage_roots[0] = storage_roots[verified - 1];
-            next_start = slot;
-            remaining = 1;
+        var next = verified;
+        var starting_hash: [32]u8 = if (verified > 0) @splat(0) else request.starting_hash;
+        if (result.continue_from_slot) |from| {
+            const origin = std.mem.readInt(u256, &from, .big);
+            const limit = std.mem.readInt(u256, &request.limit_hash, .big);
+            if (verified < requested_accounts.len) {
+                if (self.free_snap_requests.pop()) |new_req| {
+                    try self.requestSlots(new_req, req, verified - 1, origin, std.math.maxInt(u256));
+                } else {
+                    next = verified - 1;
+                    starting_hash = from;
+                }
+            } else if (origin <= limit) {
+                const received_from: [32]u8 = if (verified == 1) request.starting_hash else @splat(0);
+                const step = @max(origin - std.mem.readInt(u256, &received_from, .big), min_split_range);
+                if (limit - origin > step and !self.free_snap_requests.empty()) {
+                    std.mem.writeInt(u256, &request.limit_hash, origin + step, .big);
+                    var start = origin + step + 1;
+                    while (self.free_snap_requests.pop()) |new_req| : (start += step + 1) {
+                        const end = if (self.free_snap_requests.empty() or limit - start <= step) limit else start + step;
+                        try self.requestSlots(new_req, req, verified - 1, start, end);
+                        if (end == limit) break;
+                    }
+                }
+                next = verified - 1;
+                starting_hash = from;
+            }
         }
-        std.mem.copyForwards([32]u8, requested_accounts[remaining..][0..unserved.len], unserved);
-        std.mem.copyForwards([32]u8, storage_roots[remaining..][0..unserved.len], storage_roots[verified..]);
-        remaining += unserved.len;
 
+        const remaining = requested_accounts.len - next;
         if (remaining > 0) {
+            std.mem.copyForwards([32]u8, requested_accounts[0..remaining], requested_accounts[next..]);
+            std.mem.copyForwards([32]u8, storage_roots[0..remaining], storage_roots[next..]);
             request.account_hashes = requested_accounts[0..remaining];
             req.storage_roots = storage_roots[0..remaining];
-            request.starting_hash = next_start;
+            request.starting_hash = starting_hash;
             self.sendSnapRequest(req) catch {};
         } else {
             self.allocator.free(@as([][32]u8, requested_accounts.ptr[0..batch_storage_code_req_size]));
@@ -1316,37 +1334,22 @@ pub const Downloader = struct {
         try self.commitTxn(txn, "storage", txn_start);
     }
 
-    fn splitLargeAccount(self: *Self, req: *Request(snap.Message), verified: usize, from: [32]u8) !?[32]u8 {
-        const request = &req.msg.get_storage_ranges;
-        const only_account_left = verified == request.account_hashes.len;
-        const account_limit = if (only_account_left) request.limit_hash else @as([32]u8, @splat(0xff));
-        const origin = std.mem.readInt(u256, &from, .big);
-        const limit = std.mem.readInt(u256, &account_limit, .big);
-        if (limit < origin) return null;
-        if (only_account_left and limit - origin < min_split_range) return from;
-        const new_req = self.free_snap_requests.pop() orelse return from;
-
-        var new_origin = from;
-        if (only_account_left) {
-            std.mem.writeInt(u256, &request.limit_hash, origin / 2 + limit / 2, .big);
-            std.mem.writeInt(u256, &new_origin, origin / 2 + limit / 2 + 1, .big);
-        }
-
+    fn requestSlots(self: *Self, new_req: *Request(snap.Message), req: *const Request(snap.Message), account: usize, start: u256, end: u256) !void {
+        log.debug("requesting slots of account {x} start: {x} end: {x}", .{ req.msg.get_storage_ranges.account_hashes[account], start, end });
         const hashes = try self.allocator.alloc([32]u8, batch_storage_code_req_size);
         errdefer self.allocator.free(hashes);
         const roots = try self.allocator.alloc([32]u8, batch_storage_code_req_size);
-        hashes[0] = request.account_hashes[verified - 1];
-        roots[0] = req.storage_roots[verified - 1];
+        hashes[0] = req.msg.get_storage_ranges.account_hashes[account];
+        roots[0] = req.storage_roots[account];
         new_req.keyspace = .{ 0, 0 };
         new_req.storage_roots = roots[0..1];
         new_req.msg = .{ .get_storage_ranges = .{
             .account_hashes = hashes[0..1],
-            .root_hash = request.root_hash,
-            .starting_hash = new_origin,
-            .limit_hash = account_limit,
+            .root_hash = req.msg.get_storage_ranges.root_hash,
         } };
+        std.mem.writeInt(u256, &new_req.msg.get_storage_ranges.starting_hash, start, .big);
+        std.mem.writeInt(u256, &new_req.msg.get_storage_ranges.limit_hash, end, .big);
         self.sendSnapRequest(new_req) catch {};
-        return if (only_account_left) from else null;
     }
 
     fn requestCodes(self: *Self, req: *Request(snap.Message), code_hashes: [][32]u8) void {

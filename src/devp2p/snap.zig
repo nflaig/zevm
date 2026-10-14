@@ -24,7 +24,7 @@ pub const GetAccountRange = struct {
     root: [32]u8,
     origin: [32]u8,
     limit: [32]u8,
-    bytes: u64 = 10_000_000,
+    bytes: u64 = 2_000_000,
 };
 
 pub const SlimAccount = struct {
@@ -43,7 +43,7 @@ pub const AccountRange = struct {
 pub const GetByteCodes = struct {
     id: u64 = 0,
     hashes: [][32]u8,
-    bytes: u64 = 10_000_000,
+    bytes: u64 = 2_000_000,
 };
 
 pub const ByteCodes = struct {
@@ -57,7 +57,7 @@ pub const GetStorageRanges = struct {
     account_hashes: [][32]u8,
     starting_hash: [32]u8 = @splat(0),
     limit_hash: [32]u8 = @splat(0xff),
-    response_bytes: u64 = 10_000_000,
+    response_bytes: u64 = 2_000_000,
 };
 
 pub const StorageRanges = struct {
