@@ -1174,15 +1174,11 @@ pub const Downloader = struct {
         }
 
         while (true) {
-            const code_request = self.free_snap_requests.pop();
             const storage_request = self.free_snap_requests.pop();
             if (storage_request == null) {
-                if (code_request) |req|
-                    self.free_snap_requests.push(req);
                 return;
             }
             errdefer {
-                self.free_snap_requests.push(code_request.?);
                 self.free_snap_requests.push(storage_request.?);
             }
 
@@ -1198,12 +1194,6 @@ pub const Downloader = struct {
                 storage_roots.len = batch_storage_code_req_size;
                 self.allocator.free(storage_roots);
             }
-            var code_hashes = try self.allocator.alloc([32]u8, batch_storage_code_req_size);
-            code_hashes.len = 0;
-            errdefer {
-                code_hashes.len = batch_storage_code_req_size;
-                self.allocator.free(code_hashes);
-            }
 
             const batch_start = std.mem.readInt(u256, &state.storage_fetch_head, .big);
             const accounts_exhausted = while (true) {
@@ -1212,21 +1202,10 @@ pub const Downloader = struct {
                 state.storage_fetch_head = cur.key[0..32].*;
 
                 const acc = EthDb.decodeAccount(cur.value) catch unreachable;
-
-                var has_code = false;
-                if (!std.meta.eql(acc.code_hash, types.empty_code_hash)) {
-                    has_code = if (try codes_iterator.seekLowerBound(&acc.code_hash)) |res| !res.exact else true;
-                }
                 const has_storage = !std.meta.eql(acc.storage_hash, types.empty_root_hash);
 
-                if (has_code and code_hashes.len == batch_storage_code_req_size or
-                    has_storage and account_hashes.len == batch_storage_code_req_size)
+                if (has_storage and account_hashes.len == batch_storage_code_req_size)
                     break false;
-
-                if (has_code) {
-                    code_hashes.len += 1;
-                    code_hashes[code_hashes.len - 1] = acc.code_hash;
-                }
 
                 if (has_storage) {
                     account_hashes.len += 1;
@@ -1245,9 +1224,7 @@ pub const Downloader = struct {
             );
             storage_request.?.keyspace = .{ batch_start, batch_end };
             storage_request.?.storage_roots = storage_roots;
-            code_request.?.keyspace = .{ batch_start, batch_end };
             self.requestStorageRanges(storage_request.?, state.pivot.state_root, account_hashes);
-            self.requestCodes(code_request.?, code_hashes);
 
             if (accounts_exhausted) {
                 state.storage_and_fetch_initiated = true;
