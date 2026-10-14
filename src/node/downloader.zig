@@ -23,6 +23,7 @@ const batch_storage_code_req_size = 256;
 const min_split_range = std.math.maxInt(u256) / (1 << 16);
 const progress_log_interval: std.Io.Duration = .fromSeconds(8);
 const arena_retain_limit = (32 << 20) - 64;
+const max_snap_flush_queue_bytes = 1024 << 20;
 
 const log = std.log.scoped(.downloader);
 
@@ -51,6 +52,7 @@ pub const Downloader = struct {
     stashed_snap_requests: []Request(snap.Message),
     validating_snap_requests: List(Request(snap.Message)) = .{},
     snap_flush_queue: List(QueuedSnapFlush) = .{},
+    snap_flush_queue_bytes: usize = 0,
 
     validated_responses: std.Io.Queue(ValidatedResponse),
     validation_group: std.Io.Group = .init,
@@ -337,12 +339,14 @@ pub const Downloader = struct {
         };
         node.elem = flush;
         self.snap_flush_queue.insertSorted(&node.elem, QueuedSnapFlush.lessThan);
+        self.snap_flush_queue_bytes += node.elem.size();
     }
 
     fn drainSnapFlushQueue(self: *Self) !void {
         while (self.snap_flush_queue.pop()) |flush| {
             if (self.hasPrecedingSnapRequest(flush)) return self.snap_flush_queue.prepend(flush);
 
+            self.snap_flush_queue_bytes -= flush.size();
             defer flush.deinit(self.allocator);
             switch (flush.response.msg) {
                 .account_range => |*account_range| try self.persistAccounts(flush.validation_outcome.accounts, account_range),
@@ -360,9 +364,6 @@ pub const Downloader = struct {
                 const request: *List(Request(snap.Message)).Node = @alignCast(@fieldParentPtr("node", list_node));
                 if (flush.isPrecededBy(request.elem.msg)) return true;
             }
-        }
-        for (self.stashed_snap_requests) |request| {
-            if (flush.isPrecededBy(request.msg)) return true;
         }
         return false;
     }
@@ -691,12 +692,20 @@ pub const Downloader = struct {
     }
 
     fn reissueSnapRequest(self: *Self, req: *Request(snap.Message)) !void {
+        if (self.snapFlushQueueFull()) {
+            const head_node = self.snap_flush_queue.inner.first orelse return error.SnapFlushQueueFull;
+            const head = &@as(*List(QueuedSnapFlush).Node, @alignCast(@fieldParentPtr("node", head_node))).elem;
+            if (!head.isPrecededBy(req.msg)) return error.SnapFlushQueueFull;
+        }
         return self.sendRequest(self.snap_provider, Self.pickSnapPeer, req);
     }
 
+    fn snapFlushQueueFull(self: *Self) bool {
+        if (self.state_heal) |state_heal| if (!state_heal.bal_requested) return true;
+        return self.snap_flush_queue_bytes > max_snap_flush_queue_bytes;
+    }
+
     fn drainPendingSnapRequests(self: *Self) void {
-        // until the heal requests an access list, pending requests are download follow ups to be stashed
-        if (self.state_heal) |state_heal| if (!state_heal.bal_requested) return;
         drainPendingRequests(self, &self.pending_snap_requests, &self.inflight_snap_requests, Self.reissueSnapRequest);
     }
 
@@ -1408,7 +1417,7 @@ pub const Downloader = struct {
         }
 
         if (state_heal.bal_requested == false) {
-            if (!self.validating_snap_requests.empty()) return;
+            if (!self.validating_snap_requests.empty() or !self.snap_flush_queue.empty()) return;
             self.stashSnapRequests();
             const bal_req = self.free_eth_requests.pop() orelse return;
 
@@ -1720,6 +1729,10 @@ const QueuedSnapFlush = struct {
     fn deinit(self: *const QueuedSnapFlush, allocator: std.mem.Allocator) void {
         allocator.free(self.response.read.payload);
         self.arena.deinit();
+    }
+
+    fn size(self: *const QueuedSnapFlush) usize {
+        return self.arena.queryCapacity() + self.response.read.payload.len;
     }
 
     fn lessThan(_: void, left: QueuedSnapFlush, right: QueuedSnapFlush) bool {
