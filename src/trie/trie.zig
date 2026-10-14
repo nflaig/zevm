@@ -105,6 +105,11 @@ pub const Trie = struct {
     skipped_deletions: bool = false,
 
     pub const NodeResolver = struct {
+        /// Borrowed for the duration of the trie operation. `path` is a
+        /// root-relative nibble path valid only during the callback. Return
+        /// null for an unavailable preimage; callback errors propagate.
+        /// Returned RLP bytes must remain valid until the trie copies them
+        /// immediately after the callback. The trie verifies their hash first.
         ptr: *anyopaque,
         resolveFn: *const fn (ptr: *anyopaque, path: []const u8, node_hash: [32]u8) anyerror!?[]const u8,
     };
@@ -969,4 +974,154 @@ test "a write in the same batch keeps the branch from collapsing onto a missing 
     var expected = std.array_list.Managed(u8).init(a);
     try rlp.serialize([17][]const u8, a, expected_branch, &expected);
     try std.testing.expectEqualSlices(u8, &keccak256(expected.items), &try t.rootHash());
+}
+
+const ResolverFixture = struct {
+    root: [32]u8,
+    key: [32]u8,
+    sibling: [32]u8,
+    encoded_sibling: []u8,
+    expected: [32]u8,
+    nodes: NodesHashMap,
+
+    fn init(a: std.mem.Allocator) !ResolverFixture {
+        var leaf_path: [30]u8 = @splat(0);
+        leaf_path[0] = 0x30; // 59 nibbles after the extension and branch
+        const value_a: [32]u8 = @splat(0xaa);
+        const value_b: [32]u8 = @splat(0xbb);
+        var leaf_a = std.array_list.Managed(u8).init(a);
+        var leaf_b = std.array_list.Managed(u8).init(a);
+        try rlp.serialize([2][]const u8, a, .{ &leaf_path, &value_a }, &leaf_a);
+        try rlp.serialize([2][]const u8, a, .{ &leaf_path, &value_b }, &leaf_b);
+        const hash_a = keccak256(leaf_a.items);
+        const hash_b = keccak256(leaf_b.items);
+        var children: [17][]const u8 = @splat(&.{});
+        children[0] = &hash_a;
+        children[1] = &hash_b;
+        var branch = std.array_list.Managed(u8).init(a);
+        try rlp.serialize([17][]const u8, a, children, &branch);
+        const branch_hash = keccak256(branch.items);
+        var extension = std.array_list.Managed(u8).init(a);
+        try rlp.serialize([2][]const u8, a, .{ &.{ 0x00, 0x0a, 0x0b }, &branch_hash }, &extension);
+        const root = keccak256(extension.items);
+        var nodes: NodesHashMap = .empty;
+        try nodes.put(a, root, extension.items);
+        try nodes.put(a, branch_hash, branch.items);
+        try nodes.put(a, hash_a, leaf_a.items);
+        var key: [32]u8 = @splat(0);
+        key[0..2].* = .{ 0x0a, 0x0b };
+        var remaining_path: [33]u8 = @splat(0);
+        remaining_path[0..4].* = .{ 0x20, 0x0a, 0x0b, 0x10 };
+        var expected = std.array_list.Managed(u8).init(a);
+        try rlp.serialize([2][]const u8, a, .{ &remaining_path, &value_b }, &expected);
+        return .{ .root = root, .key = key, .sibling = hash_b, .encoded_sibling = leaf_b.items, .expected = keccak256(expected.items), .nodes = nodes };
+    }
+};
+
+const ResolverResponse = struct {
+    fixture: *const ResolverFixture,
+    mode: enum { missing, wrong_hash, failed, present },
+    path: [64]u8 = @splat(0),
+    depth: usize = 0,
+    calls: usize = 0,
+
+    fn resolve(ptr: *anyopaque, path: []const u8, hash: [32]u8) anyerror!?[]const u8 {
+        const self: *ResolverResponse = @ptrCast(@alignCast(ptr));
+        try std.testing.expectEqual(self.fixture.sibling, hash);
+        self.depth = path.len;
+        @memcpy(self.path[0..path.len], path);
+        self.calls += 1;
+        return switch (self.mode) {
+            .missing => null,
+            .wrong_hash => &.{0xc0},
+            .failed => error.ResolverUnavailable,
+            .present => self.fixture.encoded_sibling,
+        };
+    }
+};
+
+test "resolver includes extension paths and owns returned preimages" {
+    var source = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer source.deinit();
+    const fixture = try ResolverFixture.init(source.allocator());
+    var snapshot = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer snapshot.deinit();
+    var trie = try loadFromNodesMap(snapshot.allocator(), fixture.root, &fixture.nodes);
+    var response: ResolverResponse = .{ .fixture = &fixture, .mode = .present };
+    trie.resolver = .{ .ptr = &response, .resolveFn = ResolverResponse.resolve };
+    var values = [_][]const u8{&.{}};
+    try trie.update(&.{fixture.key}, &values);
+    try std.testing.expectEqual(1, response.calls);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 10, 0, 11, 1 }, response.path[0..response.depth]);
+    // The caller may reuse its response buffer once the operation returns.
+    @memset(fixture.encoded_sibling, 0xcc);
+    try std.testing.expectEqual(fixture.expected, try trie.rootHash());
+}
+
+test "resolver missing nodes hash mismatches and callback errors propagate" {
+    var source = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer source.deinit();
+    const fixture = try ResolverFixture.init(source.allocator());
+    for ([_]@TypeOf(@as(ResolverResponse, undefined).mode){ .missing, .wrong_hash, .failed }) |mode| {
+        var snapshot = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer snapshot.deinit();
+        var trie = try loadFromNodesMap(snapshot.allocator(), fixture.root, &fixture.nodes);
+        var response: ResolverResponse = .{ .fixture = &fixture, .mode = mode };
+        trie.resolver = .{ .ptr = &response, .resolveFn = ResolverResponse.resolve };
+        var values = [_][]const u8{&.{}};
+        const expected_error = switch (mode) {
+            .missing => error.SubTrieNotAvailable,
+            .wrong_hash => error.InvalidTrieNode,
+            .failed => error.ResolverUnavailable,
+            .present => unreachable,
+        };
+        try std.testing.expectError(expected_error, trie.update(&.{fixture.key}, &values));
+        try std.testing.expectEqual(1, response.calls);
+        try std.testing.expectEqualSlices(u8, &.{ 0, 10, 0, 11, 1 }, response.path[0..response.depth]);
+        // Errors discard this mutable snapshot; the source is still reusable.
+        var fresh = try loadFromNodesMap(snapshot.allocator(), fixture.root, &fixture.nodes);
+        try std.testing.expectEqual(fixture.root, try fresh.rootHash());
+    }
+}
+
+fn resolverAllocationCase(allocator: std.mem.Allocator) !void {
+    var source = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer source.deinit();
+    const fixture = try ResolverFixture.init(source.allocator());
+    var snapshot = std.heap.ArenaAllocator.init(allocator);
+    defer snapshot.deinit();
+    const Context = struct {
+        fixture: *const ResolverFixture,
+        calls: usize = 0,
+
+        fn resolve(ptr: *anyopaque, path: []const u8, hash: [32]u8) anyerror!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const expected_depths = [_]usize{ 0, 4, 5 };
+            try std.testing.expect(self.calls < expected_depths.len);
+            try std.testing.expectEqual(expected_depths[self.calls], path.len);
+            self.calls += 1;
+            return self.fixture.nodes.get(hash);
+        }
+    };
+    var context: Context = .{ .fixture = &fixture };
+    const empty: NodesHashMap = .empty;
+    var lazy = try loadFromNodesMap(snapshot.allocator(), fixture.root, &empty);
+    lazy.resolver = .{ .ptr = &context, .resolveFn = Context.resolve };
+    var values = [_][]const u8{&.{ 1, 2, 3 }};
+    try lazy.update(&.{fixture.key}, &values);
+    try std.testing.expectEqual(3, context.calls);
+    var eager = try loadFromNodesMap(source.allocator(), fixture.root, &fixture.nodes);
+    try eager.update(&.{fixture.key}, &values);
+    try std.testing.expectEqual(try eager.rootHash(), try lazy.rootHash());
+}
+
+test "resolver lazy writes and allocation failures release snapshot memory" {
+    const a = std.testing.allocator;
+    const deterministic: std.mem.Allocator = .{ .ptr = a.ptr, .vtable = &.{
+        .alloc = a.vtable.alloc,
+        .resize = std.mem.Allocator.noResize,
+        .remap = std.mem.Allocator.noRemap,
+        .free = a.vtable.free,
+    } };
+    try std.testing.checkAllAllocationFailures(deterministic, resolverAllocationCase, .{});
 }
