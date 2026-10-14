@@ -433,7 +433,13 @@ pub const Downloader = struct {
             accounts,
             if (response.proof.len > 0) &proof else null,
         );
-        return .{ .accounts = .{ .origin = request.origin, .limit = request.limit, .hashes = hashes, .has_more = has_more } };
+        const served = countBelowLimit(hashes, request.limit);
+        return .{ .accounts = .{
+            .origin = request.origin,
+            .limit = request.limit,
+            .hashes = hashes[0..served],
+            .has_more = has_more and served == hashes.len,
+        } };
     }
 
     fn verifyStorage(
@@ -475,10 +481,14 @@ pub const Downloader = struct {
                 if (is_last and response.proof.len > 0) &proof else null,
             ) catch break;
 
-            result.keys[index] = keys;
-            result.values[index] = values;
+            const served_slots = if (index + 1 == request.account_hashes.len)
+                countBelowLimit(keys, request.limit_hash)
+            else
+                keys.len;
+            result.keys[index] = keys[0..served_slots];
+            result.values[index] = values[0..served_slots];
             verified = index + 1;
-            if (has_more) {
+            if (has_more and served_slots == keys.len) {
                 result.continue_from_slot = origin;
                 if (keys.len > 0)
                     std.mem.writeInt(
@@ -494,6 +504,13 @@ pub const Downloader = struct {
         result.keys = result.keys[0..verified];
         result.values = result.values[0..verified];
         return .{ .storage = result };
+    }
+
+    fn countBelowLimit(keys: []const [32]u8, limit: [32]u8) usize {
+        for (keys, 0..) |key, index| {
+            if (std.mem.order(u8, &key, &limit) == .gt) return index;
+        }
+        return keys.len;
     }
 
     fn hashCodes(allocator: std.mem.Allocator, response: snap.ByteCodes) !ValidationOutcome {
