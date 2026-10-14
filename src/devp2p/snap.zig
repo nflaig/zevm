@@ -104,7 +104,7 @@ pub const Config: proto.Config = .{
     .Message = Message,
     .default_rtt = .fromSeconds(5),
     .min_timeout = .fromSeconds(10),
-    .max_rtt = .fromSeconds(30),
+    .max_rtt = .fromSeconds(20),
 };
 
 pub const Provider = proto.Provider(Config);
