@@ -336,7 +336,7 @@ pub const Downloader = struct {
             return err;
         };
         node.elem = flush;
-        self.snap_flush_queue.push(&node.elem);
+        self.snap_flush_queue.insertSorted(&node.elem, QueuedSnapFlush.lessThan);
     }
 
     fn drainSnapFlushQueue(self: *Self) !void {
@@ -1701,6 +1701,31 @@ const QueuedSnapFlush = struct {
     fn deinit(self: *const QueuedSnapFlush, allocator: std.mem.Allocator) void {
         allocator.free(self.response.read.payload);
         self.arena.deinit();
+    }
+
+    fn lessThan(_: void, left: QueuedSnapFlush, right: QueuedSnapFlush) bool {
+        const left_tag = std.meta.activeTag(left.validation_outcome);
+        const right_tag = std.meta.activeTag(right.validation_outcome);
+        if (left_tag != right_tag) return @backingInt(left_tag) < @backingInt(right_tag);
+        return switch (std.mem.order(u8, &left.firstKey(), &right.firstKey())) {
+            .lt => true,
+            .gt => false,
+            .eq => left_tag == .storage and std.mem.order(u8, &firstSlot(left.validation_outcome.storage), &firstSlot(right.validation_outcome.storage)) == .lt,
+        };
+    }
+
+    fn firstSlot(storage: VerifiedStorage) [32]u8 {
+        return if (storage.keys.len > 0 and storage.keys[0].len > 0) storage.keys[0][0] else @splat(0);
+    }
+
+    fn firstKey(self: *const QueuedSnapFlush) [32]u8 {
+        const keys: []const [32]u8 = switch (self.validation_outcome) {
+            .accounts => |accounts| return accounts.origin,
+            .storage => |storage| storage.account_hashes,
+            .codes => |hashes| hashes,
+            else => unreachable,
+        };
+        return if (keys.len > 0) keys[0] else @splat(0);
     }
 };
 
