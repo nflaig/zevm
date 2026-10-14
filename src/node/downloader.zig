@@ -275,8 +275,8 @@ pub const Downloader = struct {
                 else => unreachable,
             },
             .snap => |*resp| switch (resp.msg.msg) {
-                .account_range => |*account_range| verifyAccounts(allocator, resp.req.msg.get_account_range, account_range),
-                .storage_ranges => |*storage_ranges| verifyStorage(allocator, resp.req.msg.get_storage_ranges, resp.req.storage_roots, storage_ranges),
+                .account_range => |*account_range| self.verifyAccounts(allocator, resp.req.msg.get_account_range, account_range),
+                .storage_ranges => |*storage_ranges| self.verifyStorage(allocator, resp.req.msg.get_storage_ranges, resp.req.storage_roots, storage_ranges),
                 .byte_codes => |byte_codes| hashCodes(allocator, byte_codes),
                 else => unreachable,
             },
@@ -406,24 +406,27 @@ pub const Downloader = struct {
         return .{ .bal = .{ .hash = hash, .parsed = parsed } };
     }
 
-    fn verifyAccounts(allocator: std.mem.Allocator, request: snap.GetAccountRange, response: *const snap.AccountRange) !ValidationOutcome {
+    fn verifyAccounts(self: *Self, allocator: std.mem.Allocator, request: snap.GetAccountRange, response: *const snap.AccountRange) !ValidationOutcome {
         if (response.accounts.len == 0 and response.proof.len == 0) return error.EmptyAccountRange;
+        var scratch_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch_arena.deinit();
+        const scratch = scratch_arena.allocator();
         const hashes = try allocator.alloc([32]u8, response.accounts.len);
-        const accounts = try allocator.alloc([]const u8, response.accounts.len);
+        const accounts = try scratch.alloc([]const u8, response.accounts.len);
         for (response.accounts, 0..) |elem, index| {
             hashes[index] = elem.hash;
 
             var slim_account: snap.SlimAccount = undefined;
-            _ = try rlp.deserialize(snap.SlimAccount, allocator, elem.account.value, &slim_account);
+            _ = try rlp.deserialize(snap.SlimAccount, scratch, elem.account.value, &slim_account);
 
-            var list = std.array_list.Managed(u8).init(allocator);
-            try rlp.serialize(types.Account, allocator, slimToFullAccount(slim_account), &list);
+            var list = std.array_list.Managed(u8).init(scratch);
+            try rlp.serialize(types.Account, scratch, slimToFullAccount(slim_account), &list);
             accounts[index] = try list.toOwnedSlice();
         }
 
-        const proof = try proofNodes(allocator, response.proof);
+        const proof = try proofNodes(scratch, response.proof);
         const has_more = try verifyRangeProof(
-            allocator,
+            scratch,
             request.root,
             request.origin,
             hashes,
@@ -434,13 +437,17 @@ pub const Downloader = struct {
     }
 
     fn verifyStorage(
+        self: *Self,
         allocator: std.mem.Allocator,
         request: snap.GetStorageRanges,
         storage_roots: []const [32]u8,
         response: *const snap.StorageRanges,
     ) !ValidationOutcome {
         if (response.slots.len == 0) return error.EmptyStorageRanges;
-        const proof = try proofNodes(allocator, response.proof);
+        var scratch_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch_arena.deinit();
+        const scratch = scratch_arena.allocator();
+        const proof = try proofNodes(scratch, response.proof);
 
         const served = response.slots[0..@min(response.slots.len, request.account_hashes.len)];
         var result: VerifiedStorage = .{
@@ -460,7 +467,7 @@ pub const Downloader = struct {
             }
 
             const has_more = verifyRangeProof(
-                allocator,
+                scratch,
                 storage_roots[index],
                 origin,
                 keys,
