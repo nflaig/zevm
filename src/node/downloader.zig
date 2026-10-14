@@ -1063,8 +1063,11 @@ pub const Downloader = struct {
             const hashes = accounts.hashes;
             const last = if (hashes.len > 0) hashes[hashes.len - 1] else get_accounts_range.limit;
             log.debug("verified account range {x}-{x}", .{ get_accounts_range.origin, last });
-            if (accounts.has_more and std.mem.order(u8, &last, &get_accounts_range.limit) == .lt)
-                continue_from_account = last;
+            if (accounts.has_more and std.mem.order(u8, &last, &get_accounts_range.limit) == .lt) {
+                var next: [32]u8 = undefined;
+                std.mem.writeInt(u256, &next, std.mem.readInt(u256, &last, .big) + 1, .big);
+                continue_from_account = next;
+            }
             const covered_until = if (accounts.has_more) last else get_accounts_range.limit;
             self.progress.account_keyspace +|= std.mem.readInt(u256, &covered_until, .big) - std.mem.readInt(u256, &get_accounts_range.origin, .big);
         } else |_| {
