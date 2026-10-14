@@ -680,6 +680,11 @@ pub const Downloader = struct {
         return self.sendRequest(self.eth_provider, Self.pickEthPeer, req);
     }
 
+    fn popFreeEthRequest(self: *Self) ?*Request(eth.Message) {
+        if (!self.pending_eth_requests.empty()) return null;
+        return self.free_eth_requests.pop();
+    }
+
     fn drainPendingEthRequests(self: *Self) void {
         drainPendingRequests(self, &self.pending_eth_requests, &self.inflight_eth_requests, Self.reissueEthRequest);
     }
@@ -710,6 +715,11 @@ pub const Downloader = struct {
     fn snapFlushQueueFull(self: *Self) bool {
         if (self.state_heal) |state_heal| if (!state_heal.bal_requested) return true;
         return self.snap_flush_queue_bytes > max_snap_flush_queue_bytes;
+    }
+
+    fn popFreeSnapRequest(self: *Self) ?*Request(snap.Message) {
+        if (!self.pending_snap_requests.empty()) return null;
+        return self.free_snap_requests.pop();
     }
 
     fn drainPendingSnapRequests(self: *Self) void {
@@ -765,7 +775,7 @@ pub const Downloader = struct {
             // target moved, fill the gap from new head to old head
             requestHeaders(
                 self,
-                self.free_eth_requests.pop() orelse return,
+                self.popFreeEthRequest() orelse return,
                 .{ .hash = target.hash },
                 target.number - status.requested_header_head,
             );
@@ -780,7 +790,7 @@ pub const Downloader = struct {
             const batch_size = @as(u64, @min(1023, origin_num - target.cutoff_number)) + 1;
             requestHeaders(
                 self,
-                self.free_eth_requests.pop() orelse return,
+                self.popFreeEthRequest() orelse return,
                 origin,
                 batch_size,
             );
@@ -1122,7 +1132,7 @@ pub const Downloader = struct {
             const limit = if (max - origin > state.account_fetch_step +| 1) origin + state.account_fetch_step else max;
             self.requestAccountRange(req, state.pivot.state_root, origin, limit);
             state.account_fetch_head = limit +| 1;
-            req = self.free_snap_requests.pop() orelse return;
+            req = self.popFreeSnapRequest() orelse return;
         }
         self.free_snap_requests.push(req);
     }
@@ -1174,7 +1184,7 @@ pub const Downloader = struct {
         }
 
         while (true) {
-            const storage_request = self.free_snap_requests.pop();
+            const storage_request = self.popFreeSnapRequest();
             if (storage_request == null) {
                 return;
             }
