@@ -50,6 +50,7 @@ pub const Downloader = struct {
     pending_snap_requests: List(Request(snap.Message)) = .{},
     stashed_snap_requests: []Request(snap.Message),
     validating_snap_requests: List(Request(snap.Message)) = .{},
+    snap_flush_queue: List(QueuedSnapFlush) = .{},
 
     validated_responses: std.Io.Queue(ValidatedResponse),
     validation_group: std.Io.Group = .init,
@@ -284,8 +285,6 @@ pub const Downloader = struct {
     }
 
     fn handleValidated(self: *Self, validated: ValidatedResponse) !void {
-        defer validated.deinit(self.allocator);
-
         if (validated.outcome) |_| {} else |err| switch (validated.resp) {
             inline else => |resp, proto| {
                 log.debug("dropping peer {} for an invalid {s}: {}", .{ resp.req.peer.peer_index, validated.resp.msgName(), err });
@@ -296,6 +295,8 @@ pub const Downloader = struct {
 
         switch (validated.resp) {
             .eth => |*resp| {
+                defer validated.deinit(self.allocator);
+
                 self.validating_eth_requests.remove(resp.req);
                 switch (resp.msg.msg) {
                     .block_headers => try self.handleHeaders(resp.req, validated.outcome),
@@ -305,19 +306,48 @@ pub const Downloader = struct {
                 self.drainPendingEthRequests();
             },
             .snap => |*resp| {
-                self.validating_snap_requests.remove(resp.req);
-                switch (resp.msg.msg) {
-                    .account_range => |*account_range| try self.handleAccounts(resp.req, account_range, validated.outcome),
-                    .storage_ranges => try self.handleStorage(resp.req, validated.outcome),
-                    .byte_codes => |byte_codes| try self.handleCodes(resp.req, byte_codes, validated.outcome),
-                    else => unreachable,
+                {
+                    errdefer validated.deinit(self.allocator);
+                    self.validating_snap_requests.remove(resp.req);
+                    switch (resp.msg.msg) {
+                        .account_range => try self.handleAccounts(resp.req, validated.outcome),
+                        .storage_ranges => try self.handleStorage(resp.req, validated.outcome),
+                        .byte_codes => try self.handleCodes(resp.req, validated.outcome),
+                        else => unreachable,
+                    }
                 }
+                try self.queueSnapFlush(validated);
+                try self.drainSnapFlushQueue();
+
                 self.drainPendingSnapRequests();
                 if (self.state != null)
                     try self.advanceStateDownload();
                 if (self.state_heal != null)
                     try self.advanceStateHeal();
             },
+        }
+    }
+
+    fn queueSnapFlush(self: *Self, validated: ValidatedResponse) !void {
+        const outcome = validated.outcome catch return validated.deinit(self.allocator);
+        var flush: QueuedSnapFlush = .{ .arena = validated.arena, .response = validated.resp.snap.msg, .validation_outcome = outcome };
+        const node = flush.arena.allocator().create(List(QueuedSnapFlush).Node) catch |err| {
+            flush.deinit(self.allocator);
+            return err;
+        };
+        node.elem = flush;
+        self.snap_flush_queue.push(&node.elem);
+    }
+
+    fn drainSnapFlushQueue(self: *Self) !void {
+        while (self.snap_flush_queue.pop()) |flush| {
+            defer flush.deinit(self.allocator);
+            switch (flush.response.msg) {
+                .account_range => |*account_range| try self.persistAccounts(flush.validation_outcome.accounts, account_range),
+                .storage_ranges => try self.persistStorage(flush.validation_outcome.storage),
+                .byte_codes => |byte_codes| try self.persistCodes(flush.validation_outcome.codes, byte_codes.bytecodes),
+                else => unreachable,
+            }
         }
     }
 
@@ -383,7 +413,7 @@ pub const Downloader = struct {
             accounts,
             if (response.proof.len > 0) &proof else null,
         );
-        return .{ .accounts = .{ .hashes = hashes, .has_more = has_more } };
+        return .{ .accounts = .{ .origin = request.origin, .limit = request.limit, .hashes = hashes, .has_more = has_more } };
     }
 
     fn verifyStorage(
@@ -436,6 +466,7 @@ pub const Downloader = struct {
                 break;
             }
         }
+        result.account_hashes = try allocator.dupe([32]u8, request.account_hashes[0..verified]);
         result.keys = result.keys[0..verified];
         result.values = result.values[0..verified];
         return .{ .storage = result };
@@ -1007,7 +1038,7 @@ pub const Downloader = struct {
         self.sendSnapRequest(req) catch {};
     }
 
-    fn handleAccounts(self: *Self, request: *Request(snap.Message), response: *const snap.AccountRange, outcome: anyerror!ValidationOutcome) !void {
+    fn handleAccounts(self: *Self, request: *Request(snap.Message), outcome: anyerror!ValidationOutcome) !void {
         const get_accounts_range = request.msg.get_account_range;
 
         var continue_from_account: ?[32]u8 = null;
@@ -1018,7 +1049,6 @@ pub const Downloader = struct {
             log.debug("verified account range {x}-{x}", .{ get_accounts_range.origin, last });
             if (accounts.has_more and std.mem.order(u8, &last, &get_accounts_range.limit) == .lt)
                 continue_from_account = last;
-            try self.persistAccounts(get_accounts_range, hashes, response);
             const covered_until = if (accounts.has_more) last else get_accounts_range.limit;
             self.progress.account_keyspace +|= std.mem.readInt(u256, &covered_until, .big) - std.mem.readInt(u256, &get_accounts_range.origin, .big);
         } else |_| {
@@ -1062,7 +1092,7 @@ pub const Downloader = struct {
         self.free_snap_requests.push(req);
     }
 
-    fn persistAccounts(self: *Self, request: snap.GetAccountRange, hashes: [][32]u8, response: *const snap.AccountRange) !void {
+    fn persistAccounts(self: *Self, accounts: VerifiedAccounts, response: *const snap.AccountRange) !void {
         const txn_start = std.Io.Timestamp.now(self.io, .awake);
         const txn = try self.eth_db.kv_store.transaction_rw();
         errdefer _ = txn.abort() catch |e| {
@@ -1070,12 +1100,12 @@ pub const Downloader = struct {
         };
 
         const table = self.eth_db.kv_store.table(txn, .accounts);
-        for (hashes, 0..) |hash, index| {
+        for (accounts.hashes, 0..) |hash, index| {
             try table.set(&hash, response.accounts[index].account.value, .Upsert);
         }
         // a proven single account query that doesn't return the account means it no longer exists
-        if (std.meta.eql(request.origin, request.limit) and (hashes.len == 0 or !std.meta.eql(hashes[0], request.origin))) {
-            try self.eth_db.deleteAccount(txn, request.origin);
+        if (std.meta.eql(accounts.origin, accounts.limit) and (accounts.hashes.len == 0 or !std.meta.eql(accounts.hashes[0], accounts.origin))) {
+            try self.eth_db.deleteAccount(txn, accounts.origin);
         }
 
         try self.commitTxn(txn, "accounts", txn_start);
@@ -1205,7 +1235,6 @@ pub const Downloader = struct {
         const requested_accounts = request.account_hashes;
         const storage_roots = req.storage_roots;
         const verified = result.keys.len;
-        try self.persistStorage(requested_accounts[0..verified], result);
 
         const continue_from_slot = if (result.continue_from_slot) |from| try self.splitLargeAccount(req, verified, from) else null;
         const unserved = requested_accounts[verified..];
@@ -1234,13 +1263,13 @@ pub const Downloader = struct {
         }
     }
 
-    fn persistStorage(self: *Self, account_hashes: []const [32]u8, storage: VerifiedStorage) !void {
+    fn persistStorage(self: *Self, storage: VerifiedStorage) !void {
         const txn_start = std.Io.Timestamp.now(self.io, .awake);
         const txn = try self.eth_db.kv_store.transaction_rw();
         errdefer _ = txn.abort() catch |e| {
             log.err("failed to abort txn {}", .{e});
         };
-        for (account_hashes, storage.keys, storage.values) |account_hash, keys, values|
+        for (storage.account_hashes, storage.keys, storage.values) |account_hash, keys, values|
             try self.eth_db.insertStorage(txn, account_hash, keys, values);
         try self.commitTxn(txn, "storage", txn_start);
     }
@@ -1286,23 +1315,21 @@ pub const Downloader = struct {
         self.sendSnapRequest(req) catch {};
     }
 
-    fn handleCodes(self: *Self, req: *Request(snap.Message), codes: snap.ByteCodes, outcome: anyerror!ValidationOutcome) !void {
+    fn handleCodes(self: *Self, req: *Request(snap.Message), outcome: anyerror!ValidationOutcome) !void {
         const code_hashes: [][32]u8 = if (outcome) |result| result.codes else |_| &.{};
-        const served_codes = if (outcome) |_| codes.bytecodes else |_| &.{};
 
         const requested_hashes = req.msg.get_byte_codes.hashes;
 
         var retry_count: usize = 0;
         var next_hash_index: usize = 0;
-        const matched = for (code_hashes, 0..) |code_hash, index| {
+        for (code_hashes) |code_hash| {
             while (next_hash_index < requested_hashes.len and !std.meta.eql(requested_hashes[next_hash_index], code_hash)) : (next_hash_index += 1) {
                 requested_hashes[retry_count] = requested_hashes[next_hash_index];
                 retry_count += 1;
             }
-            if (next_hash_index == requested_hashes.len) break index;
+            if (next_hash_index == requested_hashes.len) break;
             next_hash_index += 1;
-        } else code_hashes.len;
-        try self.persistCodes(code_hashes[0..matched], served_codes[0..matched]);
+        }
 
         const unserved = requested_hashes[next_hash_index..];
         std.mem.copyForwards([32]u8, requested_hashes[retry_count..][0..unserved.len], unserved);
@@ -1653,14 +1680,28 @@ const ValidationOutcome = union(enum) {
 };
 
 const VerifiedAccounts = struct {
+    origin: [32]u8,
+    limit: [32]u8,
     hashes: [][32]u8,
     has_more: bool,
 };
 
 const VerifiedStorage = struct {
+    account_hashes: [][32]u8 = &.{},
     keys: [][][32]u8 = &.{},
     values: [][][]const u8 = &.{},
     continue_from_slot: ?[32]u8 = null,
+};
+
+const QueuedSnapFlush = struct {
+    arena: std.heap.ArenaAllocator,
+    response: snap.Provider.ParsedMessage,
+    validation_outcome: ValidationOutcome,
+
+    fn deinit(self: *const QueuedSnapFlush, allocator: std.mem.Allocator) void {
+        allocator.free(self.response.read.payload);
+        self.arena.deinit();
+    }
 };
 
 const invalid_peer: rlpx.Server.PeerId = .{
