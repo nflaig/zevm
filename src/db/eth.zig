@@ -71,12 +71,19 @@ pub const Eth = struct {
         return buf[0 .. 32 + value_rlp.len];
     }
 
-    pub fn insertStorage(self: *Self, txn: kv.Transaction, account_hash: [32]u8, slot_hashes: []const [32]u8, values_rlp: []const []const u8) !void {
+    pub fn appendStorage(self: *Self, txn: kv.Transaction, account_hash: [32]u8, slot_hashes: []const [32]u8, values_rlp: []const []const u8) !void {
         const cursor = try self.kv_store.table(txn, .storage).cursor();
         defer cursor.deinit();
         var buf: [32 + max_value_rlp_len]u8 = undefined;
+        var k: lmdbx.c.MDBX_val = .{ .iov_len = account_hash.len, .iov_base = @constCast(&account_hash) };
         for (slot_hashes, values_rlp) |slot_hash, value_rlp| {
-            try cursor.put(&account_hash, try encodeSlot(&buf, slot_hash, value_rlp), .Upsert);
+            const slot = try encodeSlot(&buf, slot_hash, value_rlp);
+            var v: lmdbx.c.MDBX_val = .{ .iov_len = slot.len, .iov_base = @constCast(slot.ptr) };
+            switch (lmdbx.c.mdbx_cursor_put(cursor.ptr, &k, &v, lmdbx.c.MDBX_APPEND | lmdbx.c.MDBX_APPENDDUP)) {
+                lmdbx.c.MDBX_SUCCESS => {},
+                lmdbx.c.MDBX_EKEYMISMATCH => return lmdbx.Error.MDBX_EKEYMISMATCH,
+                else => return error.StorageAppendFailed,
+            }
         }
     }
 

@@ -1293,7 +1293,7 @@ pub const Downloader = struct {
             log.err("failed to abort txn {}", .{e});
         };
         for (storage.account_hashes, storage.keys, storage.values) |account_hash, keys, values|
-            try self.eth_db.insertStorage(txn, account_hash, keys, values);
+            try self.eth_db.appendStorage(txn, account_hash, keys, values);
         try self.commitTxn(txn, "storage", txn_start);
     }
 
