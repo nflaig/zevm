@@ -51,7 +51,7 @@ pub const Downloader = struct {
     stashed_snap_requests: []Request(snap.Message),
     validating_snap_requests: List(Request(snap.Message)) = .{},
 
-    validated_responses: std.Io.Queue(*ValidatedResponse),
+    validated_responses: std.Io.Queue(ValidatedResponse),
     validation_group: std.Io.Group = .init,
 
     sync_target: SyncTarget,
@@ -125,7 +125,7 @@ pub const Downloader = struct {
                 .cutoff_number = head.number,
                 .cutoff_hash = head.hash,
             },
-            .validated_responses = .init(try allocator.alloc(*ValidatedResponse, 2 * max_inflight_requests)),
+            .validated_responses = .init(try allocator.alloc(ValidatedResponse, 2 * max_inflight_requests)),
         };
     }
 
@@ -134,7 +134,7 @@ pub const Downloader = struct {
         const msg = union(tag) {
             eth: @typeInfo(@TypeOf(eth.Provider.next)).@"fn".return_type.?,
             snap: @typeInfo(@TypeOf(snap.Provider.next)).@"fn".return_type.?,
-            validated: @typeInfo(@TypeOf(std.Io.Queue(*ValidatedResponse).getOne)).@"fn".return_type.?,
+            validated: @typeInfo(@TypeOf(std.Io.Queue(ValidatedResponse).getOne)).@"fn".return_type.?,
             tick: @typeInfo(@TypeOf(std.Io.sleep)).@"fn".return_type.?,
         };
 
@@ -144,7 +144,7 @@ pub const Downloader = struct {
 
         try select.concurrent(.eth, eth.Provider.next, .{ self.eth_provider, self.io, self.eth_arena.allocator(), self.allocator });
         try select.concurrent(.snap, snap.Provider.next, .{ self.snap_provider, self.io, self.snap_arena.allocator(), self.allocator });
-        try select.concurrent(.validated, std.Io.Queue(*ValidatedResponse).getOne, .{ &self.validated_responses, self.io });
+        try select.concurrent(.validated, std.Io.Queue(ValidatedResponse).getOne, .{ &self.validated_responses, self.io });
         try select.concurrent(.tick, std.Io.sleep, .{ self.io, .fromSeconds(1), .real });
 
         var busy_start = std.Io.Timestamp.now(self.io, .awake);
@@ -181,11 +181,10 @@ pub const Downloader = struct {
                     self.observeHandle(@tagName(received_message.msg), busy_start);
                 },
                 .validated => |res| {
-                    defer select.concurrent(.validated, std.Io.Queue(*ValidatedResponse).getOne, .{ &self.validated_responses, self.io }) catch |e| std.debug.panic("downloader: failed to spawn task: {}", .{e});
+                    defer select.concurrent(.validated, std.Io.Queue(ValidatedResponse).getOne, .{ &self.validated_responses, self.io }) catch |e| std.debug.panic("downloader: failed to spawn task: {}", .{e});
                     const validated = try res;
-                    const msg_name = validated.msgName();
                     try self.handleValidated(validated);
-                    self.observeHandle(msg_name, busy_start);
+                    self.observeHandle(validated.resp.msgName(), busy_start);
                 },
                 .tick => {
                     defer select.concurrent(.tick, std.Io.sleep, .{ self.io, .fromSeconds(1), .real }) catch |e| std.debug.panic("downloader: failed to spawn task: {}", .{e});
@@ -257,18 +256,16 @@ pub const Downloader = struct {
         return matched != null;
     }
 
-    fn startValidation(self: *Self, arena: *std.heap.ArenaAllocator, resp: @FieldType(ValidatedResponse, "resp")) !void {
-        var owned = arena.*;
-        const validated = try owned.allocator().create(ValidatedResponse);
-        validated.* = .{ .arena = owned, .resp = resp };
-        arena.* = .init(self.allocator);
-        self.validation_group.concurrent(self.io, validate, .{ self, validated }) catch validate(self, validated);
+    fn startValidation(self: *Self, arena: *std.heap.ArenaAllocator, response: @FieldType(ValidatedResponse, "resp")) !void {
+        defer arena.* = .init(self.allocator);
+        self.validation_group.concurrent(self.io, validate, .{ self, arena.*, response }) catch validate(self, arena.*, response);
     }
 
-    fn validate(self: *Self, validated: *ValidatedResponse) void {
+    fn validate(self: *Self, arena: std.heap.ArenaAllocator, response: @FieldType(ValidatedResponse, "resp")) void {
         const start = std.Io.Timestamp.now(self.io, .awake);
-        const allocator = validated.arena.allocator();
-        validated.outcome = switch (validated.resp) {
+        var gpa = arena;
+        const allocator = gpa.allocator();
+        const outcome = switch (response) {
             .eth => |*resp| switch (resp.msg.msg) {
                 .block_headers => |headers| validateHeaders(allocator, resp.req.msg.get_block_headers, headers),
                 .block_access_list => |access_lists| validateBal(allocator, access_lists),
@@ -281,16 +278,17 @@ pub const Downloader = struct {
                 else => unreachable,
             },
         };
-        self.metrics.verify_seconds.observe(.{ .msg = validated.msgName() }, secondsSince(self.io, start)) catch {};
-        self.validated_responses.putOneUncancelable(self.io, validated) catch unreachable;
+
+        self.metrics.verify_seconds.observe(.{ .msg = response.msgName() }, secondsSince(self.io, start)) catch {};
+        self.validated_responses.putOneUncancelable(self.io, .{ .arena = gpa, .resp = response, .outcome = outcome }) catch unreachable;
     }
 
-    fn handleValidated(self: *Self, validated: *ValidatedResponse) !void {
+    fn handleValidated(self: *Self, validated: ValidatedResponse) !void {
         defer validated.deinit(self.allocator);
 
         if (validated.outcome) |_| {} else |err| switch (validated.resp) {
             inline else => |resp, proto| {
-                log.debug("dropping peer {} for an invalid {s}: {}", .{ resp.req.peer.peer_index, validated.msgName(), err });
+                log.debug("dropping peer {} for an invalid {s}: {}", .{ resp.req.peer.peer_index, validated.resp.msgName(), err });
                 const provider = if (proto == .eth) self.eth_provider else self.snap_provider;
                 provider.disconnect(resp.req.peer, err);
             },
@@ -1629,20 +1627,20 @@ const ValidatedResponse = struct {
     resp: union(enum) {
         eth: struct { msg: eth.Provider.ParsedMessage, req: *Request(eth.Message) },
         snap: struct { msg: snap.Provider.ParsedMessage, req: *Request(snap.Message) },
+
+        fn msgName(self: *const @This()) []const u8 {
+            return switch (self.*) {
+                inline else => |resp| @tagName(resp.msg.msg),
+            };
+        }
     },
     outcome: anyerror!ValidationOutcome = error.NotValidated,
 
-    fn deinit(self: *ValidatedResponse, allocator: std.mem.Allocator) void {
+    fn deinit(self: *const ValidatedResponse, allocator: std.mem.Allocator) void {
         switch (self.resp) {
             inline else => |resp| allocator.free(resp.msg.read.payload),
         }
         self.arena.deinit();
-    }
-
-    fn msgName(self: *const ValidatedResponse) []const u8 {
-        return switch (self.resp) {
-            inline else => |resp| @tagName(resp.msg.msg),
-        };
     }
 };
 
