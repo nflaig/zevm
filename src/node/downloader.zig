@@ -341,6 +341,8 @@ pub const Downloader = struct {
 
     fn drainSnapFlushQueue(self: *Self) !void {
         while (self.snap_flush_queue.pop()) |flush| {
+            if (self.hasPrecedingSnapRequest(flush)) return self.snap_flush_queue.prepend(flush);
+
             defer flush.deinit(self.allocator);
             switch (flush.response.msg) {
                 .account_range => |*account_range| try self.persistAccounts(flush.validation_outcome.accounts, account_range),
@@ -349,6 +351,20 @@ pub const Downloader = struct {
                 else => unreachable,
             }
         }
+    }
+
+    fn hasPrecedingSnapRequest(self: *Self, flush: *const QueuedSnapFlush) bool {
+        for ([_]*List(Request(snap.Message)){ &self.pending_snap_requests, &self.inflight_snap_requests, &self.validating_snap_requests }) |list| {
+            var current_node = list.inner.first;
+            while (current_node) |list_node| : (current_node = list_node.next) {
+                const request: *List(Request(snap.Message)).Node = @alignCast(@fieldParentPtr("node", list_node));
+                if (flush.isPrecededBy(request.elem.msg)) return true;
+            }
+        }
+        for (self.stashed_snap_requests) |request| {
+            if (flush.isPrecededBy(request.msg)) return true;
+        }
+        return false;
     }
 
     fn validateHeaders(allocator: std.mem.Allocator, request: eth.GetBlockHeaders, response: eth.BlockHeaders) !ValidationOutcome {
@@ -1726,6 +1742,22 @@ const QueuedSnapFlush = struct {
             else => unreachable,
         };
         return if (keys.len > 0) keys[0] else @splat(0);
+    }
+
+    fn isPrecededBy(self: *const QueuedSnapFlush, msg: snap.Message) bool {
+        switch (msg) {
+            .get_account_range => |request| return self.validation_outcome == .accounts and
+                std.mem.order(u8, &request.origin, &self.firstKey()) == .lt,
+            .get_storage_ranges => |request| {
+                if (self.validation_outcome != .storage or request.account_hashes.len == 0) return false;
+                return switch (std.mem.order(u8, &request.account_hashes[0], &self.firstKey())) {
+                    .lt => true,
+                    .gt => false,
+                    .eq => std.mem.order(u8, &request.starting_hash, &firstSlot(self.validation_outcome.storage)) == .lt,
+                };
+            },
+            else => return false,
+        }
     }
 };
 
