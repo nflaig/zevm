@@ -99,9 +99,15 @@ pub const Trie = struct {
     root: *Node,
 
     allocator: std.mem.Allocator,
+    resolver: ?NodeResolver = null,
 
     skip: enum { none, deletions, writes } = .none,
     skipped_deletions: bool = false,
+
+    pub const NodeResolver = struct {
+        ptr: *anyopaque,
+        resolveFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, path: []const u8, node_hash: [32]u8) anyerror!?[]const u8,
+    };
 
     pub fn init(allocator: std.mem.Allocator) !Self {
         const root = try allocator.create(Node);
@@ -234,7 +240,7 @@ pub const Trie = struct {
                     try self.insert(branch.children[idx].?, key[1..], path.append(key[0]), value, key_buf, keys, values);
                     if (branch.children[idx].?.* == .empty) {
                         branch.children[idx] = null;
-                        try collapseBranch(node, branch);
+                        try self.collapseBranch(node, branch, path);
                     }
                 }
                 branch.hash = null;
@@ -336,7 +342,10 @@ pub const Trie = struct {
                 }
                 if (keys.*.len > 0) _ = writeHexKey(&keys.*[0], key_buf);
             },
-            .hashed => return error.SubTrieNotAvailable,
+            .hashed => {
+                try self.resolveHashed(node, path);
+                return self.insert(node, key, path, value, key_buf, keys, values);
+            },
         }
 
         return self.tailInsert(node, key, path, value, key_buf, keys, values);
@@ -372,8 +381,18 @@ pub const Trie = struct {
         return n;
     }
 
+    fn resolveHashed(self: *Self, node: *Node, path: Path) !void {
+        const resolver = self.resolver orelse return error.SubTrieNotAvailable;
+        if (node.hashed.len != 32) return error.SubTrieNotAvailable;
+        const node_hash = node.hashed.data;
+        const encoded = try resolver.resolveFn(resolver.ptr, self.allocator, path.slice(), node_hash) orelse
+            return error.SubTrieNotAvailable;
+        errdefer self.allocator.free(encoded);
+        try decodeNode(self, node, encoded, null);
+    }
+
     // Collapse a branch that has dropped to 0 or 1 live children after a deletion.
-    fn collapseBranch(node: *Node, branch: *Node.Branch) !void {
+    fn collapseBranch(self: *Self, node: *Node, branch: *Node.Branch, path: Path) !void {
         var count: usize = 0;
         var remaining_nibble: u8 = 0;
         var remaining_child: *Node = undefined;
@@ -411,7 +430,10 @@ pub const Trie = struct {
             },
             // A hash alone cannot tell whether a sibling's path
             // must merge with this branch's final nibble. Never guess a root.
-            .hashed => return error.SubTrieNotAvailable,
+            .hashed => {
+                try self.resolveHashed(remaining_child, path.append(remaining_nibble));
+                return self.collapseBranch(node, branch, path);
+            },
             .empty => unreachable,
         }
     }
@@ -768,45 +790,39 @@ pub fn loadFromNodesMap(
         .root = undefined,
         .allocator = allocator,
     };
-    t.root = try resolveSubTrie(&t, &root, nodes);
+    t.root = try allocator.create(Node);
+    t.root.* = Node.Hashed.init(&root);
+    try resolveFromMap(&t, t.root, nodes);
     return t;
 }
 
-fn resolveSubTrie(
-    self: *Trie,
-    payload: []const u8,
-    nodes: *const NodesHashMap,
-) anyerror!*Node {
-    const child = try self.allocator.create(Node);
-    if (payload.len == 32) {
-        if (nodes.getEntryContext(payload[0..32].*, .{})) |entry| {
-            try recursiveResolve(self, child, entry.value_ptr.*, entry.key_ptr, nodes);
-        } else {
-            child.* = Node.Hashed.init(payload);
-        }
-    } else {
-        try recursiveResolve(self, child, (payload.ptr - 1)[0 .. payload.len + 1], null, nodes);
+fn resolveFromMap(self: *Trie, node: *Node, nodes: *const NodesHashMap) anyerror!void {
+    switch (node.*) {
+        .hashed => |hashed| {
+            if (hashed.len != 32) return;
+            const entry = nodes.getEntryContext(hashed.data, .{}) orelse return;
+            try decodeNode(self, node, entry.value_ptr.*, entry.key_ptr);
+            try resolveFromMap(self, node, nodes);
+        },
+        .branch => |branch| for (branch.children) |child| {
+            if (child) |c| try resolveFromMap(self, c, nodes);
+        },
+        .ext => |ext| try resolveFromMap(self, ext.child, nodes),
+        .leaf, .empty => {},
     }
-    return child;
 }
 
-fn recursiveResolve(
-    self: *Trie,
-    root: *Node,
-    root_rlp: []const u8,
-    root_hash: ?*[32]u8,
-    nodes: *const NodesHashMap,
-) anyerror!void {
+fn decodeNode(self: *Trie, node: *Node, encoded: []const u8, node_hash: ?*[32]u8) anyerror!void {
     var items: [][]const u8 = undefined;
-    _ = try rlp.deserialize([][]const u8, self.allocator, root_rlp, &items);
+    _ = try rlp.deserialize([][]const u8, self.allocator, encoded, &items);
     defer self.allocator.free(items);
 
     if (items.len == 17) {
-        root.* = Node.Branch.init();
-        root.branch.hash = root_hash;
+        node.* = Node.Branch.init();
+        node.branch.hash = node_hash;
         for (items[0..16], 0..) |child_payload, i| {
             if (child_payload.len == 0) continue;
-            root.branch.children[i] = try resolveSubTrie(self, child_payload, nodes);
+            node.branch.children[i] = try decodeChild(self, child_payload);
         }
     } else if (items.len == 2) {
         const key_payload = items[0];
@@ -816,16 +832,26 @@ fn recursiveResolve(
         const decoded = compactToHex(key_payload, &key_buf);
 
         if (decoded.is_leaf) {
-            root.* = Node.Leaf.init(decoded.nibbles, value_payload);
-            root.leaf.hash = root_hash;
+            node.* = Node.Leaf.init(decoded.nibbles, value_payload);
+            node.leaf.hash = node_hash;
         } else {
             if (value_payload.len == 0) return error.MalformedTrieNode;
-            root.* = Node.Extension.init(decoded.nibbles, try resolveSubTrie(self, value_payload, nodes));
-            root.ext.hash = root_hash;
+            node.* = Node.Extension.init(decoded.nibbles, try decodeChild(self, value_payload));
+            node.ext.hash = node_hash;
         }
     } else {
         return error.MalformedTrieNode;
     }
+}
+
+fn decodeChild(self: *Trie, payload: []const u8) !*Node {
+    const child = try self.allocator.create(Node);
+    if (payload.len == 32) {
+        child.* = Node.Hashed.init(payload);
+    } else {
+        try decodeNode(self, child, (payload.ptr - 1)[0 .. payload.len + 1], null);
+    }
+    return child;
 }
 
 fn compactToHex(compact: []const u8, out_buf: *[65]u8) struct { is_leaf: bool, nibbles: []u8 } {
@@ -875,6 +901,17 @@ test "deleting a leaf requires its remaining sibling preimage" {
     var values = [_][]const u8{&.{}};
     try std.testing.expectError(error.SubTrieNotAvailable, incomplete.update(&.{key_a}, &values));
 
+    var store: NodesHashMap = .empty;
+    try store.put(a, hash_b, encoded_b.items);
+    var resolved = try loadFromNodesMap(a, root, &nodes);
+    resolved.resolver = .{ .ptr = &store, .resolveFn = struct {
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, path: []const u8, node_hash: [32]u8) anyerror!?[]const u8 {
+            try std.testing.expectEqualSlices(u8, &.{1}, path);
+            return @as(*NodesHashMap, @ptrCast(@alignCast(ptr))).get(node_hash);
+        }
+    }.resolve };
+    try resolved.update(&.{key_a}, &values);
+
     try nodes.put(a, hash_b, encoded_b.items);
     var complete = try loadFromNodesMap(a, root, &nodes);
     try complete.update(&.{key_a}, &values);
@@ -884,6 +921,7 @@ test "deleting a leaf requires its remaining sibling preimage" {
     var expected = std.array_list.Managed(u8).init(a);
     try rlp.serialize([2][]const u8, a, .{ &remaining_path, &value_b }, &expected);
     try std.testing.expectEqualSlices(u8, &keccak256(expected.items), &try complete.rootHash());
+    try std.testing.expectEqualSlices(u8, &keccak256(expected.items), &try resolved.rootHash());
 }
 
 test "a write in the same batch keeps the branch from collapsing onto a missing sibling" {
