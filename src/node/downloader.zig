@@ -24,6 +24,7 @@ const min_split_range = std.math.maxInt(u256) / (1 << 16);
 const progress_log_interval: std.Io.Duration = .fromSeconds(8);
 const arena_retain_limit = (32 << 20) - 64;
 const max_snap_flush_queue_bytes = 2048 << 20;
+const max_snap_flush_seconds = 0.5;
 
 const log = std.log.scoped(.downloader);
 
@@ -204,6 +205,7 @@ pub const Downloader = struct {
         if (self.header != null) {
             try self.advanceHeaderDownload();
         }
+        try self.drainSnapFlushQueue();
         if (self.state != null) {
             try self.updatePivot();
             try self.advanceStateDownload();
@@ -345,14 +347,17 @@ pub const Downloader = struct {
     }
 
     fn drainSnapFlushQueue(self: *Self) !void {
+        const start = std.Io.Timestamp.now(self.io, .awake);
         var current_node = self.snap_flush_queue.inner.first;
         while (current_node) |list_node| {
+            if (secondsSince(self.io, start) > max_snap_flush_seconds) return;
             current_node = list_node.next;
             const flush = &@as(*List(QueuedSnapFlush).Node, @alignCast(@fieldParentPtr("node", list_node))).elem;
             if (self.hasPrecedingSnapRequest(flush)) continue;
 
             self.snap_flush_queue.remove(flush);
             self.snap_flush_queue_bytes -= flush.size();
+            self.metrics.snap_flushed_bytes.incrBy(flush.size());
             defer flush.deinit(self.allocator);
             switch (flush.response.msg) {
                 .account_range => |*account_range| try self.persistAccounts(flush.validation_outcome.accounts, account_range),
@@ -1604,6 +1609,8 @@ pub const Downloader = struct {
             .{ "snap", "pending", self.pending_snap_requests.inner.len() },
             .{ "snap", "validating", self.validating_snap_requests.inner.len() },
             .{ "snap", "stashed", self.stashed_snap_requests.len },
+            .{ "eth", "free", self.free_eth_requests.inner.len() },
+            .{ "snap", "free", self.free_snap_requests.inner.len() },
         };
         for (request_counts) |c| m.requests.set(.{ .proto = c[0], .state = c[1] }, c[2]) catch {};
 
@@ -1616,6 +1623,13 @@ pub const Downloader = struct {
         m.state_progress.set(.{ .kind = "codes" }, keyspacePercent(self.progress.code_keyspace)) catch {};
         if (self.eth_db.kv_store.env.info()) |info| m.db_size_bytes.set(info.geo.current) else |_| {}
         m.heal_blocks_remaining.set(if (self.state_heal) |heal| heal.target_pivot.number -| (heal.next_pivot.number - 1) else 0);
+        m.snap_flush_queue_entries.set(self.snap_flush_queue.inner.len());
+        m.snap_flush_queue_bytes.set(self.snap_flush_queue_bytes);
+        const flush_head = if (self.snap_flush_queue.inner.first) |list_node|
+            &@as(*List(QueuedSnapFlush).Node, @alignCast(@fieldParentPtr("node", list_node))).elem
+        else
+            null;
+        m.snap_flush_queue_blocked.set(if (flush_head) |head| @intFromBool(self.hasPrecedingSnapRequest(head)) else 0);
     }
 
     fn logProgress(self: *Self) void {
@@ -1897,6 +1911,10 @@ const Metrics = struct {
     db_size_bytes: prom.Gauge(u64),
     batch_build_seconds: prom.Histogram(f64, duration_buckets),
     batch_accounts_scanned: prom.Counter(u64),
+    snap_flush_queue_entries: prom.Gauge(u64),
+    snap_flush_queue_bytes: prom.Gauge(u64),
+    snap_flush_queue_blocked: prom.Gauge(u64),
+    snap_flushed_bytes: prom.Counter(u64),
 
     fn init(allocator: std.mem.Allocator, io: std.Io) !Metrics {
         const opts: prom.RegistryOpts = .{};
@@ -1938,6 +1956,10 @@ const Metrics = struct {
             .db_size_bytes = .init("downloader_db_size_bytes", .{ .help = "Current size of the state database file" }, opts),
             .batch_build_seconds = .init("downloader_batch_build_seconds", .{ .help = "Time spent building storage and code request batches" }, opts),
             .batch_accounts_scanned = .init("downloader_batch_accounts_scanned_total", .{ .help = "Accounts scanned while building storage and code request batches" }, opts),
+            .snap_flush_queue_entries = .init("downloader_snap_flush_queue_entries", .{ .help = "Snap responses waiting to be written to the database" }, opts),
+            .snap_flush_queue_bytes = .init("downloader_snap_flush_queue_bytes", .{ .help = "Memory held by the snap responses waiting to be written" }, opts),
+            .snap_flush_queue_blocked = .init("downloader_snap_flush_queue_blocked", .{ .help = "1 when the first snap response waiting to be written is waiting on a request" }, opts),
+            .snap_flushed_bytes = .init("downloader_snap_flushed_bytes_total", .{ .help = "Memory of the snap responses written to the database" }, opts),
         };
     }
 };
