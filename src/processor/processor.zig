@@ -487,7 +487,9 @@ fn convertAuthList(allocator: std.mem.Allocator, auth_list: []const types.Author
             .chain_id = if (src.chain_id > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(src.chain_id),
             .address = std.mem.readInt(u160, &src.address, .big),
             .nonce = src.nonce,
-            .authority = recoverEip7702Authority(allocator, src) catch |err| switch (err) {
+            // Native and zkVM recovery expose different error sets. Widen only
+            // the classification; every non-signature error still propagates.
+            .authority = recoverEip7702Authority(allocator, src) catch |err| switch (@as(anyerror, err)) {
                 error.InvalidSignature, error.RecoverFailed, error.InvalidRecoveryID => 0,
                 else => return err,
             },
