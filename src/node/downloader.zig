@@ -460,7 +460,7 @@ pub const Downloader = struct {
         storage_roots: []const [32]u8,
         response: *const snap.StorageRanges,
     ) !ValidationOutcome {
-        if (response.slots.len == 0) return error.EmptyStorageRanges;
+        if (response.slots.len == 0 and response.proof.len == 0) return error.EmptyStorageRanges;
         var scratch_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch_arena.deinit();
         const scratch = scratch_arena.allocator();
@@ -469,10 +469,17 @@ pub const Downloader = struct {
         const served = response.slots[0..@min(response.slots.len, request.account_hashes.len)];
         var result: VerifiedStorage = .{
             .chunk = isStorageChunk(request),
-            .keys = try allocator.alloc([][32]u8, served.len),
-            .values = try allocator.alloc([][]const u8, served.len),
+            .keys = try allocator.alloc([][32]u8, @max(served.len, 1)),
+            .values = try allocator.alloc([][]const u8, @max(served.len, 1)),
         };
         var verified: usize = 0;
+        if (served.len == 0 and request.account_hashes.len > 0) {
+            // without slots, the proof has to show the first account has none from the starting to u256.max
+            _ = try verifyRangeProof(scratch, storage_roots[0], request.starting_hash, &.{}, &.{}, &proof);
+            result.keys[0] = &.{};
+            result.values[0] = &.{};
+            verified = 1;
+        }
         for (served, 0..) |slots, index| {
             const origin: [32]u8 = if (index == 0) request.starting_hash else @splat(0);
             const is_last = index + 1 == response.slots.len;
