@@ -368,7 +368,7 @@ pub const Downloader = struct {
             var current_node = list.inner.first;
             while (current_node) |list_node| : (current_node = list_node.next) {
                 const request: *List(Request(snap.Message)).Node = @alignCast(@fieldParentPtr("node", list_node));
-                if (flush.isPrecededBy(request.elem.msg)) return true;
+                if (flush.isPrecededBy(request.elem.msg, false)) return true;
             }
         }
         return false;
@@ -731,7 +731,7 @@ pub const Downloader = struct {
         if (self.snapFlushQueueFull()) {
             const head_node = self.snap_flush_queue.inner.first orelse return error.SnapFlushQueueFull;
             const head = &@as(*List(QueuedSnapFlush).Node, @alignCast(@fieldParentPtr("node", head_node))).elem;
-            if (!head.isPrecededBy(req.msg)) return error.SnapFlushQueueFull;
+            if (!head.isPrecededBy(req.msg, true)) return error.SnapFlushQueueFull;
         }
         return self.sendRequest(self.snap_provider, Self.pickSnapPeer, req);
     }
@@ -1803,14 +1803,14 @@ const QueuedSnapFlush = struct {
         return if (keys.len > 0) keys[0] else @splat(0);
     }
 
-    fn isPrecededBy(self: *const QueuedSnapFlush, msg: snap.Message) bool {
+    fn isPrecededBy(self: *const QueuedSnapFlush, msg: snap.Message, chunks_precede_later_accounts: bool) bool {
         switch (msg) {
             .get_account_range => |request| return self.validation_outcome == .accounts and
                 std.mem.order(u8, &request.origin, &self.firstKey()) == .lt,
             .get_storage_ranges => |request| {
                 if (self.validation_outcome != .storage or request.account_hashes.len == 0) return false;
                 return switch (std.mem.order(u8, &request.account_hashes[0], &self.firstKey())) {
-                    .lt => !isStorageChunk(request),
+                    .lt => chunks_precede_later_accounts or !isStorageChunk(request),
                     .gt => false,
                     .eq => std.mem.order(u8, &request.starting_hash, &firstSlot(self.validation_outcome.storage)) == .lt,
                 };
