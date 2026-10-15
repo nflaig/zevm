@@ -488,8 +488,8 @@ fn convertAuthList(allocator: std.mem.Allocator, auth_list: []const types.Author
             .address = std.mem.readInt(u160, &src.address, .big),
             .nonce = src.nonce,
             .authority = recoverEip7702Authority(allocator, src) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => 0,
+                error.InvalidSignature, error.RecoverFailed, error.InvalidRecoveryID => 0,
+                else => return err,
             },
         };
     }
