@@ -486,7 +486,7 @@ fn convertAuthList(allocator: std.mem.Allocator, auth_list: []const types.Author
             .chain_id = if (src.chain_id > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(src.chain_id),
             .address = std.mem.readInt(u160, &src.address, .big),
             .nonce = src.nonce,
-            .authority = recoverEip7702Authority(allocator, src) catch 0,
+            .authority = recoverEip7702Authority(src) catch 0,
         };
     }
     return result;
@@ -494,18 +494,20 @@ fn convertAuthList(allocator: std.mem.Allocator, auth_list: []const types.Author
 
 const secp256k1_n_half: u256 = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
 
-fn recoverEip7702Authority(allocator: std.mem.Allocator, auth: types.AuthorizationTuple) !u160 {
+fn recoverEip7702Authority(auth: types.AuthorizationTuple) !u160 {
     if (auth.v > 1) return Errors.InvalidSignature;
     if (auth.s == 0 or auth.s > secp256k1_n_half) return Errors.InvalidSignature;
 
+    var buf: [512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const allocator = fba.allocator();
     var encoded = std.array_list.Managed(u8).init(allocator);
-    defer encoded.deinit();
     const Tuple = struct { chain_id: u256, address: [20]u8, nonce: u64 };
-    try rlp.serialize(Tuple, allocator, .{
+    rlp.serialize(Tuple, allocator, .{
         .chain_id = auth.chain_id,
         .address = auth.address,
         .nonce = auth.nonce,
-    }, &encoded);
+    }, &encoded) catch unreachable;
 
     var msg: [257]u8 = undefined;
     msg[0] = 0x05;
