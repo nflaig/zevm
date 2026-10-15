@@ -5,7 +5,6 @@ const std = @import("std");
 
 comptime {
     _ = @import("types.zig");
-    _ = @import("processor/processor.zig");
     _ = @import("evm/evm.zig");
     _ = @import("forks.zig");
     _ = @import("free_list.zig");
