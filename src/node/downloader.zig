@@ -71,7 +71,7 @@ pub const Downloader = struct {
         account_fetch_head: u256 = 0,
         account_fetch_step: u256 = 0,
         storage_fetch_head: [32]u8 = @splat(0),
-        storage_and_fetch_initiated: bool = false,
+        storage_fetch_done: bool = false,
     } = null,
     state_heal: ?struct {
         next_pivot: types.BlockHeader,
@@ -1084,14 +1084,14 @@ pub const Downloader = struct {
 
         const state = &self.state.?;
 
-        if (state.accounts_done and !state.storage_and_fetch_initiated)
-            try self.advanceStorageAndCodeDownload();
+        if (state.accounts_done and !state.storage_fetch_done)
+            try self.advanceStorageDownload();
 
         if (self.state.?.pivot.number > 0 and self.inflight_snap_requests.empty() and
             self.pending_snap_requests.empty() and self.validating_snap_requests.empty() and
             self.stashed_snap_requests.len == 0)
         {
-            if (state.accounts_done and state.storage_and_fetch_initiated) {
+            if (state.accounts_done and state.storage_fetch_done) {
                 self.state = null;
                 log.info("state download done", .{});
             } else {
@@ -1193,7 +1193,7 @@ pub const Downloader = struct {
         try self.commitTxn(txn, "accounts", txn_start);
     }
 
-    fn advanceStorageAndCodeDownload(self: *Self) !void {
+    fn advanceStorageDownload(self: *Self) !void {
         const state = &self.state.?;
 
         if (self.free_snap_requests.empty()) return;
@@ -1210,12 +1210,9 @@ pub const Downloader = struct {
         const accounts_table = self.eth_db.kv_store.table(txn, .accounts);
         const account_iterator = try accounts_table.cursor();
         defer account_iterator.deinit();
-        const codes_table = self.eth_db.kv_store.table(txn, .codes);
-        const codes_iterator = try codes_table.cursor();
-        defer codes_iterator.deinit();
 
         if (try account_iterator.seekLowerBound(&state.storage_fetch_head) == null) {
-            state.storage_and_fetch_initiated = true;
+            state.storage_fetch_done = true;
             return;
         }
 
@@ -1273,7 +1270,7 @@ pub const Downloader = struct {
             self.requestStorageRanges(storage_request.?, state.pivot.state_root, account_hashes);
 
             if (accounts_exhausted) {
-                state.storage_and_fetch_initiated = true;
+                std.mem.writeInt(u256, &state.storage_fetch_head, std.mem.readInt(u256, &state.storage_fetch_head, .big) +| 1, .big);
                 return;
             }
         }
@@ -1556,7 +1553,7 @@ pub const Downloader = struct {
         std.debug.assert(self.state_heal != null);
         const state = &self.state.?;
         if (!state.accounts_done) return false;
-        if (!state.storage_and_fetch_initiated and
+        if (!state.storage_fetch_done and
             std.mem.order(u8, &account_hash, &state.storage_fetch_head) != .lt) return false;
 
         for (self.stashed_snap_requests) |request| {
