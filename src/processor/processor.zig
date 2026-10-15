@@ -481,18 +481,52 @@ fn convertAccessList(allocator: std.mem.Allocator, al: []const types.AccessListE
 
 fn convertAuthList(allocator: std.mem.Allocator, auth_list: []const types.AuthorizationTuple) ![]evm.Authorization {
     const result = try allocator.alloc(evm.Authorization, auth_list.len);
+    errdefer allocator.free(result);
     for (auth_list, result) |src, *dst| {
         dst.* = .{
             .chain_id = if (src.chain_id > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(src.chain_id),
             .address = std.mem.readInt(u160, &src.address, .big),
             .nonce = src.nonce,
-            .authority = recoverEip7702Authority(allocator, src) catch 0,
+            .authority = recoverEip7702Authority(allocator, src) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => 0,
+            },
         };
     }
     return result;
 }
 
 const secp256k1_n_half: u256 = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
+
+test "authorization recovery propagates allocation failures and still skips invalid signatures" {
+    // A public Sepolia authorization, independent of an outer transaction.
+    var address: [20]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&address, "4a0dfa2653e3fe25cab66ae41fe1e55ff087a91b");
+    var auth: types.AuthorizationTuple = .{
+        .chain_id = 11155111,
+        .address = address,
+        .nonce = 121,
+        .v = 1,
+        .r = 0x87a05228a57afa856f5550b689d4181250f1f946df983a574fa76552c7900953,
+        .s = 0x6b325ee91763d188ba3b19b76aa95632a5a306f1932eba3addcd21acf2146e1e,
+    };
+    const authority = try recoverEip7702Authority(std.testing.allocator, auth);
+    try std.testing.expect(authority != 0);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAuthAllocation, .{ auth, authority });
+    auth.v = 2;
+    try testAuthAllocation(std.testing.allocator, auth, 0);
+    auth.v = 1;
+    auth.s = 0;
+    try testAuthAllocation(std.testing.allocator, auth, 0);
+}
+
+fn testAuthAllocation(allocator: std.mem.Allocator, auth: types.AuthorizationTuple, authority: u160) !void {
+    // Two recoveries exercise cleanup when a later entry fails after the first
+    // one has already been converted successfully.
+    const list = try convertAuthList(allocator, &.{ auth, auth });
+    defer allocator.free(list);
+    for (list) |entry| try std.testing.expectEqual(authority, entry.authority);
+}
 
 fn recoverEip7702Authority(allocator: std.mem.Allocator, auth: types.AuthorizationTuple) !u160 {
     if (auth.v > 1) return Errors.InvalidSignature;
