@@ -166,6 +166,27 @@ pub fn Provider(comptime cfg: Config) type {
             return error.NoCandidatePeer;
         }
 
+        pub fn pickFastestPeer(self: *Self, id: MessageIds, filter: anytype) !rlpx.Server.PeerId {
+            var best: ?rlpx.Server.PeerId = null;
+            var best_rtt: std.Io.Duration = undefined;
+            for (self.peers, 0..) |*slot, index| {
+                const peer = slot.info.load(.acquire);
+                if (peer.offset == 0) continue;
+
+                const peer_id: rlpx.Server.PeerId = .{
+                    .peer_index = index,
+                    .peer_epoch = peer.epoch,
+                };
+                if (@TypeOf(filter) != void and !filter.validPeer(peer_id)) continue;
+                const rtt = slot.rtt.get(id);
+                if (best == null or rtt.nanoseconds < best_rtt.nanoseconds) {
+                    best = peer_id;
+                    best_rtt = rtt;
+                }
+            }
+            return best orelse error.NoCandidatePeer;
+        }
+
         pub fn sendToRandomPeer(self: *Self, msg: cfg.Message, filter: anytype) !rlpx.Server.PeerId {
             const peer_id = try self.pickRandomPeer(filter);
             try self.send(peer_id, msg);

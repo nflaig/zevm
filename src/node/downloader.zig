@@ -747,8 +747,12 @@ pub const Downloader = struct {
         self.drainPendingEthRequests();
     }
 
-    fn pickSnapPeer(self: *Self, _: snap.Message) !rlpx.Server.PeerId {
-        return self.snap_provider.pickRandomPeer(PeerFilter(snap.Message).init(self, &self.inflight_snap_requests, self.state.?.pivot.number));
+    fn pickSnapPeer(self: *Self, msg: snap.Message) !rlpx.Server.PeerId {
+        return self.snap_provider.pickFastestPeer(std.meta.activeTag(msg), PeerFilter(snap.Message).init(
+            self,
+            &self.inflight_snap_requests,
+            self.state.?.pivot.number,
+        ));
     }
 
     fn sendSnapRequest(self: *Self, req: *Request(snap.Message)) !void {
