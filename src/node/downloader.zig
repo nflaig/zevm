@@ -25,6 +25,7 @@ const progress_log_interval: std.Io.Duration = .fromSeconds(8);
 const arena_retain_limit = (32 << 20) - 64;
 const max_snap_flush_queue_bytes = 2048 << 20;
 const max_snap_flush_seconds = 0.5;
+const expected_code_count = 20_000_000;
 
 const log = std.log.scoped(.downloader);
 
@@ -67,11 +68,17 @@ pub const Downloader = struct {
     state: ?struct {
         pivot: types.BlockHeader,
 
-        accounts_done: bool = false,
+        phase: enum {
+            accounts,
+            storage,
+            codes,
+        } = .accounts,
+
         account_fetch_head: u256 = 0,
         account_fetch_step: u256 = 0,
         storage_fetch_head: [32]u8 = @splat(0),
-        storage_fetch_done: bool = false,
+        code_hashes: std.AutoArrayHashMapUnmanaged([32]u8, void) = .empty,
+        code_fetch_head: usize = 0,
     } = null,
     state_heal: ?struct {
         next_pivot: types.BlockHeader,
@@ -424,11 +431,19 @@ pub const Downloader = struct {
         const scratch = scratch_arena.allocator();
         const hashes = try allocator.alloc([32]u8, response.accounts.len);
         const accounts = try scratch.alloc([]const u8, response.accounts.len);
+        var code_hashes = try allocator.alloc([32]u8, response.accounts.len);
+        code_hashes.len = 0;
         for (response.accounts, 0..) |elem, index| {
             hashes[index] = elem.hash;
 
             var slim_account: snap.SlimAccount = undefined;
             _ = try rlp.deserialize(snap.SlimAccount, scratch, elem.account.value, &slim_account);
+            if (slim_account.code_hash.len == 32 and !std.mem.eql(u8, slim_account.code_hash, &types.empty_code_hash) and
+                std.mem.order(u8, &elem.hash, &request.limit) != .gt)
+            {
+                code_hashes.len += 1;
+                code_hashes[code_hashes.len - 1] = slim_account.code_hash[0..32].*;
+            }
 
             var list = std.array_list.Managed(u8).init(scratch);
             try rlp.serialize(types.Account, scratch, slimToFullAccount(slim_account), &list);
@@ -449,6 +464,7 @@ pub const Downloader = struct {
             .origin = request.origin,
             .limit = request.limit,
             .hashes = hashes[0..served],
+            .code_hashes = code_hashes,
             .has_more = has_more and served == hashes.len,
         } };
     }
@@ -584,6 +600,7 @@ pub const Downloader = struct {
                 .requested_header_tail = std.math.maxInt(u64),
             };
             self.state = .{ .pivot = try self.bc.readHeader(0) orelse unreachable };
+            try self.state.?.code_hashes.ensureTotalCapacity(std.heap.page_allocator, expected_code_count);
         }
 
         try self.updatePivot();
@@ -1084,19 +1101,28 @@ pub const Downloader = struct {
 
         const state = &self.state.?;
 
-        if (state.accounts_done and !state.storage_fetch_done)
-            try self.advanceStorageDownload();
+        switch (state.phase) {
+            .accounts => {},
+            .storage => try self.advanceStorageDownload(),
+            .codes => try self.advanceCodesDownload(),
+        }
 
         if (self.state.?.pivot.number > 0 and self.inflight_snap_requests.empty() and
             self.pending_snap_requests.empty() and self.validating_snap_requests.empty() and
-            self.stashed_snap_requests.len == 0)
+            self.stashed_snap_requests.len == 0 and self.snap_flush_queue.empty())
         {
-            if (state.accounts_done and state.storage_fetch_done) {
-                self.state = null;
-                log.info("state download done", .{});
-            } else {
-                state.accounts_done = true;
-                log.info("account download done", .{});
+            log.info("{t} download done", .{state.phase});
+            switch (state.phase) {
+                .accounts => state.phase = .storage,
+                .storage => {
+                    state.code_hashes.sortUnstable(CodeHashOrder{ .keys = state.code_hashes.keys() });
+                    state.phase = .codes;
+                },
+                .codes => {
+                    state.code_hashes.deinit(std.heap.page_allocator);
+                    self.state = null;
+                    log.info("state download done", .{});
+                },
             }
         }
     }
@@ -1132,6 +1158,8 @@ pub const Downloader = struct {
             }
             const covered_until = if (accounts.has_more) last else get_accounts_range.limit;
             self.progress.account_keyspace +|= std.mem.readInt(u256, &covered_until, .big) - std.mem.readInt(u256, &get_accounts_range.origin, .big);
+            for (accounts.code_hashes) |code_hash|
+                try self.state.?.code_hashes.put(std.heap.page_allocator, code_hash, {});
         } else |_| {
             continue_from_account = get_accounts_range.origin;
         }
@@ -1211,10 +1239,8 @@ pub const Downloader = struct {
         const account_iterator = try accounts_table.cursor();
         defer account_iterator.deinit();
 
-        if (try account_iterator.seekLowerBound(&state.storage_fetch_head) == null) {
-            state.storage_fetch_done = true;
+        if (try account_iterator.seekLowerBound(&state.storage_fetch_head) == null)
             return;
-        }
 
         while (true) {
             const storage_request = self.popFreeSnapRequest();
@@ -1364,6 +1390,26 @@ pub const Downloader = struct {
         std.mem.writeInt(u256, &new_req.msg.get_storage_ranges.starting_hash, start, .big);
         std.mem.writeInt(u256, &new_req.msg.get_storage_ranges.limit_hash, end, .big);
         self.sendSnapRequest(new_req) catch {};
+    }
+
+    fn advanceCodesDownload(self: *Self) !void {
+        const state = &self.state.?;
+        const code_hashes = state.code_hashes.keys();
+
+        while (state.code_fetch_head < code_hashes.len) {
+            const code_request = self.popFreeSnapRequest() orelse return;
+            errdefer self.free_snap_requests.push(code_request);
+
+            const batch = try self.allocator.alloc([32]u8, batch_storage_code_req_size);
+            const count = @min(code_hashes.len - state.code_fetch_head, batch_storage_code_req_size);
+            @memcpy(batch[0..count], code_hashes[state.code_fetch_head..][0..count]);
+
+            const batch_start = if (state.code_fetch_head == 0) 0 else std.mem.readInt(u256, &code_hashes[state.code_fetch_head], .big);
+            state.code_fetch_head += count;
+            const batch_end = if (state.code_fetch_head == code_hashes.len) std.math.maxInt(u256) else std.mem.readInt(u256, &code_hashes[state.code_fetch_head], .big);
+            code_request.keyspace = .{ batch_start, batch_end };
+            self.requestCodes(code_request, batch[0..count]);
+        }
     }
 
     fn requestCodes(self: *Self, req: *Request(snap.Message), code_hashes: [][32]u8) void {
@@ -1537,7 +1583,7 @@ pub const Downloader = struct {
     fn isAccountFetched(self: *Self, account_hash: [32]u8) bool {
         std.debug.assert(self.state_heal != null);
         const state = &self.state.?;
-        if (state.accounts_done) return true;
+        if (state.phase != .accounts) return true;
 
         var fetched_until: [32]u8 = undefined;
         std.mem.writeInt(u256, &fetched_until, state.account_fetch_head, .big);
@@ -1552,8 +1598,8 @@ pub const Downloader = struct {
     fn isStorageFetched(self: *Self, account_hash: [32]u8, slot_hash: ?[32]u8) bool {
         std.debug.assert(self.state_heal != null);
         const state = &self.state.?;
-        if (!state.accounts_done) return false;
-        if (!state.storage_fetch_done and
+        if (state.phase == .accounts) return false;
+        if (state.phase == .storage and
             std.mem.order(u8, &account_hash, &state.storage_fetch_head) != .lt) return false;
 
         for (self.stashed_snap_requests) |request| {
@@ -1670,12 +1716,14 @@ pub const Downloader = struct {
             });
         }
         if (self.state) |state| {
-            log.info("state download: pivot {}, accounts {d:.2}% (done: {}), storage {d:.2}%, codes {d:.2}%, inflight requests {}, healing {}", .{
+            log.info("state download: pivot {}, {t} {d:.2}%, inflight requests {}, healing {}", .{
                 state.pivot.number,
-                keyspacePercent(self.progress.account_keyspace),
-                state.accounts_done,
-                keyspacePercent(self.progress.storage_keyspace),
-                keyspacePercent(self.progress.code_keyspace),
+                state.phase,
+                keyspacePercent(switch (state.phase) {
+                    .accounts => self.progress.account_keyspace,
+                    .storage => self.progress.storage_keyspace,
+                    .codes => self.progress.code_keyspace,
+                }),
                 self.inflight_snap_requests.inner.len(),
                 self.state_heal != null,
             });
@@ -1767,7 +1815,16 @@ const VerifiedAccounts = struct {
     origin: [32]u8,
     limit: [32]u8,
     hashes: [][32]u8,
+    code_hashes: [][32]u8,
     has_more: bool,
+};
+
+const CodeHashOrder = struct {
+    keys: []const [32]u8,
+
+    pub fn lessThan(self: CodeHashOrder, a: usize, b: usize) bool {
+        return std.mem.order(u8, &self.keys[a], &self.keys[b]) == .lt;
+    }
 };
 
 fn isStorageChunk(request: snap.GetStorageRanges) bool {
