@@ -108,6 +108,7 @@ pub const Trie = struct {
 
     allocator: std.mem.Allocator,
     resolver: ?NodeResolver = null,
+    on_node: ?OnNode = null,
     stack: ?std.heap.FixedBufferAllocator = null,
 
     skip: enum { none, deletions, writes } = .none,
@@ -116,6 +117,11 @@ pub const Trie = struct {
     pub const NodeResolver = struct {
         ptr: *anyopaque,
         resolveFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, path: []const u8, node_hash: [32]u8) anyerror!?[]const u8,
+    };
+
+    pub const OnNode = struct {
+        ptr: *anyopaque,
+        onNodeFn: *const fn (ptr: *anyopaque, path: []const u8, node_hash: [32]u8, blob: []const u8) anyerror!void,
     };
 
     pub fn init(allocator: std.mem.Allocator) !Self {
@@ -555,6 +561,7 @@ pub const Trie = struct {
         } else {
             const h = keccak256(list.items);
             node.* = Node.Hashed.init(&h);
+            if (self.on_node) |on_node| try on_node.onNodeFn(on_node.ptr, path.slice(), h, list.items);
         }
         if (self.stack) |*stack| if (own_frame != Node.no_frame) {
             stack.end_index = own_frame;
