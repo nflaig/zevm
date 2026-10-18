@@ -1484,7 +1484,7 @@ pub const Downloader = struct {
                 if (self.fetchStaleStorageRoots()) return;
             }
             if (self.inflight_snap_requests.empty() and self.pending_snap_requests.empty() and
-                self.validating_snap_requests.empty())
+                self.validating_snap_requests.empty() and self.snap_flush_queue.empty())
             {
                 if (state_heal.next_pivot.number + 1 > state_heal.target_pivot.number) {
                     log.info("state heal: done, healed {} blocks in {}s", .{
