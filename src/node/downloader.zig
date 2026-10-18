@@ -1589,7 +1589,7 @@ pub const Downloader = struct {
                 try self.eth_db.writeStorage(txn, addr_hash, slot_hash, slot_changes.changes[slot_changes.changes.len - 1].value);
             }
 
-            if (changes.storage_changes.len > 0 and !self.isStorageFetched(addr_hash, null)) {
+            if (changes.storage_changes.len > 0) {
                 try self.state_heal.?.stale_storage_roots.put(self.allocator, addr_hash, {});
             } else {
                 var updated_account = try self.eth_db.readAccount(txn, addr_hash) orelse types.EmptyAccount;
@@ -1622,7 +1622,7 @@ pub const Downloader = struct {
         return std.mem.order(u8, &account_hash, &fetched_until) == .lt;
     }
 
-    fn isStorageFetched(self: *Self, account_hash: [32]u8, slot_hash: ?[32]u8) bool {
+    fn isStorageFetched(self: *Self, account_hash: [32]u8, slot_hash: [32]u8) bool {
         std.debug.assert(self.state_heal != null);
         const state = &self.state.?;
         if (state.phase == .accounts) return false;
@@ -1634,10 +1634,9 @@ pub const Downloader = struct {
             const storage_request = request.msg.get_storage_ranges;
             for (storage_request.account_hashes, 0..) |requested_account, index| {
                 if (!std.meta.eql(requested_account, account_hash)) continue;
-                const slot = slot_hash orelse return false;
                 if (index > 0) return false;
-                if (std.mem.order(u8, &slot, &storage_request.starting_hash) != .lt and
-                    std.mem.order(u8, &slot, &storage_request.limit_hash) != .gt) return false;
+                if (std.mem.order(u8, &slot_hash, &storage_request.starting_hash) != .lt and
+                    std.mem.order(u8, &slot_hash, &storage_request.limit_hash) != .gt) return false;
             }
         }
         return true;
