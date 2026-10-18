@@ -88,7 +88,7 @@ pub const Downloader = struct {
 
         bal_requested: bool = false,
         bal_applied: bool = false,
-        pivot_hash_buf: [1][32]u8 = undefined,
+        bal_hashes: [128][32]u8 = undefined,
         stale_storage_roots: std.AutoArrayHashMapUnmanaged([32]u8, void) = .empty,
     } = null,
     metrics: Metrics,
@@ -417,11 +417,16 @@ pub const Downloader = struct {
 
     fn validateBal(allocator: std.mem.Allocator, response: eth.BlockAccessLists) !ValidationOutcome {
         if (response.rlps.len == 0) return error.EmptyResponse;
-        var hash: [32]u8 = undefined;
-        std.crypto.hash.sha3.Keccak256.hash(response.rlps[0].value, &hash, .{});
-        var parsed: types.BlockAccessLists = undefined;
-        _ = try rlp.deserialize(types.BlockAccessLists, allocator, response.rlps[0].value, &parsed);
-        return .{ .bal = .{ .hash = hash, .parsed = parsed } };
+        const bals = try allocator.alloc(VerifiedBal, response.rlps.len);
+        for (response.rlps, bals, 0..) |bal_rlp, *bal, index| {
+            std.crypto.hash.sha3.Keccak256.hash(bal_rlp.value, &bal.hash, .{});
+            // keep the ones before an access list the peer couldn't serve
+            _ = rlp.deserialize(types.BlockAccessLists, allocator, bal_rlp.value, &bal.parsed) catch |err| {
+                if (index == 0) return err;
+                return .{ .bals = bals[0..index] };
+            };
+        }
+        return .{ .bals = bals };
     }
 
     fn verifyAccounts(self: *Self, allocator: std.mem.Allocator, request: snap.GetAccountRange, response: *const snap.AccountRange) !ValidationOutcome {
@@ -1493,8 +1498,6 @@ pub const Downloader = struct {
                 }
 
                 state_heal.next_pivot = try self.readHeader(state_heal.next_pivot.number + 1) orelse unreachable;
-                std.debug.assert(std.meta.eql(state_heal.pivot_hash_buf[0], state_heal.next_pivot.parent_hash));
-                state_heal.pivot_hash_buf[0] = state_heal.next_pivot.hash();
                 state_heal.bal_requested = false;
                 state_heal.bal_applied = false;
             }
@@ -1504,11 +1507,22 @@ pub const Downloader = struct {
             if (!self.validating_snap_requests.empty() or !self.snap_flush_queue.empty()) return;
             self.stashSnapRequests();
             const bal_req = self.free_eth_requests.pop() orelse return;
-
-            state_heal.pivot_hash_buf[0] = state_heal.next_pivot.hash();
-            self.requestBals(bal_req, state_heal.pivot_hash_buf[0..1]);
+            try self.requestRemainingBals(bal_req);
             state_heal.bal_requested = true;
         }
+    }
+
+    fn requestRemainingBals(self: *Self, req: *Request(eth.Message)) !void {
+        const state_heal = &self.state_heal.?;
+        var header = state_heal.next_pivot;
+        var count: usize = 0;
+        while (count < state_heal.bal_hashes.len) {
+            state_heal.bal_hashes[count] = header.hash();
+            count += 1;
+            if (header.number >= state_heal.target_pivot.number) break;
+            header = try self.readHeader(header.number + 1) orelse unreachable;
+        }
+        self.requestBals(req, state_heal.bal_hashes[0..count]);
     }
 
     fn requestBals(self: *Self, req: *Request(eth.Message), hashes: [][32]u8) void {
@@ -1518,17 +1532,23 @@ pub const Downloader = struct {
 
     fn handleBals(self: *Self, req: *Request(eth.Message), outcome: anyerror!ValidationOutcome) !void {
         if (self.state_heal) |*state_heal| {
-            if (outcome) |result| {
-                if (std.meta.eql(result.bal.hash, state_heal.next_pivot.block_access_list_hash.?)) {
-                    std.debug.assert(!state_heal.bal_applied);
-                    try self.applyBal(result.bal.parsed);
+            const bals: []VerifiedBal = if (outcome) |result| result.bals else |_| &.{};
+            for (bals) |bal| {
+                if (!std.meta.eql(bal.hash, state_heal.next_pivot.block_access_list_hash.?)) break;
+                std.debug.assert(!state_heal.bal_applied);
+                try self.applyBal(bal.parsed);
+                if (state_heal.next_pivot.number >= state_heal.target_pivot.number) {
                     state_heal.bal_applied = true;
-                    self.free_eth_requests.push(req);
-                    try self.advanceStateHeal();
-                    return;
+                    break;
                 }
-            } else |_| {}
-            self.requestBals(req, state_heal.pivot_hash_buf[0..1]);
+                state_heal.next_pivot = try self.readHeader(state_heal.next_pivot.number + 1) orelse unreachable;
+            }
+            if (state_heal.bal_applied) {
+                self.free_eth_requests.push(req);
+                try self.advanceStateHeal();
+                return;
+            }
+            try self.requestRemainingBals(req);
         } else unreachable;
     }
 
@@ -1812,10 +1832,15 @@ const ValidatedResponse = struct {
 
 const ValidationOutcome = union(enum) {
     headers: struct { hashes: [][32]u8, headers: []types.BlockHeader },
-    bal: struct { hash: [32]u8, parsed: types.BlockAccessLists },
+    bals: []VerifiedBal,
     accounts: VerifiedAccounts,
     storage: VerifiedStorage,
     codes: [][32]u8,
+};
+
+const VerifiedBal = struct {
+    hash: [32]u8,
+    parsed: types.BlockAccessLists,
 };
 
 const VerifiedAccounts = struct {
