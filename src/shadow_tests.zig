@@ -11,6 +11,8 @@ const StorageTrie = @import("trie/storage_trie.zig").StorageTrie;
 const NodeCollector = @import("trie/trie.zig").NodeCollector;
 const genesis = @import("node/blockchain.zig").glamsterdam_devnet8_config.genesis_header;
 const a = std.testing.allocator;
+const undo = @import("db/undo.zig");
+const branches = @import("db/branches.zig");
 
 const queries = [_]Shadow.Query{
     .{ .address = .{ .bytes = @splat(0x11) }, .storageKeys = &.{ .init(0), .init(1), .init(2), .init(99) } },
@@ -36,13 +38,17 @@ const Fixture = struct {
     }
 
     fn write(self: *Fixture, number: u64, balance: u256, checkpoint: bool) !types.BlockHeader {
+        return self.transition(number, balance, checkpoint, null, null);
+    }
+
+    fn transition(self: *Fixture, number: u64, balance: u256, checkpoint: bool, previous: ?types.BlockHeader, record: ?undo.Record) !types.BlockHeader {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const alloc = arena.allocator();
         var eth = Eth.init(&self.store);
         const txn = try self.store.transaction_rw();
         errdefer txn.abort() catch unreachable;
-        inline for (.{ .accounts, .storage, .codes, .account_trie, .storage_tries }) |table|
+        inline for (.{ .accounts, .storage, .account_trie, .storage_tries }) |table|
             try self.store.table(txn, table).drop(false);
         const addr_hash = types.keccakOfU160(std.mem.readInt(u160, &queries[0].address.bytes, .big));
         var sc = try NodeCollector.init(alloc, 256);
@@ -64,12 +70,35 @@ const Fixture = struct {
         try at.update(&.{addr_hash}, &.{account});
         var header = genesis;
         header.number = number;
+        if (previous) |parent_header| header.parent_hash = parent_header.hash();
         header.state_root = try at.rootHash();
         try eth.commitAccountTrieNodes(txn, &ac);
         try eth.writeAccount(alloc, txn, addr_hash, account);
         if (checkpoint) try snapshots.writeCheckpoint(&self.store, txn, alloc, header);
+        if (record) |r| try undo.save(&self.store, txn, alloc, header, r);
+        if (previous) |p| try branches.select(&self.store, txn, alloc, p, &.{header});
+        if (checkpoint) try branches.initialize(&self.store, txn, alloc, header);
         try txn.commit();
         return header;
+    }
+
+    fn capture(self: *Fixture, allocator: std.mem.Allocator, parent_header: types.BlockHeader, balance: u256) !undo.Record {
+        var eth = Eth.init(&self.store);
+        const txn = try self.store.transaction_ro();
+        defer txn.abort() catch unreachable;
+        var values = [_]types.StorageChange{.{ .index = 1, .value = balance }};
+        var storage = [_]types.SlotChanges{.{ .key = 0, .changes = &values }};
+        var balances = [_]types.BalanceChange{.{ .index = 1, .balance = balance }};
+        var nonces = [_]types.NonceChange{.{ .index = 1, .nonce = parent_header.number + 1 }};
+        var changes = [_]types.AccountChanges{.{
+            .addr = std.mem.readInt(u160, &queries[0].address.bytes, .big),
+            .storage_changes = &storage,
+            .storage_reads = &.{},
+            .balance_changes = &balances,
+            .nonce_changes = &nonces,
+            .code_changes = &.{},
+        }};
+        return undo.capture(&eth, txn, allocator, parent_header, try types.HashedBlockAccessLists.init(allocator, &changes));
     }
 };
 
@@ -228,4 +257,233 @@ test "shadow allocation failures release DB cursors and read leases" {
     try std.testing.checkAllAllocationFailures(a, readAllocationCase, .{ &api, header });
     try readAllocationCase(a, &api, header);
     try std.testing.expectEqual(header.hash(), views.status().headers[0].hash());
+}
+
+test "shadow reorg rewinds storage and accounts, preserves old leases and selects another branch" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var eth = Eth.init(&f.store);
+    const base = try f.write(1, 42, true);
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    const record = try f.capture(alloc, base, 84);
+    const left = try f.transition(2, 84, true, base, record);
+    try views.publish(a);
+    const lease = try views.acquire(left.hash(), left.state_root);
+    defer lease.deinit();
+    {
+        const txn = try f.store.transaction_rw();
+        errdefer txn.abort() catch unreachable;
+        const restored = try undo.rewind(&eth, txn, alloc, base.hash());
+        try std.testing.expectEqual(base.hash(), restored.hash());
+        try branches.select(&f.store, txn, alloc, base, &.{});
+        try txn.commit();
+    }
+    try views.publish(a);
+    try std.testing.expectEqual(base.hash(), views.status().headers[0].hash());
+    try std.testing.expectEqual(2, views.status().count);
+    var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    try std.testing.expectEqual(42, (try api.read(alloc, parent(base), &queries)).accounts[0].storageProof[0].value.number);
+    const right_record = try f.capture(alloc, base, 99);
+    const right = try f.transition(2, 99, true, base, right_record);
+    try views.publish(a);
+    try std.testing.expectEqual(84, (try api.read(alloc, parent(left), &queries)).accounts[0].balance.number);
+    try std.testing.expectEqual(99, (try api.read(alloc, parent(right), &queries)).accounts[0].balance.number);
+    const key = types.keccakOfU160(std.mem.readInt(u160, &queries[0].address.bytes, .big));
+    try std.testing.expectEqual(84, (try eth.readAccount(lease.txn, key)).?.balance);
+    const txn = try f.store.transaction_ro();
+    defer txn.abort() catch unreachable;
+    try std.testing.expectEqual(left.hash(), (try branches.byHash(&f.store, txn, left.hash())).?.hash());
+    try std.testing.expectEqual(right.hash(), (try branches.read(&f.store, txn, 2)).?.hash());
+}
+
+test "shadow missing undo history aborts even after an earlier successful rewind" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var eth = Eth.init(&f.store);
+    const base = try f.write(1, 42, true);
+    const middle = try f.transition(2, 84, true, base, try f.capture(alloc, base, 84));
+    const last = try f.transition(3, 123, true, middle, try f.capture(alloc, middle, 123));
+    {
+        const txn = try f.store.transaction_rw();
+        try f.store.table(txn, .state_undo).delete(&middle.hash());
+        try txn.commit();
+    }
+    {
+        const txn = try f.store.transaction_rw();
+        defer txn.abort() catch unreachable;
+        try std.testing.expectError(error.StateHistoryUnavailable, undo.rewind(&eth, txn, alloc, base.hash()));
+    }
+    const txn = try f.store.transaction_ro();
+    defer txn.abort() catch unreachable;
+    try std.testing.expectEqual(last.hash(), (try snapshots.readCheckpoint(&f.store, txn, alloc)).?.hash());
+    const key = types.keccakOfU160(std.mem.readInt(u160, &queries[0].address.bytes, .big));
+    try std.testing.expectEqual(123, (try eth.readAccount(txn, key)).?.balance);
+}
+
+test "shadow headers reject a disconnected extension before modifying selection" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const base = try f.write(1, 42, true);
+    var left = base;
+    left.number += 1;
+    left.parent_hash = base.hash();
+    var wrong = left;
+    wrong.number += 1;
+    wrong.parent_hash = @splat(0xee);
+    const txn = try f.store.transaction_rw();
+    defer txn.abort() catch unreachable;
+    try std.testing.expectError(error.BranchParentMismatch, branches.select(&f.store, txn, alloc, base, &.{ left, wrong }));
+    try std.testing.expectEqual(base.hash(), (try branches.state(&f.store, txn)).?.head.hash());
+    try std.testing.expect(try branches.byHash(&f.store, txn, left.hash()) == null);
+}
+
+fn rewindAllocationCase(backing: std.mem.Allocator, f: *Fixture, target: [32]u8) !void {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    var eth = Eth.init(&f.store);
+    const txn = try f.store.transaction_rw();
+    defer txn.abort() catch unreachable;
+    _ = try undo.rewind(&eth, txn, arena.allocator(), target);
+}
+
+test "shadow rewind allocation failures leave the committed child intact" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const base = try f.write(1, 42, true);
+    const child = try f.transition(2, 84, true, base, try f.capture(arena.allocator(), base, 84));
+    try std.testing.checkAllAllocationFailures(a, rewindAllocationCase, .{ &f, base.hash() });
+    const txn = try f.store.transaction_ro();
+    defer txn.abort() catch unreachable;
+    try std.testing.expectEqual(child.hash(), (try snapshots.readCheckpoint(&f.store, txn, arena.allocator())).?.hash());
+}
+
+test "shadow rejects the actual Plataberget disconnected header pair from 21 November" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const captured = try std.json.parseFromSlice([][]const u8, alloc, @embedFile("testdata/shadow-reorg-20261121.json"), .{});
+    var headers: [4]types.BlockHeader = undefined;
+    for (captured.value, &headers) |raw, *header| {
+        const bytes = try alloc.alloc(u8, (raw.len - 2) / 2);
+        _ = try std.fmt.hexToBytes(bytes, raw[2..]);
+        _ = try @import("rlp").deserialize(types.BlockHeader, alloc, bytes, header);
+    }
+    try std.testing.expectEqual(627187, headers[1].number);
+    try std.testing.expectEqual(627188, headers[2].number);
+    try std.testing.expectEqual(627189, headers[3].number);
+    const txn = try f.store.transaction_rw();
+    defer txn.abort() catch unreachable;
+    try branches.initialize(&f.store, txn, alloc, headers[1]);
+    try std.testing.expectError(error.BranchParentMismatch, branches.select(&f.store, txn, alloc, headers[1], headers[2..]));
+    try std.testing.expectEqual(headers[1].hash(), (try branches.state(&f.store, txn)).?.head.hash());
+    try std.testing.expect(try branches.byHash(&f.store, txn, headers[2].hash()) == null);
+}
+
+test "shadow persistent undo survives database reopen and restores the parent" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const base = try f.write(1, 42, true);
+    const child = try f.transition(2, 84, true, base, try f.capture(alloc, base, 84));
+    var path: [1024]u8 = undefined;
+    const length = try f.dir.dir.realPathFile(std.testing.io, "db", &path);
+    try f.store.deinit();
+    f.store = try kv.Store.initBounded(a, path[0..length], 64 << 20, 1 << 20);
+    var eth = Eth.init(&f.store);
+    const txn = try f.store.transaction_rw();
+    errdefer txn.abort() catch unreachable;
+    try std.testing.expectEqual(child.hash(), (try snapshots.readCheckpoint(&f.store, txn, alloc)).?.hash());
+    _ = try undo.rewind(&eth, txn, alloc, base.hash());
+    try branches.select(&f.store, txn, alloc, base, &.{});
+    try txn.commit();
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    try std.testing.expectEqual(42, (try api.read(alloc, parent(base), &queries)).accounts[0].balance.number);
+}
+
+test "shadow journal retention is bounded and unsupported deep rewind does not commit" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const base = try f.write(1, 42, true);
+    var head = base;
+    for (2..38) |n| head = try f.transition(n, n, true, head, try f.capture(alloc, head, n));
+    var eth = Eth.init(&f.store);
+    {
+        const txn = try f.store.transaction_rw();
+        defer txn.abort() catch unreachable;
+        try std.testing.expectError(error.StateHistoryUnavailable, undo.rewind(&eth, txn, alloc, base.hash()));
+    }
+    const txn = try f.store.transaction_ro();
+    defer txn.abort() catch unreachable;
+    try std.testing.expectEqual(head.hash(), (try snapshots.readCheckpoint(&f.store, txn, alloc)).?.hash());
+    const cursor = try f.store.table(txn, .state_undo).cursor();
+    defer cursor.deinit();
+    var count: usize = 0;
+    if (try cursor.seekLowerBound(&@as([32]u8, @splat(0))) != null) {
+        count = 1;
+        while (try cursor.goToNext() != null) count += 1;
+    }
+    try std.testing.expectEqual(undo.depth_limit, count);
+}
+
+test "shadow reselecting a retained view after ring wrap preserves all other views" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
+    defer views.deinit();
+    for (1..13) |n| {
+        _ = try f.write(n, n, true);
+        try views.publish(a);
+    }
+    const header = try f.write(7, 7, true);
+    try views.publish(a);
+    const status = views.status();
+    try std.testing.expectEqual(8, status.count);
+    try std.testing.expectEqual(header.hash(), status.headers[0].hash());
+    try std.testing.expectEqual(12, status.headers[1].number);
+}
+
+test "shadow corrupted undo preimages cannot restore a falsely labelled parent root" {
+    for (0..2) |case| {
+        var f = try Fixture.init();
+        defer f.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const base = try f.write(1, 42, true);
+        const record = try f.capture(alloc, base, 84);
+        if (case == 0) record.accounts[0].value.balance += 1 else record.accounts[0].slots[0].value += 1;
+        const child = try f.transition(2, 84, true, base, record);
+        var eth = Eth.init(&f.store);
+        {
+            const txn = try f.store.transaction_rw();
+            defer txn.abort() catch unreachable;
+            try std.testing.expectError(if (case == 0) error.UndoStateRootMismatch else error.UndoStorageRootMismatch, undo.rewind(&eth, txn, alloc, base.hash()));
+        }
+        const txn = try f.store.transaction_ro();
+        defer txn.abort() catch unreachable;
+        try std.testing.expectEqual(child.hash(), (try snapshots.readCheckpoint(&f.store, txn, alloc)).?.hash());
+    }
 }

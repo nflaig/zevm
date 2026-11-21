@@ -45,10 +45,20 @@ including flat-state leaves, is hash-checked; missing data never means zero.
 Restart resumes the state checkpoint rather than the header tip. A checkpoint
 whose header is unavailable or no longer matches is rejected. A directory from
 an interrupted initial sync has no checkpoint and is refused; restart that
-experiment with a new directory. Automatic partial-sync recovery and reorg
-reconstruction remain qualification gaps. Retained views can represent different
-branches, but the peer-driven downloader does not yet implement CL forkchoice or
-reconstruct arbitrary historical branches. This is not full multi-branch sync.
+experiment with a new directory. After the first verified checkpoint, recent
+selected headers live transactionally in MDBX, independently of the initial-sync
+header files. Each verified BAL update journals its account/storage preimages in
+the same transaction as state and checkpoint. A branch switch rewinds to a common
+ancestor, checks every restored root, and atomically selects the new header chain.
+Existing cloned read leases remain immutable across that switch.
+
+Undo is bounded to 32 records / 128 MiB, at most 32 MiB per record. Selected
+headers retain a 256-height window and install at most 128 headers ahead of the
+verified state at a time. Missing history, corrupt preimages or a reorg preceding
+the first verified checkpoint fail closed without committing a partial rewind.
+Automatic partial-sync recovery and deeper reorg reconstruction remain gaps. The
+peer-driven downloader still does not implement CL forkchoice. Retaining views
+from different branches is not full multi-branch sync.
 
 Before production adoption, qualify independent live sync, restart/corruption,
 reorg recovery, exact-parent availability at builder deadlines, full candidate
@@ -57,8 +67,9 @@ root/receipt/value parity, and performance against an independent EL oracle.
 The first Plataberget qualification on 2026-11-21 reproduced a downloader reorg
 failure: the persisted header at height 627188 was `bd23ae2d…`, while the next
 persisted header's parent was the competing `f9b3c70e…` header at the same height.
-State application returned `Reorg` and the process exited. The header downloader
-currently appends a height extension without reconciling its cutoff hash against
-the existing branch. A fresh initial sync and a clean restart therefore do not
-qualify recovery or continuous availability. Do not deploy this as a production
-state source until branch-aware sync and recovery have passed the same tests.
+State application returned `Reorg` and the process exited. The captured headers
+are now a regression fixture: a disconnected height extension is rejected before
+selection changes. Tests also cover ancestor rewind, an alternate branch, database
+reopen, retention limits, corruption, allocation failures and retained read
+leases. Live downloader recovery and continuous exact-parent availability still
+need separate qualification; these tests alone do not authorize production use.

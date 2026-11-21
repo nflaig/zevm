@@ -59,10 +59,21 @@ pub const Snapshots = struct {
         const header = try readCheckpoint(self.store, txn, allocator) orelse return error.StateNotReady;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        for (self.views) |view| if (view) |v| {
+        for (self.views, 0..) |view, index| if (view) |v| {
             if (std.meta.eql(v.header.hash(), header.hash())) {
                 if (!std.meta.eql(v.header.state_root, header.state_root)) return error.StateRootMismatch;
-                try txn.abort();
+                // A rewind can make a retained parent the selected checkpoint
+                // again. Promote the new committed view without evicting a
+                // different branch or invalidating outstanding cloned leases.
+                v.deinit();
+                var position = index;
+                const newest = (self.next + capacity - 1) % capacity;
+                while (position != newest) {
+                    const following = (position + 1) % capacity;
+                    self.views[position] = self.views[following];
+                    position = following;
+                }
+                self.views[newest] = .{ .txn = txn, .header = header };
                 return;
             }
         };

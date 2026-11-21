@@ -7,6 +7,7 @@ const forks = @import("../forks.zig");
 const rlp = @import("rlp");
 const EthDb = @import("../db/eth.zig").Eth;
 const FileStorage = @import("../db/file.zig").Storage;
+const branches = @import("../db/branches.zig");
 
 pub const Config = struct {
     chain_id: u64,
@@ -23,6 +24,7 @@ pub const Blockchain = struct {
     allocator: std.mem.Allocator,
     eth_db: *EthDb,
     file_storage: *FileStorage,
+    shadow_branches: bool = false,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, cfg: Config, file_storage: *FileStorage, eth_db: *EthDb) !Self {
         var bc = Self{
@@ -52,11 +54,22 @@ pub const Blockchain = struct {
     }
 
     pub fn headHeader(self: *Self) !types.BlockHeader {
+        if (self.shadow_branches) {
+            const txn = try self.eth_db.kv_store.transaction_ro();
+            defer txn.abort() catch unreachable;
+            return (try branches.state(self.eth_db.kv_store, txn) orelse return error.StateNotReady).head;
+        }
         const range = self.file_storage.ranges[@backingInt(FileStorage.Table.headers)];
         return (try self.readHeader(range.?.head)).?;
     }
 
     pub fn readHeader(self: *Self, number: u64) !?types.BlockHeader {
+        if (self.shadow_branches) {
+            const txn = try self.eth_db.kv_store.transaction_ro();
+            defer txn.abort() catch unreachable;
+            const selected = try branches.state(self.eth_db.kv_store, txn) orelse return error.StateNotReady;
+            if (number >= selected.base.number) return branches.read(self.eth_db.kv_store, txn, number);
+        }
         if (try self.file_storage.get(self.io, self.allocator, .headers, number)) |header_rlp| {
             defer self.allocator.free(header_rlp);
             var header: types.BlockHeader = undefined;

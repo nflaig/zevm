@@ -11,6 +11,9 @@ const trie = @import("../trie/trie.zig");
 const kv = @import("../db/kv.zig");
 const lmdbx = @import("lmdbx");
 const prom = @import("metrics");
+const branches = @import("../db/branches.zig");
+const undo = @import("../db/undo.zig");
+const snapshots_db = @import("../db/snapshot.zig");
 
 const RangeProofVerifier = @import("../trie/range_proof.zig").Verifier;
 const EthDb = @import("../db/eth.zig").Eth;
@@ -220,6 +223,7 @@ pub const Downloader = struct {
         self.logProgress();
         if (self.header != null) {
             try self.advanceHeaderDownload();
+            if (self.bc.shadow_branches) try self.checkHeaderDownloadComplete();
         }
         try self.drainSnapFlushQueue();
         if (self.state != null) {
@@ -602,14 +606,27 @@ pub const Downloader = struct {
     /// head. A partial initial sync has no checkpoint and must start in a fresh
     /// directory; silently interpreting those flat tables as complete is unsafe.
     pub fn enableShadow(self: *Self, snapshots: *@import("../db/snapshot.zig").Snapshots) !void {
-        const txn = try self.eth_db.kv_store.transaction_ro();
-        defer txn.abort() catch unreachable;
-        const checkpoint = try @import("../db/snapshot.zig").readCheckpoint(self.eth_db.kv_store, txn, self.allocator);
+        const txn = try self.eth_db.kv_store.transaction_rw();
+        var committed = false;
+        defer if (!committed) txn.abort() catch unreachable;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const checkpoint = try snapshots_db.readCheckpoint(self.eth_db.kv_store, txn, arena.allocator());
         if (checkpoint) |header| {
+            // Existing transactional branch metadata supersedes the old append-only
+            // header files. Old prototypes can initialize only at their checkpoint;
+            // they cannot invent undo history preceding it.
+            self.bc.shadow_branches = try branches.state(self.eth_db.kv_store, txn) != null;
             const saved = try self.bc.readHeader(header.number) orelse return error.StateCheckpointHeaderUnavailable;
             if (!std.meta.eql(saved.hash(), header.hash())) return error.StateCheckpointBranchMismatch;
+            try branches.initialize(self.eth_db.kv_store, txn, arena.allocator(), header);
+            try txn.commit();
+            committed = true;
+            self.bc.shadow_branches = true;
             self.state = .{ .pivot = header, .phase = .catchup };
             try snapshots.publish(self.allocator);
+            const head = try self.bc.head();
+            self.sync_target = .{ .number = head.number, .hash = head.hash, .cutoff_number = head.number, .cutoff_hash = head.hash };
         } else if ((try self.bc.head()).number != 0) return error.IncompleteStateCheckpoint;
         self.shadow_snapshots = snapshots;
     }
@@ -619,10 +636,21 @@ pub const Downloader = struct {
         const txn = try self.eth_db.kv_store.transaction_rw();
         var committed = false;
         errdefer if (!committed) txn.abort() catch unreachable;
-        try @import("../db/snapshot.zig").writeCheckpoint(self.eth_db.kv_store, txn, self.allocator, header);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        try snapshots_db.writeCheckpoint(self.eth_db.kv_store, txn, arena.allocator(), header);
+        try branches.initialize(self.eth_db.kv_store, txn, arena.allocator(), header);
         try txn.commit();
         committed = true;
+        self.bc.shadow_branches = true;
         try snapshots.publish(self.allocator);
+        self.sync_target_mutex.lockUncancelable(self.io);
+        self.sync_target.cutoff_number = header.number;
+        self.sync_target.cutoff_hash = header.hash();
+        const target_number = self.sync_target.number;
+        self.sync_target_mutex.unlock(self.io);
+        if (self.header == null and target_number > header.number)
+            self.header = .{ .requested_header_head = 0, .requested_header_tail = std.math.maxInt(u64) };
     }
 
     fn updateTarget(self: *Self, number: u64, hash: [32]u8) !void {
@@ -903,6 +931,8 @@ pub const Downloader = struct {
         while (status.requested_header_tail > target.cutoff_number) {
             const origin: eth.HashOrNumber, const origin_num = if (status.requested_header_tail == std.math.maxInt(u64))
                 .{ .{ .hash = target.hash }, target.number }
+            else if (self.bc.shadow_branches and try self.readDownladedHeader(status.requested_header_tail) != null)
+                .{ .{ .hash = (try self.readDownladedHeader(status.requested_header_tail)).?.hash() }, status.requested_header_tail }
             else
                 .{ .{ .number = status.requested_header_tail }, status.requested_header_tail };
             const batch_size = @as(u64, @min(1023, origin_num - target.cutoff_number)) + 1;
@@ -980,6 +1010,7 @@ pub const Downloader = struct {
     }
 
     fn checkHeaderDownloadComplete(self: *Self) !void {
+        if (self.header == null) return;
         const target = self.syncTarget();
         if (self.header.?.requested_header_head < target.number or
             self.header.?.requested_header_tail > target.cutoff_number)
@@ -988,7 +1019,13 @@ pub const Downloader = struct {
         if (!self.pending_eth_requests.empty()) return;
         if (hasHeaderRequest(&self.inflight_eth_requests) or hasHeaderRequest(&self.validating_eth_requests)) return;
 
+        if (self.bc.shadow_branches) return self.selectDownloadedBranch(target);
+
         const head = try self.bc.head();
+        if (self.shadow_snapshots != null) {
+            const cutoff = try self.readDownladedHeader(head.number) orelse return error.MissingDownloadedHeader;
+            if (!std.meta.eql(cutoff.hash(), head.hash)) return error.ShadowInitialSyncReorg;
+        }
         log.debug("persisting headers start {} end {}", .{
             head.number + 1,
             target.number,
@@ -1007,6 +1044,56 @@ pub const Downloader = struct {
 
         try self.clearDownloadedHeaders();
         self.header = null;
+    }
+
+    fn selectDownloadedBranch(self: *Self, target: SyncTarget) !void {
+        // An in-flight BAL is bound to the selected branch. Finish it before
+        // changing the writer's branch; read leases are independent MDBX views.
+        if (self.state_heal != null) return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const store = self.eth_db.kv_store;
+        const txn = try store.transaction_rw();
+        var committed = false;
+        defer if (!committed) txn.abort() catch unreachable;
+        const selected = try branches.state(store, txn) orelse return error.StateNotReady;
+        var checkpoint = try snapshots_db.readCheckpoint(store, txn, allocator) orelse return error.StateNotReady;
+        // Limit selected-header lead so all catch-up parents stay in the bounded
+        // selected window, even after a long offline period.
+        if (checkpoint.number < selected.head.number) return;
+        const tip = try self.readDownladedHeader(target.number) orelse return error.MissingDownloadedHeader;
+        if (!std.meta.eql(tip.hash(), target.hash)) return error.BranchTargetMismatch;
+        var number = @min(selected.head.number, target.number);
+        const ancestor = while (true) : (number -= 1) {
+            const downloaded = try self.readDownladedHeader(number) orelse {
+                self.sync_target_mutex.lockUncancelable(self.io);
+                self.sync_target.cutoff_number = number;
+                self.sync_target_mutex.unlock(self.io);
+                return;
+            };
+            const known = try branches.read(store, txn, number) orelse return error.BranchAncestorUnavailable;
+            if (std.meta.eql(downloaded.hash(), known.hash())) break known;
+            if (number == selected.base.number or selected.head.number - number >= undo.depth_limit)
+                return error.StateHistoryUnavailable;
+        };
+        const end = @min(target.number, ancestor.number + branches.extension_limit);
+        const headers = try self.readDownladedHeaders(allocator, ancestor.number + 1, end - ancestor.number);
+        // Rewind, selected headers and verified checkpoint commit together.
+        if (checkpoint.number > ancestor.number) checkpoint = try undo.rewind(self.eth_db, txn, allocator, ancestor.hash());
+        try branches.select(store, txn, allocator, ancestor, headers);
+        try txn.commit();
+        committed = true;
+        const rewound = selected.head.number - ancestor.number;
+        if (rewound > 0) {
+            log.info("shadow reorg recovered: old head {}, ancestor {}, selected {}, depth {}", .{ selected.head.number, ancestor.number, end, rewound });
+            try self.shadow_snapshots.?.publish(self.allocator);
+        }
+        self.state = .{ .pivot = checkpoint, .phase = .catchup };
+        if (end == target.number) {
+            try self.clearDownloadedHeaders();
+            self.header = null;
+        }
     }
 
     fn persistDownloadedHeaderChain(
@@ -1174,7 +1261,9 @@ pub const Downloader = struct {
             .catchup => {
                 const target = self.syncTarget();
                 if (state.pivot.number < target.number) {
-                    const new_pivot = try self.bc.readHeader(target.number) orelse return;
+                    const target_number = if (self.bc.shadow_branches) @min(target.number, (try self.bc.head()).number) else target.number;
+                    if (target_number <= state.pivot.number) return;
+                    const new_pivot = try self.bc.readHeader(target_number) orelse return;
                     if (!try self.startStateHeal(state.pivot, new_pivot)) return;
                     state.pivot = new_pivot;
                     return;
@@ -1787,6 +1876,7 @@ pub const Downloader = struct {
         defer if (account_trie) |*at| self.eth_db.closeAccountTrie(at);
 
         const hashed = try types.HashedBlockAccessLists.init(allocator, bal);
+        const previous = if (publish_shadow) try undo.capture(self.eth_db, txn, allocator, parent, hashed) else null;
         for (hashed.changes, hashed.account_hashes, hashed.slot_hashes) |changes, addr_hash, slot_hashes| {
             if (changes.readOnly()) continue;
             if (!self.isAccountFetched(addr_hash)) continue;
@@ -1838,7 +1928,8 @@ pub const Downloader = struct {
             try self.eth_db.commitAccountTrieNodes(txn, &account_collector);
         } else if (publish_shadow) return error.StateNotReady;
 
-        if (publish_shadow) try @import("../db/snapshot.zig").writeCheckpoint(
+        if (previous) |record| try undo.save(self.eth_db.kv_store, txn, allocator, self.state_heal.?.next_pivot, record);
+        if (publish_shadow) try snapshots_db.writeCheckpoint(
             self.eth_db.kv_store,
             txn,
             allocator,

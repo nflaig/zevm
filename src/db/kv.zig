@@ -14,6 +14,9 @@ pub const Table = enum {
     account_trie,
     storage_tries,
     state_meta,
+    state_undo,
+    branch_headers,
+    branch_numbers,
 
     pub fn options(self: Table) lmdbx.Database.Options {
         return switch (self) {
