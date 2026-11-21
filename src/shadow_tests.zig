@@ -13,6 +13,7 @@ const genesis = @import("node/blockchain.zig").glamsterdam_devnet8_config.genesi
 const a = std.testing.allocator;
 const undo = @import("db/undo.zig");
 const branches = @import("db/branches.zig");
+const keccak256 = @import("evm/crypto/hash.zig").keccak256;
 
 test {
     _ = @import("node/consensus.zig");
@@ -108,6 +109,152 @@ const Fixture = struct {
 
 fn parent(header: types.BlockHeader) Shadow.Parent {
     return .{ .blockHash = .{ .bytes = header.hash() }, .stateRoot = .{ .bytes = header.state_root } };
+}
+
+test "shadow exact trie nodes authenticate path hash owner and retained version" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var eth = Eth.init(&f.store);
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
+    defer views.deinit();
+    var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const first = try f.write(1, 42, true);
+    try views.publish(a);
+    const proof = try api.read(alloc, parent(first), &queries);
+    const slot_proof = proof.accounts[0].storageProof[0].proof;
+    try std.testing.expectEqual(@as(usize, 2), slot_proof.len);
+    const hashed_slot = types.keccakOfU256(0);
+    const path = [_]u8{hashed_slot[0] >> 4};
+    const query: Shadow.NodeQuery = .{ .owner = queries[0].address, .path = .{ .bytes = &path }, .expectedHash = .{ .bytes = keccak256(slot_proof[1].bytes) } };
+    const result = try api.readNodes(alloc, parent(first), &.{
+        .{ .path = .{ .bytes = &.{} }, .expectedHash = .{ .bytes = first.state_root } },
+        query,
+    });
+    try std.testing.expectEqualSlices(u8, proof.accounts[0].accountProof[0].bytes, result.nodes[0].bytes);
+    try std.testing.expectEqualSlices(u8, slot_proof[1].bytes, result.nodes[1].bytes);
+    var bad = query;
+    bad.expectedHash.bytes = @splat(0);
+    try std.testing.expectError(error.TrieNodeHashMismatch, api.readNodes(alloc, parent(first), &.{bad}));
+    bad = query;
+    bad.owner = queries[1].address;
+    try std.testing.expectError(error.StateAccountUnavailable, api.readNodes(alloc, parent(first), &.{bad}));
+    bad = query;
+    bad.path.bytes = &.{16};
+    try std.testing.expectError(error.InvalidTrieNodePath, api.readNodes(alloc, parent(first), &.{bad}));
+    try std.testing.expectError(error.StateQueryLimit, api.readNodes(alloc, parent(first), &.{}));
+    const second = try f.write(2, 84, true);
+    try views.publish(a);
+    const old = try api.readNodes(alloc, parent(first), &.{query});
+    try std.testing.expectEqualSlices(u8, result.nodes[1].bytes, old.nodes[0].bytes);
+    try std.testing.expectError(error.TrieNodeHashMismatch, api.readNodes(alloc, parent(second), &.{query}));
+}
+
+test "shadow ancestor backfill is hash-bound and never substitutes a selected height" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var eth = Eth.init(&f.store);
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
+    defer views.deinit();
+    var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var one = genesis;
+    one.number = 1;
+    one.parent_hash = genesis.hash();
+    var two = one;
+    two.number = 2;
+    two.parent_hash = one.hash();
+    {
+        const txn = try f.store.transaction_rw();
+        errdefer txn.abort() catch unreachable;
+        try branches.initialize(&f.store, txn, alloc, two);
+        try snapshots.writeCheckpoint(&f.store, txn, alloc, two);
+        try txn.commit();
+    }
+    try views.publish(alloc);
+    try std.testing.expectError(error.AncestorUnavailable, api.readAncestors(alloc, parent(two), 3));
+    try std.testing.expectError(error.AncestorQueryLimit, api.readAncestors(alloc, parent(two), 4));
+    try std.testing.expectError(error.AncestorQueryLimit, api.readAncestors(alloc, parent(two), 0));
+    var alternate_one = one;
+    alternate_one.state_root = @splat(0xa1);
+    var alternate_two = two;
+    alternate_two.parent_hash = alternate_one.hash();
+    {
+        const txn = try f.store.transaction_rw();
+        errdefer txn.abort() catch unreachable;
+        try branches.rememberAncestors(&f.store, txn, alloc, one.hash(), &.{ genesis, one });
+        try branches.rememberAncestors(&f.store, txn, alloc, alternate_one.hash(), &.{ genesis, alternate_one });
+        try std.testing.expectEqual(two.hash(), (try branches.state(&f.store, txn)).?.head.hash());
+        try std.testing.expectEqual(null, try branches.read(&f.store, txn, 1));
+        try snapshots.writeCheckpoint(&f.store, txn, alloc, alternate_two);
+        try txn.commit();
+    }
+    try views.publish(alloc);
+    const old = try api.readAncestors(alloc, parent(two), 3);
+    const alt = try api.readAncestors(alloc, parent(alternate_two), 3);
+    try std.testing.expectEqual(one.hash(), keccak256(old.headers[1].bytes));
+    try std.testing.expectEqual(alternate_one.hash(), keccak256(alt.headers[1].bytes));
+    try std.testing.expectEqual(genesis.hash(), keccak256(old.headers[2].bytes));
+    // Corruption is rejected by content hash; no fallback to another branch.
+    {
+        const txn = try f.store.transaction_rw();
+        errdefer txn.abort() catch unreachable;
+        try f.store.table(txn, .branch_headers).set(&one.hash(), alt.headers[1].bytes, .Upsert);
+        try txn.commit();
+    }
+    try std.testing.expectError(error.InvalidBranchHeader, api.readAncestors(alloc, parent(two), 3));
+}
+
+test "shadow ancestor cache rejects disconnected chains before any insertion" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var one = genesis;
+    one.number = 1;
+    one.parent_hash = @splat(0x99);
+    const txn = try f.store.transaction_rw();
+    defer txn.abort() catch unreachable;
+    try std.testing.expectError(error.BranchParentMismatch, branches.rememberAncestors(&f.store, txn, a, one.hash(), &.{ genesis, one }));
+    try std.testing.expectEqual(null, try branches.byHash(&f.store, txn, genesis.hash()));
+}
+
+test "shadow full ancestor cache remains bounded with the downloader slab allocator" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var backing = std.heap.ArenaAllocator.init(a);
+    defer backing.deinit();
+    var slabs = @import("devp2p/allocator.zig").SlabAllocator.init(backing.allocator());
+    var arena = std.heap.ArenaAllocator.init(slabs.allocator());
+    defer arena.deinit();
+    var headers: [256]types.BlockHeader = undefined;
+    var last = genesis;
+    const txn = try f.store.transaction_rw();
+    errdefer txn.abort() catch unreachable;
+    for (0..17) |_| {
+        for (&headers) |*header| {
+            header.* = last;
+            header.number += 1;
+            header.parent_hash = last.hash();
+            last = header.*;
+        }
+        _ = arena.reset(.retain_capacity);
+        try branches.rememberAncestors(&f.store, txn, arena.allocator(), last.hash(), &headers);
+    }
+    try std.testing.expectEqual(null, try branches.missingAncestor(&f.store, txn, last));
+    var count: usize = 0;
+    {
+        const cursor = try f.store.table(txn, .branch_headers).cursor();
+        defer cursor.deinit();
+        if (try cursor.seekLowerBound(&@as([32]u8, @splat(0))) != null) {
+            count = 1;
+            while (try cursor.goToNext() != null) count += 1;
+        }
+    }
+    try std.testing.expectEqual(4096, count);
+    try txn.commit();
 }
 
 test "shadow rejects partial state, unknown parent and incorrect root" {

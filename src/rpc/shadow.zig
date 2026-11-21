@@ -8,6 +8,7 @@ const EthDb = @import("../db/eth.zig").Eth;
 const Snapshots = @import("../db/snapshot.zig").Snapshots;
 const rpc = @import("jsonrpc.zig");
 const hex = @import("hex.zig");
+const branches = @import("../db/branches.zig");
 
 pub const Shadow = struct {
     snapshots: *Snapshots,
@@ -16,6 +17,8 @@ pub const Shadow = struct {
     pub fn register(self: *Shadow, allocator: std.mem.Allocator, server: *rpc.Server) !void {
         try server.register(allocator, "zevm_getStateStatusV1", self, status);
         try server.register(allocator, "zevm_getStateWitnessV1", self, witness);
+        try server.register(allocator, "zevm_getStateNodesV1", self, trieNodes);
+        try server.register(allocator, "zevm_getStateAncestorsV1", self, ancestors);
     }
 
     pub const Parent = struct { blockHash: hex.Data(32), stateRoot: hex.Data(32) };
@@ -55,6 +58,89 @@ pub const Shadow = struct {
         code: hex.Bytes,
     };
     pub const Witness = struct { parent: Stamp, accounts: []const AccountProof };
+    pub const NodeQuery = struct {
+        // null selects the account trie; otherwise authenticate this account's
+        // storage root before walking its raw nibble path.
+        owner: ?hex.Data(20) = null,
+        path: hex.Bytes,
+        expectedHash: hex.Data(32),
+    };
+    pub const Nodes = struct { parent: Stamp, nodes: []const hex.Bytes };
+    pub const Ancestors = struct { parent: Stamp, headers: []const hex.Bytes };
+
+    pub fn trieNodes(self: *Shadow, _: std.Io, allocator: std.mem.Allocator, parent: Parent, queries: []const NodeQuery) !rpc.RawJson {
+        try checkNodeQueries(queries);
+        const backing = try allocator.alloc(u8, 4 << 20);
+        defer allocator.free(backing);
+        var scratch = std.heap.FixedBufferAllocator.init(backing);
+        const result = try self.readNodes(scratch.allocator(), parent, queries);
+        return .{ .raw = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(result, .{})}) };
+    }
+
+    fn checkNodeQueries(queries: []const NodeQuery) !void {
+        if (queries.len == 0 or queries.len > 16) return error.StateQueryLimit;
+        for (queries) |q| {
+            if (q.path.bytes.len > 64) return error.InvalidTrieNodePath;
+            for (q.path.bytes) |nibble| if (nibble > 15) return error.InvalidTrieNodePath;
+        }
+    }
+
+    pub fn readNodes(self: *Shadow, allocator: std.mem.Allocator, parent: Parent, queries: []const NodeQuery) !Nodes {
+        try checkNodeQueries(queries);
+        const view = try self.snapshots.acquire(parent.blockHash.bytes, parent.stateRoot.bytes);
+        defer view.deinit();
+        const out = try allocator.alloc(hex.Bytes, queries.len);
+        for (queries, out) |query, *entry| {
+            var at = try self.eth.openAccountTrie(allocator, view.txn, view.header.state_root);
+            defer self.eth.closeAccountTrie(&at);
+            if (query.owner) |owner| {
+                const key = types.keccakOfU160(std.mem.readInt(u160, &owner.bytes, .big));
+                const proof = try at.inner.prove(key);
+                const encoded = proof.value orelse return error.StateAccountUnavailable;
+                var account: types.Account = undefined;
+                if (try rlp.deserialize(types.Account, allocator, encoded, &account) != encoded.len) return error.MalformedAccount;
+                var st = try self.eth.openStorageTrie(allocator, view.txn, key, account.storage_hash);
+                defer self.eth.closeStorageTrie(&st);
+                entry.* = .{ .bytes = try st.inner.nodeAtPath(query.path.bytes, query.expectedHash.bytes) };
+            } else entry.* = .{ .bytes = try at.inner.nodeAtPath(query.path.bytes, query.expectedHash.bytes) };
+        }
+        return .{ .parent = stamp(view.header, view.txn.id()), .nodes = out };
+    }
+
+    pub fn ancestors(self: *Shadow, _: std.Io, allocator: std.mem.Allocator, parent: Parent, count: u16) !rpc.RawJson {
+        if (count == 0 or count > 256) return error.AncestorQueryLimit;
+        const backing = try allocator.alloc(u8, 4 << 20);
+        defer allocator.free(backing);
+        var scratch = std.heap.FixedBufferAllocator.init(backing);
+        const result = try self.readAncestors(scratch.allocator(), parent, count);
+        return .{ .raw = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(result, .{})}) };
+    }
+
+    /// Header cache entries are immutable by hash and may be backfilled after
+    /// the state view was published. Read that cache in a fresh RO transaction,
+    /// following hashes from the leased parent, never selected block numbers.
+    pub fn readAncestors(self: *Shadow, allocator: std.mem.Allocator, parent: Parent, count: u16) !Ancestors {
+        if (count == 0 or count > 256) return error.AncestorQueryLimit;
+        const view = try self.snapshots.acquire(parent.blockHash.bytes, parent.stateRoot.bytes);
+        defer view.deinit();
+        if (count - 1 > view.header.number) return error.AncestorQueryLimit;
+        const store = self.eth.kv_store;
+        const txn = try store.transaction_ro();
+        defer txn.abort() catch unreachable;
+        const headers = try allocator.alloc(hex.Bytes, count);
+        var header = view.header;
+        for (headers, 0..) |*entry, i| {
+            var encoded = std.array_list.Managed(u8).init(allocator);
+            try rlp.serialize(types.BlockHeader, allocator, header, &encoded);
+            if (encoded.items.len > 2048) return error.InvalidBranchHeader;
+            entry.* = .{ .bytes = encoded.items };
+            if (i + 1 == count) break;
+            const previous = try branches.byHash(store, txn, header.parent_hash) orelse return error.AncestorUnavailable;
+            if (previous.number != header.number - 1) return error.BranchParentMismatch;
+            header = previous;
+        }
+        return .{ .parent = stamp(view.header, view.txn.id()), .headers = headers };
+    }
 
     /// Hard bounds apply even to trusted local callers. The response is copied
     /// out before the DB lease and bounded scratch allocation are released.

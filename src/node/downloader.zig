@@ -48,6 +48,8 @@ pub const Downloader = struct {
     consensus_anchor: ?consensus.Anchor = null,
     consensus_probe: ?[32]u8 = null,
     consensus_reported: ?[32]u8 = null,
+    ancestor_probe: ?[32]u8 = null,
+    ancestors_ready: ?[32]u8 = null,
     header_generation: u64 = 0,
 
     peer_ranges: []?PeerRange,
@@ -241,6 +243,7 @@ pub const Downloader = struct {
         self.updateMetrics();
         self.logProgress();
         if (self.consensus_updates != null) try self.advanceConsensusTarget();
+        if (self.shadow_snapshots != null) try self.advanceAncestorDownload();
         if (self.header != null) {
             try self.advanceHeaderDownload();
             if (self.bc.shadow_branches.load(.acquire)) try self.checkHeaderDownloadComplete();
@@ -792,6 +795,7 @@ pub const Downloader = struct {
         }
         if (self.state != null) try self.advanceStateDownload();
         if (self.state_heal != null) try self.advanceStateHeal();
+        try self.advanceAncestorDownload();
         const update = self.consensus_update orelse return;
         const status = self.shadow_snapshots.?.status();
         const ready = status.find(update.head.hash) orelse return;
@@ -801,6 +805,41 @@ pub const Downloader = struct {
             update.head.slot,                                                        ready.number, update.head.hash,
             std.Io.Clock.real.now(self.io).toMilliseconds() - update.observed_at_ms,
         });
+    }
+
+    fn advanceAncestorDownload(self: *Self) !void {
+        if (self.ancestor_probe != null) return;
+        const status = self.shadow_snapshots.?.status();
+        if (status.count == 0) return;
+        const parent = status.headers[0];
+        if (self.ancestors_ready) |hash| if (std.meta.eql(hash, parent.hash())) return;
+        const txn = try self.eth_db.kv_store.transaction_ro();
+        defer txn.abort() catch unreachable;
+        const gap = try branches.missingAncestor(self.eth_db.kv_store, txn, parent) orelse {
+            self.ancestors_ready = parent.hash();
+            return;
+        };
+        const req = self.free_eth_requests.pop() orelse return;
+        self.ancestor_probe = gap.hash;
+        self.requestHeadersFor(req, .{ .hash = gap.hash }, gap.count, .ancestors);
+    }
+
+    fn handleAncestorHeaders(self: *Self, req: *Request(eth.Message), outcome: anyerror!ValidationOutcome) !void {
+        const request = req.msg.get_block_headers.range;
+        const headers = if (outcome) |result| result.headers.headers else |_| &.{};
+        if (headers.len == 0) {
+            self.requestHeadersFor(req, request.origin, request.amount, .ancestors);
+            return;
+        }
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const txn = try self.eth_db.kv_store.transaction_rw();
+        errdefer txn.abort() catch unreachable;
+        try branches.rememberAncestors(self.eth_db.kv_store, txn, arena.allocator(), request.origin.hash, headers);
+        try txn.commit();
+        self.free_eth_requests.push(req);
+        self.ancestor_probe = null;
+        log.debug("shadow cached {} hash-linked ancestors", .{headers.len});
     }
 
     fn publishHashedState(self: *Self, header: types.BlockHeader) !void {
@@ -1139,6 +1178,7 @@ pub const Downloader = struct {
 
     fn handleHeaders(self: *Self, matched_request: *Request(eth.Message), outcome: anyerror!ValidationOutcome) !void {
         if (matched_request.header_purpose == .consensus) return self.handleConsensusHeader(matched_request, outcome);
+        if (matched_request.header_purpose == .ancestors) return self.handleAncestorHeaders(matched_request, outcome);
         if (matched_request.header_generation != self.header_generation) {
             self.free_eth_requests.push(matched_request);
             return;
@@ -2340,7 +2380,7 @@ pub const Downloader = struct {
     }
 };
 
-const HeaderPurpose = enum { chain, consensus };
+const HeaderPurpose = enum { chain, consensus, ancestors };
 
 fn Request(comptime msg: type) type {
     return struct {

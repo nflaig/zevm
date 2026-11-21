@@ -35,6 +35,39 @@ roots fail; there is no latest or block-number fallback. Clients must authentica
 all claims against their independently selected parent root. A header from an
 untrusted peer alone is not proof of canonical chain selection.
 
+`zevm_getStateNodesV1` takes the same parent selector followed by 1–16 queries:
+
+```json
+[{"blockHash":"0x<32 bytes>","stateRoot":"0x<32 bytes>"},
+ [{"owner":"0x<20 bytes>","path":"0x000a","expectedHash":"0x<32 bytes>"}]]
+```
+
+`owner: null` selects the account trie; an address selects its authenticated
+parent storage trie. `path` encodes **raw nibble bytes** (the example means
+nibbles 0, 10), not a compact trie path or storage-key preimage. At most 64
+nibbles are accepted. The server walks from the leased root, verifies each hash
+reference, and returns `parent` plus `nodes`, in query order, each at most 1024
+bytes. Embedded nodes are not separate missing hash references. A client must
+independently establish that the expected hash is reachable at that path in its
+parent trie before importing it. Both the root binding and node hash matter.
+Scratch is limited to 4 MiB; unknown owners, corrupt preimages, wrong paths and
+wrong expected hashes fail without a latest-state fallback.
+
+`zevm_getStateAncestorsV1` takes `[parent, count]`, where `count` is 1–256 and
+includes the exact parent itself. It returns `parent` and RLP `headers`, newest
+first, following parent hashes only. The immutable header cache may be backfilled
+after a state lease was published, so it uses a fresh read-only header transaction
+while retaining the original state lease. The caller checks every hash, number,
+and the first header's state root. A missing ancestor returns `AncestorUnavailable`;
+state-read readiness alone does not promise construction readiness.
+
+The downloader fills missing ancestors by hash from peers, separately from
+selected-height mappings and writable state. Partial responses resume at the
+next missing hash. The cache is bounded to 4096 headers / 8 MiB; backfill batches
+are at most 256 headers and reuse a 4 MiB insertion workspace. Backfilling never
+extends the undo window or changes forkchoice. Tests fill and evict the cache
+using the live downloader slab allocator and preserve alternate branch chains.
+
 Only completed account/storage hashing and code acquisition establish the first
 checkpoint. Later checked BAL updates write state and checkpoint in one MDBX
 transaction. Readers clone retained read-only transactions so concurrent writes

@@ -186,6 +186,75 @@ pub const Trie = struct {
 
     pub const Proof = struct { value: ?[]const u8, nodes: []const []const u8 };
 
+    /// Resolve a hash reference without trusting path-indexed DB bytes. Flat
+    /// leaves must be reconstructed and authenticated just like stored RLP.
+    fn verifiedNode(self: *const Self, hashed: Node.Hashed, path: []const u8) ![]const u8 {
+        if (hashed.len != 32 or path.len > 64) return error.MalformedTrieNode;
+        const resolver = self.resolver orelse return error.SubTrieNotAvailable;
+        const resolved = try resolver.resolveFn(resolver.ptr, self.allocator, path, hashed.data) orelse
+            return error.SubTrieNotAvailable;
+        const encoded = switch (resolved) {
+            .rlp => |bytes| bytes,
+            .node => |resolved_node| leaf: {
+                if (resolved_node != .leaf) return error.MalformedTrieNode;
+                var leaf = resolved_node.leaf;
+                if (path.len + leaf.key_len != 64) return error.MalformedTrieNode;
+                leaf.key[leaf.key_len] = 16;
+                var list = std.array_list.Managed(u8).init(self.allocator);
+                try rlp.serialize(struct { key: []const u8, value: []const u8 }, self.allocator, .{
+                    .key = hexToCompact(leaf.key[0 .. leaf.key_len + 1]),
+                    .value = leaf.val,
+                }, &list);
+                break :leaf list.items;
+            },
+        };
+        if (!std.meta.eql(keccak256(encoded), hashed.data)) return error.StateRootMismatch;
+        return self.allocator.dupe(u8, encoded);
+    }
+
+    /// Return one unresolved hashed node at an exact nibble boundary. Walk from
+    /// the authenticated root, not directly into the path-indexed backing DB.
+    /// Embedded children cannot be missing from an otherwise complete parent
+    /// node, and do not qualify as separate hash references here.
+    pub fn nodeAtPath(self: *const Self, path: []const u8, expected: [32]u8) ![]const u8 {
+        if (path.len > 64) return error.InvalidTrieNodePath;
+        for (path) |nibble| if (nibble > 15) return error.InvalidTrieNodePath;
+        var reader = self.*;
+        var root = self.root;
+        var node = &root;
+        var depth: usize = 0;
+        var resolved: usize = 0;
+        while (true) {
+            if (depth == path.len) {
+                if (node.* != .hashed or node.hashed.len != 32) return error.TrieNodeNotHashReference;
+                if (!std.meta.eql(node.hashed.data, expected)) return error.TrieNodeHashMismatch;
+                const encoded = try self.verifiedNode(node.hashed, path);
+                if (encoded.len > 1024) return error.TrieNodeSizeLimit;
+                return encoded;
+            }
+            switch (node.*) {
+                .hashed => |hashed| {
+                    if (resolved >= 65) return error.MalformedTrieNode;
+                    const encoded = try self.verifiedNode(hashed, path[0..depth]);
+                    try reader.decodeNode(node, encoded, null);
+                    resolved += 1;
+                },
+                .branch => |*branch| {
+                    if (depth >= 64) return error.MalformedTrieNode;
+                    node = branch.children[path[depth]] orelse return error.TrieNodePathUnavailable;
+                    depth += 1;
+                },
+                .ext => |*ext| {
+                    if (ext.key_len == 0 or depth + ext.key_len > 64) return error.MalformedTrieNode;
+                    if (!std.mem.startsWith(u8, path[depth..], ext.key[0..ext.key_len])) return error.TrieNodePathUnavailable;
+                    depth += ext.key_len;
+                    node = ext.child;
+                },
+                .leaf, .empty => return error.TrieNodePathUnavailable,
+            }
+        }
+    }
+
     /// Read an immutable DB trie and produce an inclusion/absence witness.
     /// Every resolved node, including a leaf reconstructed from flat state,
     /// must match the hash committed by the requested root. Missing nodes are
@@ -202,26 +271,7 @@ pub const Trie = struct {
             switch (node.*) {
                 .hashed => |hashed| {
                     if (hashed.len != 32 or nodes.items.len >= 65) return error.MalformedTrieNode;
-                    const resolver = self.resolver orelse return error.SubTrieNotAvailable;
-                    const resolved = try resolver.resolveFn(resolver.ptr, self.allocator, nibbles[0..depth], hashed.data) orelse
-                        return error.SubTrieNotAvailable;
-                    const encoded = switch (resolved) {
-                        .rlp => |bytes| bytes,
-                        .node => |resolved_node| leaf: {
-                            if (resolved_node != .leaf) return error.MalformedTrieNode;
-                            var leaf = resolved_node.leaf;
-                            if (depth + leaf.key_len != 64) return error.MalformedTrieNode;
-                            leaf.key[leaf.key_len] = 16;
-                            var list = std.array_list.Managed(u8).init(self.allocator);
-                            try rlp.serialize(struct { key: []const u8, value: []const u8 }, self.allocator, .{
-                                .key = hexToCompact(leaf.key[0 .. leaf.key_len + 1]),
-                                .value = leaf.val,
-                            }, &list);
-                            break :leaf list.items;
-                        },
-                    };
-                    if (!std.meta.eql(keccak256(encoded), hashed.data)) return error.StateRootMismatch;
-                    const owned = try self.allocator.dupe(u8, encoded);
+                    const owned = try self.verifiedNode(hashed, nibbles[0..depth]);
                     try nodes.append(owned);
                     try reader.decodeNode(node, owned, null);
                 },
