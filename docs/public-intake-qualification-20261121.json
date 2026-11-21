@@ -1,0 +1,34 @@
+{
+  "binary": "public-intake-final-r2-safe/bin/zevm (isolated qualification artifact)",
+  "binary_sha256": "86e61697379a28e57c116bc25e1c5b70971174ac8ca87a28466a2d8dff317888",
+  "source": {
+    "src/node/public_intake.zig": "56b50d7fa166395ef30f8cd269766e9d7854eef689233314b3bff769b30364f4",
+    "src/node/public_intake_peer.zig": "13c44c12cc2ae510b8b555833b367a4f761e9e55761cf87de3c4be3fc23a7d78",
+    "src/node/downloader.zig": "003f66a6288d6e55d7996ab7dbc6f283b8d5da6eeed58757637d95de9491751e",
+    "src/devp2p/eth.zig": "e8c4f7a64e7db074e7d3f148adf26fa0712b1e09f86664f8d453a3b870759aaf",
+    "src/main.zig": "1387c36ac06c5d2b53131c62ab2006ee5f782e2861ee7040598ee071c2a2750c",
+    "src/unit_tests.zig": "984266320228fc284884f01a892379d4a2b042f07aa51fd5c27d519bc7df82d4",
+    "docs/public-intake.md": "67f61563b7fcca6542fcfde33cb9d1f20ce3623293caf80ee3ba010e9bcdc364",
+    "docs/shadow-state.md": "9cfbb5a29152830dba83182d3b3271008b54dc9e76caf0fe2fca922802fd40bc"
+  },
+  "tests": {
+    "debug": {
+      "exit": 0,
+      "general": 103,
+      "shadow": 77,
+      "total": 180
+    },
+    "safe": {
+      "exit": 0,
+      "general": 103,
+      "shadow": 77,
+      "total": 180
+    }
+  },
+  "target": "x86_64-linux-gnu.2.35",
+  "cpu": "baseline+cx16",
+  "cli_help_exit": 0,
+  "cli_shadow_guard_exit": 1,
+  "review_status": "intake Opus hardening and exact final delta reviews still pending; safe to qualify observer disabled only",
+  "scope": "Both new features default off unless shadow modes are selected. Production constructors unchanged; independent intake is not constructor delivery. Header reuse will be qualified first with intake disabled."
+}

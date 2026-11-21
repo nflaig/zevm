@@ -15,6 +15,7 @@ const branches = @import("../db/branches.zig");
 const undo = @import("../db/undo.zig");
 const snapshots_db = @import("../db/snapshot.zig");
 const consensus = @import("consensus.zig");
+const PublicIntake = @import("public_intake_peer.zig").Driver;
 
 const RangeProofVerifier = @import("../trie/range_proof.zig").Verifier;
 const EthDb = @import("../db/eth.zig").Eth;
@@ -43,6 +44,7 @@ pub const Downloader = struct {
     bc: *Blockchain,
     eth_db: *EthDb,
     shadow_snapshots: ?*@import("../db/snapshot.zig").Snapshots = null,
+    public_intake: ?*PublicIntake = null,
     pending_bootstrap: ?types.BlockHeader = null,
     consensus_updates: ?*std.Io.Queue(consensus.Update) = null,
     consensus_update: ?consensus.Update = null,
@@ -241,6 +243,11 @@ pub const Downloader = struct {
     }
 
     fn handleTick(self: *Self) !void {
+        if (self.public_intake) |intake| {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            intake.tick(arena.allocator(), std.Io.Timestamp.now(self.io, .awake).toMilliseconds());
+        }
         self.updateMetrics();
         self.logProgress();
         if (self.consensus_updates != null) try self.advanceConsensusTarget();
@@ -265,6 +272,16 @@ pub const Downloader = struct {
 
     fn handleEth(self: *Self, received: eth.Provider.ParsedMessage) !bool {
         const peer = received.read.peer;
+        if (self.public_intake) |intake| {
+            // A Status for this connection epoch must precede public intake.
+            if (self.peer_ranges[peer.peer_index]) |range| {
+                if (range.id.peer_epoch == peer.peer_epoch)
+                    intake.handle(self.eth_arena.allocator(), received, .{
+                        .mono_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds(),
+                        .wall_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
+                    });
+            }
+        }
         var matched: ?*Request(eth.Message) = null;
         switch (received.msg) {
             .status => |status| {
@@ -809,6 +826,36 @@ pub const Downloader = struct {
             self.state = .{ .pivot = status.headers[0], .phase = .catchup };
         }
         log.info("shadow consensus target: slot {} execution {} hash {x}", .{ self.consensus_update.?.head.slot, header.number, hash });
+        // The CL-bound lookup already authenticated this exact target header.
+        // For a direct extension of the CURRENT verified checkpoint, its parent
+        // is also local. Reuse both instead of fetching the pair from a peer
+        // again. Keep the normal branch-selection and BAL/root-validation path;
+        // storing a header must never publish unexecuted state as ready.
+        if (self.bc.shadow_branches.load(.acquire) and self.state_heal == null and
+            header.number > 0 and header.number - 1 == head.number and
+            std.meta.eql(header.parent_hash, head.hash))
+        {
+            const checkpoint = blk: {
+                const store = self.eth_db.kv_store;
+                const txn = try store.transaction_ro();
+                defer txn.abort() catch unreachable;
+                var scratch: [8192]u8 = undefined;
+                var a = std.heap.FixedBufferAllocator.init(&scratch);
+                // BlockHeader owns all fields, including ExtraData.buf. The
+                // decoder copies bytes; no transaction/scratch view escapes.
+                break :blk try snapshots_db.readCheckpoint(store, txn, a.allocator());
+            };
+            if (checkpoint) |parent| if (std.meta.eql(parent.hash(), head.hash)) {
+                var headers = [_]types.BlockHeader{ parent, header };
+                var hashes = [_][32]u8{ head.hash, hash };
+                if (try self.persistDownloadedHeaderChain(&headers, &hashes, 2) != null)
+                    return error.InconsistentConsensusHeaderSeed;
+                self.header = .{ .requested_header_head = header.number, .requested_header_tail = parent.number };
+                self.progress.headers = 2;
+                try self.checkHeaderDownloadComplete();
+                return;
+            };
+        }
         try self.advanceHeaderDownload();
     }
 
@@ -2515,6 +2562,275 @@ test "retained EMPTY parent cancels obsolete probes without rewinding warmed FUL
     const old = try snapshots.acquire(parent.hash(), parent.state_root);
     defer old.deinit();
     try std.testing.expectEqual(parent.hash(), old.header.hash());
+}
+
+test "consensus direct extension reuses verified target and checkpoint without a second header request" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.createDir(io, "db", .default_dir);
+    var path: [1024]u8 = undefined;
+    const length = try dir.dir.realPathFile(io, "db", &path);
+    var store = try kv.Store.initBounded(a, path[0..length], 64 << 20, 1 << 20);
+    defer store.deinit() catch unreachable;
+    var files = try @import("../db/file.zig").Storage.init(io, a, path[0..length]);
+    defer files.deinit(io, a) catch unreachable;
+    var db = EthDb.init(&store);
+    var bc: Blockchain = .{
+        .cfg = @import("blockchain.zig").glamsterdam_devnet8_config,
+        .io = io,
+        .allocator = a,
+        .eth_db = &db,
+        .file_storage = &files,
+        .shadow_branches = .init(true),
+    };
+    var parent = bc.cfg.genesis_header;
+    parent.number = 10;
+    parent.block_access_list_hash = @splat(0x44);
+    parent.slot_number = 20;
+    parent.state_root = types.empty_root_hash;
+    {
+        const txn = try store.transaction_rw();
+        errdefer txn.abort() catch unreachable;
+        try branches.initialize(&store, txn, arena.allocator(), parent);
+        try snapshots_db.writeCheckpoint(&store, txn, a, parent);
+        try txn.commit();
+    }
+    var snapshots: snapshots_db.Snapshots = .{ .io = io, .store = &store };
+    defer snapshots.deinit();
+    try snapshots.publish(a);
+    const lease = try snapshots.acquire(parent.hash(), parent.state_root);
+    defer lease.deinit();
+    var child = parent;
+    child.number += 1;
+    child.parent_hash = parent.hash();
+    child.slot_number = 21;
+    std.crypto.hash.sha3.Keccak256.hash(&.{0xc0}, &child.block_access_list_hash.?, .{});
+
+    // Fully initialized providers have no connected peers. The authenticated
+    // child and immutable checkpoint must advance without queuing another fetch.
+    // State is NOT marked ready before the normal BAL/root validation finishes.
+    var eth_provider = try eth.Provider.init(arena.allocator());
+    var snap_provider = try snap.Provider.init(arena.allocator());
+    var downloader = try Downloader.init(io, arena.allocator(), &bc, &db, &eth_provider, &snap_provider);
+    downloader.shadow_snapshots = &snapshots;
+    downloader.consensus_anchor = .{ .beacon_root = @splat(8), .execution_hash = parent.hash(), .slot = 20 };
+    downloader.consensus_update = .{
+        .anchor = downloader.consensus_anchor.?,
+        .head = .{ .hash = child.hash(), .slot = 21 },
+        .observed_at_ms = 0,
+    };
+    downloader.free_eth_requests = .{};
+    var request_pool = try List(Request(eth.Message)).init(arena.allocator(), 4);
+    const lookup = request_pool.pop().?;
+    lookup.header_purpose = .consensus;
+    lookup.msg = .{ .get_block_headers = .{ .range = .{ .origin = .{ .hash = child.hash() }, .amount = 1, .skip = 0, .reverse = true } } };
+    var lookup_headers = [_]types.BlockHeader{child};
+    var lookup_hashes = [_][32]u8{child.hash()};
+    const lookup_result: ValidationOutcome = .{ .headers = .{ .headers = &lookup_headers, .hashes = &lookup_hashes } };
+
+    // A worker result's claimed hash is not authority: bind the decoded header
+    // itself to the current trusted CL target before altering any branch state.
+    lookup_headers[0].beneficiary = @splat(0x77);
+    try std.testing.expectError(error.ConsensusHeaderHashMismatch, downloader.handleConsensusHeader(lookup, lookup_result));
+    try std.testing.expectEqual(parent.hash(), downloader.sync_target.hash);
+    try std.testing.expectEqual(null, downloader.header);
+    lookup_headers[0] = child;
+    lookup_headers[0].block_access_list_hash = null;
+    lookup.msg.get_block_headers.range.origin.hash = lookup_headers[0].hash();
+    downloader.consensus_update.?.head.hash = lookup_headers[0].hash();
+    try std.testing.expectError(error.PostGloasRequired, downloader.handleConsensusHeader(lookup, lookup_result));
+    try std.testing.expectEqual(parent.hash(), downloader.sync_target.hash);
+    lookup_headers[0] = child;
+    lookup.msg.get_block_headers.range.origin.hash = child.hash();
+    downloader.consensus_update.?.head.hash = child.hash();
+    try downloader.handleConsensusHeader(lookup, lookup_result);
+    try std.testing.expectEqual(null, downloader.header);
+    try std.testing.expectEqual(child.hash(), (try bc.head()).hash);
+    try std.testing.expectEqual(parent.hash(), downloader.state.?.pivot.hash());
+    try std.testing.expectEqual(parent.hash(), snapshots.status().headers[0].hash());
+    try std.testing.expectError(error.StateViewUnavailable, snapshots.acquire(child.hash(), child.state_root));
+    try std.testing.expectEqual(parent.hash(), lease.header.hash());
+    try std.testing.expectEqual(2, downloader.progress.headers);
+    try std.testing.expect(downloader.pending_eth_requests.empty() and downloader.inflight_eth_requests.empty());
+    const generation = downloader.header_generation;
+    try downloader.selectConsensusTarget(child);
+    try std.testing.expectEqual(generation, downloader.header_generation);
+    try std.testing.expectEqual(null, downloader.header);
+
+    // A true same-height sibling has the same verified parent but a different
+    // hash. Child A is already selected: child B must follow normal branch
+    // discovery while A's state is still being completed, not seed a conflict.
+    var sibling = child;
+    sibling.beneficiary = @splat(0xbb);
+    try downloader.selectConsensusTarget(sibling);
+    try std.testing.expectEqual(child.number, sibling.number);
+    try std.testing.expectEqual(child.parent_hash, sibling.parent_hash);
+    try std.testing.expectEqual(sibling.hash(), downloader.sync_target.hash);
+    try std.testing.expect(downloader.header != null);
+    try std.testing.expectEqual(child.hash(), (try bc.head()).hash);
+    try std.testing.expectEqual(0, downloader.progress.headers);
+    try std.testing.expectError(error.StateViewUnavailable, snapshots.acquire(sibling.hash(), sibling.state_root));
+
+    // A known header without its verified state must not authorize this path.
+    // The old parent lease remains usable while the next target waits on peers.
+    var next = child;
+    next.number += 1;
+    next.parent_hash = child.hash();
+    next.slot_number = 22;
+    try downloader.selectConsensusTarget(next);
+    try std.testing.expect(downloader.header != null);
+    try std.testing.expectEqual(child.hash(), (try bc.head()).hash);
+    try std.testing.expectEqual(parent.hash(), lease.header.hash());
+
+    // Height gaps and broken parent links use the normal
+    // authenticated range-download path rather than inventing an ancestor.
+    inline for (.{ "gap", "wrong_parent", "healing" }) |case| {
+        {
+            const reset = try store.transaction_rw();
+            errdefer reset.abort() catch unreachable;
+            try branches.select(&store, reset, arena.allocator(), parent, &.{});
+            try reset.commit();
+        }
+        downloader.sync_target = .{ .number = parent.number, .hash = parent.hash(), .cutoff_number = parent.number, .cutoff_hash = parent.hash() };
+        downloader.state_heal = null;
+        var other = child;
+        if (comptime std.mem.eql(u8, case, "gap")) other.number += 1;
+        if (comptime std.mem.eql(u8, case, "wrong_parent")) other.parent_hash = @splat(0xaa);
+        if (comptime std.mem.eql(u8, case, "healing")) downloader.state_heal = .{
+            .next_pivot = child,
+            .target_pivot = child,
+            .start_number = parent.number,
+            .started_at = .now(io, .awake),
+        };
+        try downloader.selectConsensusTarget(other);
+        try std.testing.expect(downloader.header != null);
+        try std.testing.expectEqual(parent.hash(), (try bc.head()).hash);
+        try std.testing.expectEqual(parent.hash(), snapshots.status().headers[0].hash());
+        try std.testing.expectEqual(0, downloader.progress.headers);
+    }
+
+    // Switching a live download cancels requests owned by the loop, but leaves
+    // a worker's request alive until its result arrives. Old staged descendants
+    // must also be removed before seeding the new sibling of that old target.
+    downloader.state_heal = null;
+    downloader.cancelHeaderRequests(.chain);
+    downloader.free_eth_requests = .{};
+    downloader.sync_target = .{ .number = parent.number, .hash = parent.hash(), .cutoff_number = parent.number, .cutoff_hash = parent.hash() };
+    var old_descendant = sibling;
+    old_descendant.number += 1;
+    old_descendant.parent_hash = sibling.hash();
+    var old_headers = [_]types.BlockHeader{ parent, sibling, old_descendant };
+    var old_hashes = [_][32]u8{ parent.hash(), sibling.hash(), old_descendant.hash() };
+    try std.testing.expectEqual(null, try downloader.persistDownloadedHeaderChain(&old_headers, &old_hashes, 3));
+    const inflight = request_pool.pop().?;
+    const pending = request_pool.pop().?;
+    const validating = request_pool.pop().?;
+    const old_generation = downloader.header_generation;
+    for ([_]*Request(eth.Message){ inflight, pending, validating }) |req| req.* = .{
+        .id = 1,
+        .peer = .{ .peer_index = 0, .peer_epoch = 0 },
+        .msg = .{ .get_block_headers = .{ .range = .{ .origin = .{ .hash = sibling.hash() }, .amount = 2 } } },
+        .sent_at = .now(io, .awake),
+        .deadline = .now(io, .awake),
+        .header_generation = old_generation,
+    };
+    downloader.inflight_eth_requests.push(inflight);
+    downloader.pending_eth_requests.push(pending);
+    downloader.validating_eth_requests.push(validating);
+    try downloader.selectConsensusTarget(child);
+    try std.testing.expectEqual(old_generation + 1, downloader.header_generation);
+    try std.testing.expect(downloader.inflight_eth_requests.empty() and downloader.pending_eth_requests.empty());
+    try std.testing.expectEqual(2, downloader.free_eth_requests.inner.len());
+    try std.testing.expectEqual(1, downloader.validating_eth_requests.inner.len());
+    try std.testing.expect(downloader.header != null);
+    try std.testing.expectEqual(parent.hash(), (try bc.head()).hash);
+    try std.testing.expectEqual(child.hash(), (try downloader.readDownladedHeader(child.number)).?.hash());
+    try std.testing.expectEqual(null, try downloader.readDownladedHeader(old_descendant.number));
+    try downloader.handleValidated(.{
+        .arena = .init(arena.allocator()),
+        .resp = .{ .eth = .{
+            .req = validating,
+            .msg = .{
+                .msg = .{ .block_headers = .{ .request_id = 1, .rlps = &.{} } },
+                .read = .{ .peer = validating.peer, .id = 4, .payload = try arena.allocator().alloc(u8, 0) },
+            },
+        } },
+        .outcome = .{ .headers = .{ .headers = old_headers[0..2], .hashes = old_hashes[0..2] } },
+    });
+    try std.testing.expect(downloader.validating_eth_requests.empty());
+    try std.testing.expectEqual(3, downloader.free_eth_requests.inner.len());
+    try std.testing.expectEqual(child.hash(), (try downloader.readDownladedHeader(child.number)).?.hash());
+    try std.testing.expectEqual(2, downloader.progress.headers);
+    try downloader.checkHeaderDownloadComplete();
+    try std.testing.expectEqual(null, downloader.header);
+    try std.testing.expectEqual(child.hash(), (try bc.head()).hash);
+    try std.testing.expectError(error.StateViewUnavailable, snapshots.acquire(child.hash(), child.state_root));
+
+    // Header reuse still goes through BAL hash gating, state-root calculation
+    // and atomic checkpoint publication. A wrong BAL cannot make the child
+    // ready; the matching empty BAL advances the real empty trie checkpoint.
+    downloader.state_heal = .{
+        .next_pivot = child,
+        .target_pivot = child,
+        .start_number = parent.number,
+        .started_at = .now(io, .real),
+        .bal_requested = true,
+    };
+    const bal_req = downloader.free_eth_requests.pop().?;
+    var bals = [_]VerifiedBal{.{ .hash = @splat(0x99), .parsed = &.{} }};
+    try downloader.handleBals(bal_req, .{ .bals = &bals });
+    try std.testing.expect(!downloader.state_heal.?.bal_applied);
+    try std.testing.expectError(error.StateViewUnavailable, snapshots.acquire(child.hash(), child.state_root));
+    try std.testing.expectEqual(parent.hash(), snapshots.status().headers[0].hash());
+    try std.testing.expectEqual(bal_req, downloader.pending_eth_requests.pop().?);
+    bals[0].hash = child.block_access_list_hash.?;
+    try downloader.handleBals(bal_req, .{ .bals = &bals });
+    try std.testing.expectEqual(null, downloader.state_heal);
+    const child_lease = try snapshots.acquire(child.hash(), child.state_root);
+    defer child_lease.deinit();
+    try std.testing.expectEqual(child.hash(), child_lease.header.hash());
+    try std.testing.expectError(error.StateRootMismatch, snapshots.acquire(child.hash(), @splat(0xff)));
+    try std.testing.expectEqual(parent.hash(), lease.header.hash());
+
+    // Once A is fully verified, a same-height CL switch to B still downloads
+    // its ancestry, rewinds to the common parent and verifies B's own BAL.
+    // The retained FULL-A lease stays valid while the writer follows FULL-B.
+    downloader.consensus_update.?.head.hash = sibling.hash();
+    const sibling_lookup = downloader.free_eth_requests.pop().?;
+    sibling_lookup.header_purpose = .consensus;
+    sibling_lookup.msg = .{ .get_block_headers = .{ .range = .{ .origin = .{ .hash = sibling.hash() }, .amount = 1 } } };
+    lookup_headers[0] = sibling;
+    lookup_hashes[0] = sibling.hash();
+    try downloader.handleConsensusHeader(sibling_lookup, lookup_result);
+    try std.testing.expectEqual(child.hash(), (try bc.head()).hash);
+    const sibling_range = downloader.pending_eth_requests.pop().?;
+    try downloader.handleHeaders(sibling_range, lookup_result);
+    try std.testing.expectEqual(child.hash(), (try bc.head()).hash);
+    try downloader.advanceHeaderDownload();
+    const ancestry_range = downloader.pending_eth_requests.pop().?;
+    try std.testing.expectEqual(2, ancestry_range.msg.get_block_headers.range.amount);
+    try downloader.handleHeaders(ancestry_range, .{ .headers = .{ .headers = old_headers[0..2], .hashes = old_hashes[0..2] } });
+    try std.testing.expectEqual(null, downloader.header);
+    try std.testing.expectEqual(sibling.hash(), (try bc.head()).hash);
+    try std.testing.expectEqual(parent.hash(), downloader.state.?.pivot.hash());
+    try std.testing.expectError(error.StateViewUnavailable, snapshots.acquire(sibling.hash(), sibling.state_root));
+    downloader.state_heal = .{
+        .next_pivot = sibling,
+        .target_pivot = sibling,
+        .start_number = parent.number,
+        .started_at = .now(io, .real),
+        .bal_requested = true,
+    };
+    try downloader.handleBals(downloader.free_eth_requests.pop().?, .{ .bals = &bals });
+    const sibling_lease = try snapshots.acquire(sibling.hash(), sibling.state_root);
+    defer sibling_lease.deinit();
+    try std.testing.expectEqual(sibling.hash(), sibling_lease.header.hash());
+    try std.testing.expectEqual(child.hash(), child_lease.header.hash());
+    try std.testing.expectEqual(parent.hash(), lease.header.hash());
 }
 
 test "shadow cancellation preserves in-validation ownership and BAL requests" {

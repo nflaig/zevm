@@ -30,6 +30,8 @@ const Shutdown = @import("signals.zig").Shutdown;
 const Snapshots = @import("db/snapshot.zig").Snapshots;
 const ShadowApi = @import("rpc/shadow.zig").Shadow;
 const consensus = @import("node/consensus.zig");
+const public_intake = @import("node/public_intake.zig");
+const public_intake_peer = @import("node/public_intake_peer.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -54,6 +56,7 @@ const params = clap.parseParamsComptime(
     \\    --metrics-port <u16>  Prometheus metrics HTTP listening port (default: 6060).
     \\    --shadow-state        Enable exact-parent state witness qualification.
     \\    --shadow-beacon-url <str> Follow a trusted local post-Gloas beacon node (requires --shadow-state).
+    \\    --public-intake-observer Observe independent public transaction hashes/times (requires --shadow-state; never feeds construction).
     \\
 );
 
@@ -75,6 +78,7 @@ const Options = struct {
     metrics_addr: std.Io.net.IpAddress,
     shadow_state: bool,
     shadow_beacon_url: ?[]const u8,
+    public_intake_observer: bool,
 
     fn parse(init: std.process.Init) !?Options {
         var diag = clap.Diagnostic{};
@@ -100,9 +104,12 @@ const Options = struct {
         const metrics_port = res.args.@"metrics-port" orelse 6060;
         if (res.args.@"shadow-beacon-url" != null and res.args.@"shadow-state" == 0)
             return error.ShadowStateRequired;
+        if (res.args.@"public-intake-observer" != 0 and res.args.@"shadow-state" == 0)
+            return error.ShadowStateRequired;
         return .{
             .shadow_state = res.args.@"shadow-state" != 0,
             .shadow_beacon_url = res.args.@"shadow-beacon-url",
+            .public_intake_observer = res.args.@"public-intake-observer" != 0,
             .config = switch (network) {
                 .glamsterdam_devnet8 => blockchain.glamsterdam_devnet8_config,
                 .mainnet => blockchain.mainnet_config,
@@ -241,6 +248,11 @@ fn runNode(init: std.process.Init, opts: Options) !void {
     );
 
     var snapshots: Snapshots = .{ .io = init.io, .store = &store };
+    var public_observer: public_intake_peer.Observer = .{ .io = init.io };
+    var public_source: public_intake.Intake = .{ .allocator = init.gpa, .chain_id = opts.config.chain_id, .sink = public_observer.sink() };
+    defer public_source.deinit();
+    var public_driver: public_intake_peer.Driver = .{ .source = &public_source, .provider = &ethproto };
+    if (opts.public_intake_observer) downloader.public_intake = &public_driver;
     defer snapshots.deinit();
     if (opts.shadow_state) try downloader.enableShadow(&snapshots, opts.shadow_beacon_url != null);
     var shadow_api: ShadowApi = .{ .snapshots = &snapshots, .eth = &eth_db };

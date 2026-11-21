@@ -199,3 +199,44 @@ exceed the slab allocator's 32 MiB single-allocation limit. These bounded scratc
 buffers now use independent page allocations and are released after copying the
 JSON response. The alternating-request regression passes with the real slab
 allocator in both Debug and safe mode; the global slab limit is unchanged.
+
+## Direct-extension header readiness qualification
+
+The trusted CL target lookup already returns the exact execution header. When
+that header directly extends the **current verified checkpoint**, the downloader
+now reuses the header and local checkpoint instead of fetching the pair again
+from a peer. This removes one redundant header request on that path. It retains
+the normal branch selector, BAL hash check, calculated state-root check and
+atomic checkpoint publication. No state becomes available at header selection.
+Active BAL work, unverified selected heads, gaps and alternate branches continue
+through the existing download path. Target changes cancel loop-owned requests,
+advance the generation and discard old staging; worker-owned responses are
+discarded by generation after their validation finishes.
+
+The full-source review confirmed that `BlockHeader` owns every field inline,
+including the 32-byte `ExtraData` buffer. Reading a checkpoint does not retain
+the decoder scratch or database transaction. Header reuse does not introduce
+execution-header semantic validation: both paths depend on the trusted,
+execution-valid Lodestar selection described above. They bind the fetched header
+to its CL hash and require post-Gloas fields; this is not a standalone EL.
+
+The integration regression uses initialized ETH/SNAP providers with no connected
+peers. It checks the missing second request, mismatched header hash and absent
+Gloas fields, duplicate targets, true same-height siblings, old in-flight and
+worker-owned requests, stale staged descendants, unavailable child state before
+BAL verification and a wrong BAL hash. A matching BAL passes the existing root
+calculation and publishes the child. A later verified A-to-B sibling transition
+downloads ancestry, rewinds to the common parent and publishes B while a retained
+A lease stays readable. ReleaseSafe qualification passed 95 general and 77 shadow
+tests; general totals also include the independent public-intake tests.
+
+The read-only 15-minute baseline from 2026-11-21 contained 68 completed single-block
+advances. Median observation-to-ready was 573.5 ms, target-header-known-to-ready
+356.863 ms, and target-header-known-to-heal-start 160.7495 ms. The last interval
+includes header download, storage and scheduling; it is **not** the expected
+gain from this change. No post-change live improvement is claimed by this test.
+Use zbuilder's `test/analyze_shadow_readiness.py` on a single chronological process
+log for a comparison. It matches slot/number/hash, handles midnight, reports
+incomplete/duplicate events and excludes ambiguous sibling heal-start attribution.
+Its three parser tests pass, and it reproduces every row and median of the saved
+68-block baseline exactly.

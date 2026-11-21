@@ -36,7 +36,9 @@ pub const Status = struct {
     latest_block_hash: [32]u8,
 };
 
-pub const Transactions = []rlp.RawValue;
+// Intake bounds the item count before decoding transaction objects. Keeping the
+// frame raw also avoids allocating a large list when intake is disabled.
+pub const Transactions = rlp.RawValue;
 
 pub const BlockRangeUpdate = struct {
     earliest_block: u64,
