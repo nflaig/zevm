@@ -487,3 +487,24 @@ test "shadow corrupted undo preimages cannot restore a falsely labelled parent r
         try std.testing.expectEqual(child.hash(), (try snapshots.readCheckpoint(&f.store, txn, alloc)).?.hash());
     }
 }
+
+test "shadow undo workspace works with the live downloader slab allocator" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var backing = std.heap.ArenaAllocator.init(a);
+    defer backing.deinit();
+    var slabs = @import("devp2p/allocator.zig").SlabAllocator.init(backing.allocator());
+    var arena = std.heap.ArenaAllocator.init(slabs.allocator());
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const base = try f.write(1, 42, true);
+    const record = try f.capture(alloc, base, 84);
+    const child = try f.transition(2, 84, true, base, null);
+    var eth = Eth.init(&f.store);
+    const txn = try f.store.transaction_rw();
+    errdefer txn.abort() catch unreachable;
+    try undo.save(&f.store, txn, alloc, child, record);
+    const restored = try undo.rewind(&eth, txn, alloc, base.hash());
+    try std.testing.expectEqual(base.hash(), restored.hash());
+    try txn.commit();
+}

@@ -52,8 +52,11 @@ pub fn capture(eth: *Eth, txn: kv.Transaction, allocator: std.mem.Allocator, par
 pub fn save(store: *kv.Store, txn: kv.Transaction, allocator: std.mem.Allocator, child: types.BlockHeader, record: Record) !void {
     if (child.number != record.parent.number + 1 or !std.meta.eql(child.parent_hash, record.parent.hash()))
         return error.StateCheckpointBranchMismatch;
-    const backing = try allocator.alloc(u8, max_record_bytes);
-    defer allocator.free(backing);
+    // The downloader's slab allocator caps a single allocation at 32 MiB;
+    // allocating this through an arena also needs its header/growth overhead.
+    // Map the bounded large workspace directly and release it on every path.
+    const backing = try std.heap.page_allocator.alloc(u8, max_record_bytes);
+    defer std.heap.page_allocator.free(backing);
     var buffer = std.heap.FixedBufferAllocator.init(backing);
     var encoded = std.array_list.Managed(u8).init(buffer.allocator());
     rlp.serialize(Record, buffer.allocator(), record, &encoded) catch |e| {
@@ -68,8 +71,8 @@ pub fn save(store: *kv.Store, txn: kv.Transaction, allocator: std.mem.Allocator,
 pub fn rewind(eth: *Eth, txn: kv.Transaction, allocator: std.mem.Allocator, target: [32]u8) !types.BlockHeader {
     var current = try snapshot.readCheckpoint(eth.kv_store, txn, allocator) orelse return error.StateNotReady;
     if (std.meta.eql(current.hash(), target)) return current;
-    const scratch_bytes = try allocator.alloc(u8, 64 << 20);
-    defer allocator.free(scratch_bytes);
+    const scratch_bytes = try std.heap.page_allocator.alloc(u8, 64 << 20);
+    defer std.heap.page_allocator.free(scratch_bytes);
     var scratch = std.heap.FixedBufferAllocator.init(scratch_bytes);
     for (0..depth_limit) |_| {
         if (std.meta.eql(current.hash(), target)) return current;
