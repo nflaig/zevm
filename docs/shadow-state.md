@@ -148,6 +148,17 @@ cleared; missing/mismatched anchor metadata still fails closed. The database tes
 cover reset commit/abort, wrong anchors, progressed branches and preserving a
 verified checkpoint (77 shadow tests and 81 general tests in Debug and safe).
 
+A separate live Plataberget process was killed with SIGKILL after account/storage
+download and during initial code/hash work. On restart in the **same** directory,
+it kept all state views unavailable until the fixed anchor's root was verified,
+then published that anchor after 233.5 seconds. Independent Geth header/root
+comparison passed, followed by three complete native payload reconstructions
+using only shadow state RPCs. The ten initial connection-refused observations
+were during process startup; no partial state was published. Evidence lives in
+`bootstrap-recovery-v7` and `full-execution-bootstrap-recovery-v7` in the isolated
+qualification workspace. This tests one interruption point, not power loss or
+exhausted history recovery.
+
 Current limits: the finalized bootstrap pivot stays fixed until complete; peers
 must still serve its state after an interruption. Recovery is bounded by retained
 undo history; only eight recent views are retained and one writer processes
