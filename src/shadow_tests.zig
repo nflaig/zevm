@@ -482,6 +482,57 @@ test "shadow reorg rewinds storage and accounts, preserves old leases and select
     try std.testing.expectEqual(right.hash(), (try branches.read(&f.store, txn, 2)).?.hash());
 }
 
+test "shadow four-block reorg restores the common ancestor and preserves a losing-branch lease" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var eth = Eth.init(&f.store);
+    const base = try f.write(1, 42, true);
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var left = base;
+    for (2..6) |number| {
+        const balance = number * 100;
+        left = try f.transition(number, balance, true, left, try f.capture(alloc, left, balance));
+        try views.publish(a);
+    }
+    const old = try views.acquire(left.hash(), left.state_root);
+    defer old.deinit();
+    {
+        const txn = try f.store.transaction_rw();
+        errdefer txn.abort() catch unreachable;
+        const restored = try undo.rewind(&eth, txn, alloc, base.hash());
+        try std.testing.expectEqual(base.hash(), restored.hash());
+        try branches.select(&f.store, txn, alloc, base, &.{});
+        try txn.commit();
+    }
+    try views.publish(a);
+    var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    const restored = (try api.read(alloc, parent(base), &queries)).accounts[0];
+    try std.testing.expectEqual(42, restored.balance.number);
+    try std.testing.expectEqual(1, restored.nonce.number);
+    try std.testing.expectEqual(42, restored.storageProof[0].value.number);
+    var right = base;
+    for (2..6) |number| {
+        const balance = number * 100 + 1;
+        right = try f.transition(number, balance, true, right, try f.capture(alloc, right, balance));
+        try views.publish(a);
+    }
+    const current = (try api.read(alloc, parent(right), &queries)).accounts[0];
+    try std.testing.expectEqual(501, current.balance.number);
+    try std.testing.expectEqual(501, current.storageProof[0].value.number);
+    const key = types.keccakOfU160(std.mem.readInt(u160, &queries[0].address.bytes, .big));
+    try std.testing.expectEqual(500, (try eth.readAccount(old.txn, key)).?.balance);
+    const txn = try f.store.transaction_ro();
+    defer txn.abort() catch unreachable;
+    try std.testing.expectEqual(right.hash(), (try snapshots.readCheckpoint(&f.store, txn, alloc)).?.hash());
+    try std.testing.expectEqual(right.hash(), (try branches.read(&f.store, txn, 5)).?.hash());
+    try std.testing.expectEqual(left.hash(), (try branches.byHash(&f.store, txn, left.hash())).?.hash());
+}
+
 test "shadow missing undo history aborts even after an earlier successful rewind" {
     var f = try Fixture.init();
     defer f.deinit();
