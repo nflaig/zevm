@@ -1,0 +1,305 @@
+{
+  "schemaVersion": 1,
+  "scope": "Retained bounded workspace for exact-parent authenticated native state RPC; no production provider change.",
+  "sourceBase": "62ff6c994d7f59cc04fdbb879a9a9169b49becd7",
+  "runtimeFiles": {
+    "src/rpc/shadow.zig": "7a7abae343bfe85db5eb35828d668379b381eda004c760d6095896bbefd5f275",
+    "src/rpc/http.zig": "c3fb50e5d34f1323bd0d4bbe9932b0930f05d039a82d6c048f7efb8c99d5ee6e",
+    "src/rpc/jsonrpc.zig": "ad80775cd9e793bf8ea1162efec3c09d7f86f6816fc1f1aebc2b9a05ca22b1c5",
+    "src/main.zig": "b5c8e4f12d9dc94e78ba041b3d5a625309867f9a53af58c99a21e1e9820ff75c"
+  },
+  "qualification": {
+    "debug": {
+      "testsPassed": 192,
+      "command": [
+        "/home/nico/debug/zig-payload-plan-20261011/qualification/toolchain/zig-x86_64-linux-0.17.0/zig",
+        "build",
+        "test",
+        "test-shadow-state",
+        "zevm",
+        "-Doptimize=debug",
+        "-Dtarget=x86_64-linux-gnu.2.35",
+        "-Dcpu=baseline+cx16",
+        "--cache-dir",
+        "/home/nico/debug/zevm-geth-retirement-20261121/zig-scratch-reuse-debug-v12",
+        "--prefix",
+        "/home/nico/debug/zevm-geth-retirement-20261121/scratch-reuse-debug-v12",
+        "--summary",
+        "all"
+      ],
+      "sourceUnchanged": true,
+      "binarySha256": "3953284508d5e63f0faedee9e968040eea4fe7a7ad49b8396d20fadcb0328f8d",
+      "logSha256": "1ebf5d68989489cd4155f32913fb6d81ea1ec9ab401176851c99fd58b738eb74"
+    },
+    "safe": {
+      "testsPassed": 192,
+      "command": [
+        "/home/nico/debug/zig-payload-plan-20261011/qualification/toolchain/zig-x86_64-linux-0.17.0/zig",
+        "build",
+        "test",
+        "test-shadow-state",
+        "zevm",
+        "-Doptimize=safe",
+        "-Dtarget=x86_64-linux-gnu.2.35",
+        "-Dcpu=baseline+cx16",
+        "--cache-dir",
+        "/home/nico/debug/zevm-geth-retirement-20261121/zig-scratch-reuse-safe-v12",
+        "--prefix",
+        "/home/nico/debug/zevm-geth-retirement-20261121/scratch-reuse-safe-v12",
+        "--summary",
+        "all"
+      ],
+      "sourceUnchanged": true,
+      "binarySha256": "dfca4fb9943f2dcc69f5949a7c0fcc668dbfe5455bbb09d693616feecfdeb181",
+      "logSha256": "a4fae724ed7c60f546e872298f305b062f740b5daed63301e6f0381310bca30b"
+    }
+  },
+  "benchmark": {
+    "implementationFiles": [
+      "zevm/src/shadow_witness_bench.zig",
+      "zevm/build.zig",
+      "zevm/docs/shadow-witness-benchmark.md"
+    ],
+    "correctness": {
+      "debug": {
+        "modeComparisons": 56,
+        "referenceProofChecks": 4,
+        "digests": {
+          "absent_account": "b73e04fb5704b05b9d663ac1b6a7cbfffaa5306b87097dc506c420784f317d0a",
+          "account_only": "2a63aa1de1c15820de5bf7a7e16b1d7117473e05a7b37035866d0ab208282fe4",
+          "one_slot": "60f4a19f475853d172cb2842556f5593603b2d0fd2363c0fb1e80b3353506423",
+          "128_slots": "50782a8bc97542da5d140d8787d90dacac2cf79a5ef43921a90ec20c382af95d"
+        },
+        "sha256": "ad7bbf92f818a9ffafa3bcbcc4fd994601e758b4245681c4b8572f2636f7350b",
+        "log": "/home/nico/debug/zevm-geth-retirement-20261121/witness-bench-final-debug-check.jsonl"
+      },
+      "safe": {
+        "modeComparisons": 56,
+        "referenceProofChecks": 4,
+        "digests": {
+          "absent_account": "b73e04fb5704b05b9d663ac1b6a7cbfffaa5306b87097dc506c420784f317d0a",
+          "account_only": "2a63aa1de1c15820de5bf7a7e16b1d7117473e05a7b37035866d0ab208282fe4",
+          "one_slot": "60f4a19f475853d172cb2842556f5593603b2d0fd2363c0fb1e80b3353506423",
+          "128_slots": "50782a8bc97542da5d140d8787d90dacac2cf79a5ef43921a90ec20c382af95d"
+        },
+        "sha256": "de13589c81eebdf538b702fb015c820fc439fe4586824eb504c5b6b41396603f",
+        "log": "/home/nico/debug/zevm-geth-retirement-20261121/witness-bench-final-safe-check.jsonl"
+      }
+    },
+    "timingComparisons": 1204,
+    "timingMeasuredSamples": 1120,
+    "referenceProofChecks": 4,
+    "shapeModeTimings": {
+      "absent_account": {
+        "typed_fresh": {
+          "medianMs": 9.001756,
+          "p90Ms": 9.171068
+        },
+        "typed_reused": {
+          "medianMs": 0.017861,
+          "p90Ms": 0.020177
+        },
+        "witness_fresh": {
+          "medianMs": 8.88507,
+          "p90Ms": 9.247384
+        },
+        "witness_reused": {
+          "medianMs": 0.023108,
+          "p90Ms": 0.024708
+        },
+        "rpc_fresh": {
+          "medianMs": 8.921048,
+          "p90Ms": 9.282386
+        },
+        "rpc_reused": {
+          "medianMs": 0.030882,
+          "p90Ms": 0.033009
+        },
+        "rpc_runtime": {
+          "medianMs": 0.018819,
+          "p90Ms": 0.030098
+        }
+      },
+      "account_only": {
+        "typed_fresh": {
+          "medianMs": 9.119934,
+          "p90Ms": 9.632773
+        },
+        "typed_reused": {
+          "medianMs": 0.021626,
+          "p90Ms": 0.027632
+        },
+        "witness_fresh": {
+          "medianMs": 9.116564,
+          "p90Ms": 9.500813
+        },
+        "witness_reused": {
+          "medianMs": 0.027619,
+          "p90Ms": 0.035314
+        },
+        "rpc_fresh": {
+          "medianMs": 9.09837,
+          "p90Ms": 9.627346
+        },
+        "rpc_reused": {
+          "medianMs": 0.035869,
+          "p90Ms": 0.041771
+        },
+        "rpc_runtime": {
+          "medianMs": 0.021719,
+          "p90Ms": 0.037682
+        }
+      },
+      "one_slot": {
+        "typed_fresh": {
+          "medianMs": 9.117039,
+          "p90Ms": 9.376247
+        },
+        "typed_reused": {
+          "medianMs": 0.029006,
+          "p90Ms": 0.03132
+        },
+        "witness_fresh": {
+          "medianMs": 9.112112,
+          "p90Ms": 9.347541
+        },
+        "witness_reused": {
+          "medianMs": 0.037565,
+          "p90Ms": 0.044121
+        },
+        "rpc_fresh": {
+          "medianMs": 9.121857,
+          "p90Ms": 9.261078
+        },
+        "rpc_reused": {
+          "medianMs": 0.045947,
+          "p90Ms": 0.049266
+        },
+        "rpc_runtime": {
+          "medianMs": 0.031138,
+          "p90Ms": 0.045612
+        }
+      },
+      "128_slots": {
+        "typed_fresh": {
+          "medianMs": 10.174103,
+          "p90Ms": 10.331331
+        },
+        "typed_reused": {
+          "medianMs": 1.077476,
+          "p90Ms": 1.096662
+        },
+        "witness_fresh": {
+          "medianMs": 10.426194,
+          "p90Ms": 10.675103
+        },
+        "witness_reused": {
+          "medianMs": 1.40344,
+          "p90Ms": 1.439155
+        },
+        "rpc_fresh": {
+          "medianMs": 10.517642,
+          "p90Ms": 10.684666
+        },
+        "rpc_reused": {
+          "medianMs": 1.469698,
+          "p90Ms": 1.526402
+        },
+        "rpc_runtime": {
+          "medianMs": 1.458894,
+          "p90Ms": 1.507033
+        }
+      }
+    },
+    "metadata": {
+      "cpuAffinity": [
+        0
+      ],
+      "cpuModel": "13th Gen Intel(R) Core(TM) i7-1360P",
+      "platform": "Linux-7.2.15-76070215-generic-x86_64-with-glibc2.39",
+      "toolchain": "/home/nico/debug/zig-payload-plan-20261011/qualification/toolchain/zig-x86_64-linux-0.17.0/zig",
+      "toolchainVersion": "0.17.0",
+      "sourceCommit": "62ff6c994d7f59cc04fdbb879a9a9169b49becd7",
+      "sourceHashes": {
+        "src/rpc/shadow.zig": "7a7abae343bfe85db5eb35828d668379b381eda004c760d6095896bbefd5f275",
+        "src/rpc/jsonrpc.zig": "42b772c0fb1a9f3b08c7df1cddd17c7cb85a0faaa3305c8a0130e6cf5bfb51bc",
+        "src/rpc/http.zig": "fef57bf71130eaf63cd405c1115d30202d750cfd9dbbce48ef9d6e546f8673a2",
+        "src/shadow_witness_bench.zig": "13748e6c3a274dba8201c714c116fd99443ee12bc7314b46b394d4dbd33f808a",
+        "build.zig": "54b50e8aecfb7eca389b59550ab7c17a335ec0017f23973557c18cf94beaef32"
+      },
+      "binarySha256": "c2623f29a78a246b6e4d4bd2e4c152fc36826c9c212b9c745b1ea4f2fec43d26",
+      "iterations": 40,
+      "warmup": 3,
+      "startedAtUnixMs": 1795291523555,
+      "command": [
+        "taskset",
+        "--cpu-list",
+        "0",
+        "/home/nico/debug/zevm-geth-retirement-20261121/witness-bench-final-safe/bin/shadow-witness-bench",
+        "--iterations",
+        "40",
+        "--warmup",
+        "3"
+      ],
+      "endedAtUnixMs": 1795291528779,
+      "exitCode": 0,
+      "sourceUnchanged": true
+    },
+    "rawEvidence": "/home/nico/debug/zevm-geth-retirement-20261121/evidence/shadow-witness-bench-final-safe-40.jsonl",
+    "rawEvidenceSha256": "d66a24aecca6e8c444e759a6f13e457f954896dfba02b63ea167e5427c50b21d",
+    "limits": [
+      "Warm local synthetic state in real temporary MDBX,16accounts and128storage slots; fixed parent.",
+      "Native JSON-RPC handler only, no HTTP/network/scheduling latency; no production or live node measurement.",
+      "Old and reused controls alternate with identical data and authentication, but phase instrumentation adds overhead relative to uninstrumented runtime handler.",
+      "Typed timers exclude JSON/equality work and include fresh backing allocation/free.",
+      "No timing thresholds; all variants must equal proof-authenticated reference including code and storage values.",
+      "No concurrent workspace ownership coverage from this benchmark; root-owned runtime tests qualify that separately."
+    ]
+  },
+  "requestLimitsBytes": {
+    "witness": 16777216,
+    "nodes": 4194304,
+    "ancestors": 4194304,
+    "retainedWorkspacePerApi": 16777216
+  },
+  "runtimeReview": {
+    "completed": [
+      {
+        "name": "opus-workspace-review-v12",
+        "model": "Opus 5.5",
+        "effort": "xhigh",
+        "reviewComplete": true,
+        "resultSha256": "2d46104b564422fc780efad07073fd5c5eb579e87352aeec5643d66d4c3b48c1",
+        "result": "**No blockers found.** Nothing I can see in this diff is unsound. I reviewed the source you pasted and ran nothing. I couldn't see `rpc.Server` dispatch or the trie code, and one item below depends on each of them.\n\n## What I checked\n\n- **Bounds:** each request gets a fresh FBA over `backing[0..limit]` that starts at zero. A node or ancestor request can't reach past 4 MiB, and a witness can't pass 16 MiB. The FBA checks resize against `buffer.len`, which is the slice length, so growing an allocation in place stays inside the cap too.\n- **Lifetime:** Zig evaluates `return .{ .raw = try allocPrint(...) }` before the deferred `release` runs. So the JSON is serialized while the lease is still held. `raw` belongs to the caller's allocator. The `Lease`/FBA sits in the handler's stack frame and never escapes it.\n- **Cleanup on failure:**\n  - Cancelled while waiting: the `errdefer` isn't set up yet, so nothing gets unlocked. That's correct.\n  - Backing allocation fails: the lock is released, `backing` stays `null`, and a later call can retry (your test covers this).\n  - `read*` or response allocation fails: the deferred `release` runs.\n- **Deadlock:** the only nesting is the workspace lock, then `snapshots.mutex` inside `snapshots.acquire`. `publish` and `status` never take the workspace lock. `release` can't be cancelled. No shadow method can call another one while holding a lease.\n- **Exact-parent isolation:** a lease holds no view, transaction or header. Every request calls `snapshots.acquire(hash, root)` itself. Bytes from earlier requests stay in the buffer, but a request only reaches memory through its own fresh allocations, which it writes before serializing. ReleaseSafe also fills each new FBA allocation with 0xaa.\n- **Concurrency:** `backing` is only read or written while holding the mutex. `deinit` reads it without the lock, which is fine given that callers must be joined first.\n- **Shutdown:** defers run in reverse, so `rpc_thread` is cancelled and joined before `shadow_api.deinit`, and `snapshots.deinit` runs after that. `rpc_thread` is the only production caller, because authrpc doesn't register the shadow methods. If an earlier `try` fails before `rpc_thread` exists, `deinit` sees `backing == null` and does nothing.\n\n## Low or conditional issues (none block this change)\n\n1. **A new `error.Canceled` path (Low; depends on code I didn't see).** Before this diff, the three handlers had no point where they could be cancelled. Now `mutex.lock(io)` can return `Canceled` while a request waits.\n   - **Trigger:** `rpc.Server.handle` turns every handler error into a JSON-RPC error object.\n   - **Consequence:** that swallows the cancel request. The server task keeps running into its next blocking accept/read, and `rpc_thread.cancel` can hang at shutdown.\n   - **Reachability:** only when a request has to wait for the lock. The serial HTTP server never makes it wait, so this is unreachable in production today. A direct wrapper that catches errors could hit it.\n   - **Check:** make sure the dispatcher passes `Canceled` through, or calls `io.recancel()` if it handles it.\n2. **`Shadow` is no longer safe to copy (footgun, not a bug).** It used to be two pointers. Now it owns a buffer and a mutex. A by-value copy made after the first request would share `backing` under two separate mutexes. Leases could then overlap and corrupt each other's scratch, and the two `deinit` calls would free the buffer twice. Nothing you showed makes a copy: `register` takes `*Shadow` and the tests use `var api`.\n3. **Test nit:** `try io.concurrent(...)` fails the test with `ConcurrencyUnavailable` on a single-threaded build or Io instead of skipping it.\n\n## Existing issue, not from this diff (unverified)\n\n`read()`, `readNodes()` and `readAncestors()` call `view.deinit()`, which aborts the read transaction, before they return. Serialization has always run after the MDBX transaction is gone, both before and after this diff.\n- Code bytes are copied with `dupe`, and ancestor headers are serialized into scratch, so both are owned.\n- Proof nodes (`prove().nodes`, `nodeAtPath`) are only safe if the trie copies node bytes into `allocator` instead of pointing into MDBX's memory-mapped pages. I couldn't see that code.\n- If they do point into those pages, a concurrent writer reusing freed pages could corrupt the bytes in a response. The current tests have no concurrent writer, so they wouldn't catch it.\n- The old doc comment said the response was copied out before the DB lease was released, which the code never did. The new comment rightly drops that claim.\n\nOne quick look at the trie's `prove` and `nodeAtPath` would settle it.\n\nSerializing concurrent direct callers is a throughput change you intended. It isn't a correctness problem."
+      },
+      {
+        "name": "opus-workspace-cancel-v12",
+        "model": "Opus 5.5",
+        "effort": "xhigh",
+        "reviewComplete": true,
+        "resultSha256": "951ed611e06e45814db13566e7d7f108329844f4eac4365efd3dfaa39ad66890",
+        "result": "**Verdict: the delta itself has no bugs.** Both new `Canceled` checks are in the right place and run before any response is built. The two regression tests do what they claim. The cancellation path still has one gap, though. This delta didn't introduce it, but it means shutdown can still fail to join, and I didn't flag it in my earlier review.\n\n**What I checked in the delta**\n- **`jsonrpc.handle`:** the check comes before `resp.err` is filled in. `resp.result` is still null at that point, so `defer resp.deinit` frees nothing. `parsed.deinit` still runs. The handler's `try` passes `Canceled` up through `Handler.call`. The test has no leak.\n- **`http.serve`:** `Canceled` now goes up instead of turning into a 500. Out-of-memory and other errors still return 500.\n- **HTTP test:** the defers run in the right order: close the client, join `serving`, then `server.deinit`. Calling `cancel` after `await` just returns the stored result, so the extra call is safe. If the regression comes back, `await` returns `{}` and the test fails. So it would catch a return of the 500 swallow.\n\n**Remaining bug: socket cancellation shows up as `ReadFailed`/`WriteFailed`, and `serveOne` swallows it**\n- **Mechanism:** `std.http.Server` reads and writes through the generic `std.Io.Reader`/`Writer` interfaces. Those only return `error.ReadFailed` or `error.WriteFailed`. The real cause, here `Canceled`, is stored in the stream reader's or writer's `.err` field. `serveOne` only passes on errors that are literally `Canceled`, so these get swallowed. Then `run` loops back into `accept`.\n- **Why it hangs:** Zig's `Io` returns a cancel request only once (that's why `Io.recancel` exists). After the swallow, `accept` has no pending cancel and blocks forever, so the join never returns.\n- **Trigger:** a shutdown cancel that arrives while a request is in progress. Two cases:\n  1. A client has connected but hasn't finished sending. There is no read timeout, so the server sits in `receiveHead` or the body read.\n  2. A witness or ancestors handler is still running. Its only cancellation point was the mutex lock at the start, and the DB reads don't go through `Io`. So the next cancellation point is the write in `request.respond`, and that write takes the cancel.\n\n  Case 2 is more likely than the mutex-wait case your regression covers, because the HTTP server handles one request at a time and only direct callers ever compete for the mutex.\n- **Severity:** medium. Shutdown hangs until the process manager kills the process. Nothing is corrupted.\n- **Assumption:** this rests on the stream reader and writer keeping the cause in `.err`, and on cancel being returned only once. Check both on your pinned Zig. If cancellation keeps firing instead, the cost drops to one wasted loop and it isn't a bug.\n- **Fix:** convert the error back to its cause inside `serve`, where `reader` and `writer` are in scope:\n  ```zig\n  self.exchange(&reader, &writer) catch |e| switch (e) {\n      error.ReadFailed => return if (reader.err) |cause| cause else e,\n      error.WriteFailed => return if (writer.err) |cause| cause else e,\n      else => return e,\n  };\n  ```\n- **Test:** this one doesn't depend on timing.\n  1. Connect a client and call `listener.accept` on the test thread.\n  2. Run `io.concurrent(HttpServer.serve, .{ &server, stream })`.\n  3. `expectError(error.Canceled, task.cancel(io))`.\n\n  The first cancellation point in `serve` is the read of the request head, so the cancel lands there wherever it arrives. With the current code, `serve` returns `ReadFailed` and the test fails.\n\n**Nit:** in `handle`, `return e` widens the inferred error set to `anyerror`, because `e` comes from the `anyerror` handler result. `return error.Canceled` keeps it at `error{OutOfMemory, Canceled}`.\n\nSince full tests are pending, I'd make the `serve` fix part of this change. The invariant you added, that cancellation reaches whoever joins the server, only fully holds once it's in."
+      },
+      {
+        "name": "opus-workspace-socket-v12",
+        "model": "Opus 5.5",
+        "effort": "xhigh",
+        "reviewComplete": true,
+        "resultSha256": "71b75f811480126472d30a4ef4b6f8048489fc863c71feb79f43ce1900a78068",
+        "result": "**No blockers. The correction is complete for the cancellation-erasure bug.** I reviewed it by reading only, without building or running anything. I relied on what you confirmed about pinned Zig 0.17: `Reader/Writer.err: ?Error`, and cancel is delivered once.\n\n**Why it's complete:** every place inside `exchange` that can be cancelled is covered.\n- **Socket reads** (`receiveHead`, `allocRemaining`) fail as `ReadFailed` with `reader.err` set.\n- **Socket writes** (every `respond`, plus the `100 Continue` write inside `readerExpectContinue`) fail as `WriteFailed` with `writer.err` set.\n- **`rpc.handle`** has its own explicit `Canceled` branch.\n- **The rest** (`Clock.now`, `jwt.verify`, JSON parsing and the deferred `close`) can't be cancelled.\n- **Not depending on `std.http.Server`'s error mapping:** you check the `err` fields whatever error `exchange` returns.\n- **No failure gets swallowed on the way out:**\n  - Every `respond` uses `keep_alive = false`, so `discardBody` never reads.\n  - The `StreamTooLong` \u2192 413 branch can't follow a failed read.\n- **A cancel after the final flush** isn't used up, so the next `accept` gets it.\n\n**Not blocking:**\n1. **Handler contract (same bug one layer down, only if such handlers exist).** This triggers when a handler's cancellable call sits behind a generic Reader/Writer (`std.http.Client`, `File.Reader`, etc.), or when a handler catches `Canceled`:\n   - The handler returns `ReadFailed` (or similar), which `jsonrpc` maps to `-32603`.\n   - The HTTP layer then answers 200, and the cancel is used up.\n   - `run()` goes back into `accept`, and shutdown hangs.\n\n   That's the original severity. `jsonrpc` can't fix this for everyone because those `err` fields belong to the handler's own reader. Such handlers need the same unwrap, or `io.recancel()` if they mean to swallow the cancel.\n2. **Coverage gap.** No test covers the writer-side unwrap. Test 1 uses a `Canceled` the handler returns itself, not a real cancel request, and test 2 only covers the reader. The code is symmetric, so the risk is low. A test that blocks the writer needs a full send buffer, so it's optional.\n3. **Existing issue, outside this correction.** `accept`'s `else => return` spins hot when the process or system runs out of file descriptors (EMFILE/ENFILE). It doesn't block shutdown because `accept` can still be cancelled."
+      }
+    ],
+    "disposition": "No workspace blocker. Conditional RPC and socket cancellation issues were fixed and covered by dispatch, HTTP and blocked-read regressions. Final correction review reports no blockers. Optional writer-backpressure test not added; symmetry/source inspected. Independent agent and root audited lifetimes and lock order. No blanket upstream/Engine approval claimed."
+  },
+  "preliminaryFailures": [
+    "Initial default local Zig cache attempted read-only configuration; explicit writable --cache-dir used.",
+    "HTTP test had an unreachable error-set else prong, corrected.",
+    "HTTP test used an unimplemented pinned-toolchain connect timeout, removed for local connected-listener test.",
+    "Optional error values required payload unwrapping in socket-cause checks, corrected."
+  ],
+  "limits": [
+    "Matched timing fixture uses warm small MDBX state and JSON dispatch, not HTTP or full construction.",
+    "Measured workspace/typed read source unchanged by subsequent socket shutdown changes; final node tests include those changes.",
+    "No live speedup, production bid improvement or full Geth retirement established by this record."
+  ]
+}

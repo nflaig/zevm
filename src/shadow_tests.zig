@@ -189,6 +189,7 @@ test "shadow exact trie nodes authenticate path hash owner and retained version"
     var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
     defer views.deinit();
     var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    defer api.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -230,6 +231,7 @@ test "shadow ancestor backfill is hash-bound and never substitutes a selected he
     var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
     defer views.deinit();
     var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    defer api.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -337,6 +339,7 @@ test "shadow RPC witnesses work after ancestor responses in a retained slab aren
     defer views.deinit();
     try views.publish(a);
     var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    defer api.deinit();
     var server: @import("rpc/jsonrpc.zig").Server = .{};
     defer server.deinit(a);
     try api.register(a, &server);
@@ -356,6 +359,122 @@ test "shadow RPC witnesses work after ancestor responses in a retained slab aren
         try std.testing.expect(parsed.value.object.get("error") == null);
         try std.testing.expect(parsed.value.object.contains("result"));
     }
+}
+
+test "shadow RPC workspace reuse preserves copied responses across failures and different parents" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var eth = Eth.init(&f.store);
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
+    defer views.deinit();
+    var api: Shadow = .{ .snapshots = &views, .eth = &eth, .workspace = .{ .backing_allocator = a } };
+    defer api.deinit();
+    const first = try f.write(1, 42, true);
+    try views.publish(a);
+    const original = try api.witness(std.testing.io, a, parent(first), &queries);
+    defer a.free(original.raw);
+    const expected = try a.dupe(u8, original.raw);
+    defer a.free(expected);
+
+    const second = try f.write(2, 84, true);
+    try views.publish(a);
+    const newer = try api.witness(std.testing.io, a, parent(second), &queries);
+    defer a.free(newer.raw);
+    try std.testing.expect(!std.mem.eql(u8, original.raw, newer.raw));
+    const parsed = try std.json.parseFromSlice(Shadow.Witness, a, newer.raw, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(84, parsed.value.accounts[0].balance.number);
+    try std.testing.expectEqual(84, parsed.value.accounts[0].storageProof[0].value.number);
+
+    // Exercise both smaller workspace users between witness reads.
+    const ancestry = try api.ancestors(std.testing.io, a, parent(second), 1);
+    defer a.free(ancestry.raw);
+    const nodes = try api.trieNodes(std.testing.io, a, parent(second), &.{.{
+        .path = .{ .bytes = &.{} },
+        .expectedHash = .{ .bytes = second.state_root },
+    }});
+    defer a.free(nodes.raw);
+    try std.testing.expectError(error.StateRootMismatch, api.witness(std.testing.io, a, .{
+        .blockHash = parent(first).blockHash,
+        .stateRoot = parent(second).stateRoot,
+    }, &queries));
+    // A response allocation failure must release the workspace too.
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, api.witness(std.testing.io, failing.allocator(), parent(second), &queries));
+    const repeated = try api.witness(std.testing.io, a, parent(first), &queries);
+    defer a.free(repeated.raw);
+    try std.testing.expectEqualSlices(u8, expected, repeated.raw);
+
+    // Returned JSON has no workspace or DB borrow after retention evicts first.
+    for (3..12) |i| {
+        _ = try f.write(i, i, true);
+        try views.publish(a);
+    }
+    try std.testing.expectError(error.StateViewUnavailable, api.witness(std.testing.io, a, parent(first), &queries));
+    try std.testing.expectEqualSlices(u8, expected, original.raw);
+}
+
+test "shadow RPC scratch allocation failure releases admission and can recover" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var eth = Eth.init(&f.store);
+    const header = try f.write(1, 42, true);
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var api: Shadow = .{ .snapshots = &views, .eth = &eth, .workspace = .{ .backing_allocator = failing.allocator() } };
+    defer api.deinit();
+    try std.testing.expectError(error.OutOfMemory, api.witness(std.testing.io, a, parent(header), &queries));
+    try std.testing.expectEqual(null, api.workspace.backing);
+    api.workspace.backing_allocator = a;
+    const response = try api.witness(std.testing.io, a, parent(header), &queries);
+    defer a.free(response.raw);
+    const parsed = try std.json.parseFromSlice(Shadow.Witness, a, response.raw, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(42, parsed.value.accounts[0].balance.number);
+}
+
+test "shadow concurrent RPC witnesses keep exact parents and response ownership separate" {
+    const io = std.testing.io;
+    var f = try Fixture.init();
+    defer f.deinit();
+    var eth = Eth.init(&f.store);
+    var views: snapshots.Snapshots = .{ .io = io, .store = &f.store };
+    defer views.deinit();
+    const first = try f.write(1, 42, true);
+    try views.publish(a);
+    const second = try f.write(2, 84, true);
+    try views.publish(a);
+    var api: Shadow = .{ .snapshots = &views, .eth = &eth, .workspace = .{ .backing_allocator = a } };
+    defer api.deinit();
+    var start: std.Io.Event = .unset;
+    const Reader = struct {
+        fn run(task_io: std.Io, gate: *std.Io.Event, shared: *Shadow, header: types.BlockHeader, balance: u256) !void {
+            try gate.wait(task_io);
+            var owned = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer owned.deinit();
+            const allocator = owned.allocator();
+            var responses: [16][]const u8 = undefined;
+            for (&responses) |*response| {
+                response.* = (try shared.witness(task_io, allocator, parent(header), &queries)).raw;
+            }
+            for (responses) |response| {
+                const parsed = try std.json.parseFromSlice(Shadow.Witness, allocator, response, .{});
+                try std.testing.expectEqual(header.hash(), parsed.value.parent.blockHash.bytes);
+                try std.testing.expectEqual(header.state_root, parsed.value.parent.stateRoot.bytes);
+                try std.testing.expectEqual(balance, parsed.value.accounts[0].balance.number);
+                try std.testing.expectEqual(balance, parsed.value.accounts[0].storageProof[0].value.number);
+            }
+        }
+    };
+    var left = try io.concurrent(Reader.run, .{ io, &start, &api, first, 42 });
+    defer left.cancel(io) catch {};
+    var right = try io.concurrent(Reader.run, .{ io, &start, &api, second, 84 });
+    defer right.cancel(io) catch {};
+    start.set(io);
+    try left.await(io);
+    try right.await(io);
 }
 
 test "shadow rejects partial state, unknown parent and incorrect root" {
@@ -379,6 +498,7 @@ test "shadow authenticated reads survive advancement, eviction and caller-owned 
     var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
     defer views.deinit();
     var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    defer api.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const first = try f.write(1, 42, true);
@@ -426,6 +546,7 @@ test "shadow authenticates flat leaves and code instead of trusting checkpoint l
     defer views.deinit();
     try views.publish(a);
     var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    defer api.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     try std.testing.expectError(error.StateRootMismatch, api.read(arena.allocator(), parent(header), &queries));
@@ -454,6 +575,7 @@ test "shadow retains distinct branches at the same height and rejects oversized 
     var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
     defer views.deinit();
     var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    defer api.deinit();
     const left = try f.write(7, 111, true);
     try views.publish(a);
     const right = try f.write(7, 222, true);
@@ -486,6 +608,7 @@ test "shadow missing and corrupted code never become empty code" {
         defer views.deinit();
         try views.publish(a);
         var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+        defer api.deinit();
         const expected = if (i == 0) error.CodeUnavailable else error.CodeHashMismatch;
         try std.testing.expectError(expected, api.read(arena.allocator(), parent(header), &queries));
     }
@@ -506,6 +629,7 @@ test "shadow allocation failures release DB cursors and read leases" {
     defer views.deinit();
     try views.publish(a);
     var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    defer api.deinit();
     try std.testing.checkAllAllocationFailures(a, readAllocationCase, .{ &api, header });
     try readAllocationCase(a, &api, header);
     try std.testing.expectEqual(header.hash(), views.status().headers[0].hash());
@@ -539,6 +663,7 @@ test "shadow reorg rewinds storage and accounts, preserves old leases and select
     try std.testing.expectEqual(base.hash(), views.status().headers[0].hash());
     try std.testing.expectEqual(2, views.status().count);
     var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    defer api.deinit();
     try std.testing.expectEqual(42, (try api.read(alloc, parent(base), &queries)).accounts[0].storageProof[0].value.number);
     const right_record = try f.capture(alloc, base, 99);
     const right = try f.transition(2, 99, true, base, right_record);
@@ -582,6 +707,7 @@ test "shadow four-block reorg restores the common ancestor and preserves a losin
     }
     try views.publish(a);
     var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    defer api.deinit();
     const restored = (try api.read(alloc, parent(base), &queries)).accounts[0];
     try std.testing.expectEqual(42, restored.balance.number);
     try std.testing.expectEqual(1, restored.nonce.number);
@@ -720,6 +846,7 @@ test "shadow persistent undo survives database reopen and restores the parent" {
     defer views.deinit();
     try views.publish(a);
     var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    defer api.deinit();
     try std.testing.expectEqual(42, (try api.read(alloc, parent(base), &queries)).accounts[0].balance.number);
 }
 

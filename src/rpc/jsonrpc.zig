@@ -58,6 +58,9 @@ pub const Server = struct {
         if (result) |result_json| {
             resp.result = result_json;
         } else |e| {
+            // Cancellation belongs to the server task, not to the JSON-RPC
+            // caller. Preserve it so shutdown can join a waiting handler.
+            if (e == error.Canceled) return error.Canceled;
             resp.err = .{
                 .code = @backingInt(switch (e) {
                     Errors.InvalidJSON => ErrorCodes.InvalidJSON,
@@ -204,6 +207,21 @@ pub const RawJson = struct {
 
 fn ExtractSubTuple(comptime FullTuple: type, comptime start_idx: usize) type {
     return @Tuple(@typeInfo(FullTuple).@"struct".field_types[start_idx..]);
+}
+
+test "RPC handler cancellation propagates without producing an error response" {
+    const API = struct {
+        fn cancelled(_: *@This(), _: std.Io, _: std.mem.Allocator) error{Canceled}!void {
+            return error.Canceled;
+        }
+    };
+    var api: API = .{};
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
+    try server.register(std.testing.allocator, "cancelled", &api, API.cancelled);
+    try std.testing.expectError(error.Canceled, server.handle(std.testing.io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","method":"cancelled","params":[],"id":1}
+    ));
 }
 
 test "allocated RPC arguments survive handler allocations and response serialization" {

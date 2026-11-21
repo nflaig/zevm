@@ -268,6 +268,22 @@ pub fn build(b: *std.Build) void {
     b.step("shadow-crash-probe", "Build the isolated state-commit SIGKILL qualification target")
         .dependOn(&b.addInstallArtifact(crash_probe, .{}).step);
 
+    const witness_bench = b.addExecutable(.{
+        .name = "shadow-witness-bench",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/shadow_witness_bench.zig"), .target = target, .optimize = optimize }),
+        .use_llvm = true,
+    });
+    witness_bench.root_module.link_libcpp = true;
+    witness_bench.root_module.addOptions("build_options", native_opts);
+    linkDeps(witness_bench.root_module, deps, .native);
+    witness_bench.root_module.addImport("lmdbx", mdbx_dep.module("lmdbx"));
+    b.step("shadow-witness-bench", "Build the local authenticated shadow witness benchmark")
+        .dependOn(&b.addInstallArtifact(witness_bench, .{}).step);
+    const check_witness_bench = b.addRunArtifact(witness_bench);
+    check_witness_bench.addArgs(&.{ "--iterations", "2", "--warmup", "0" });
+    b.step("test-shadow-witness-bench", "Check witness benchmark proof authentication and exact mode equality")
+        .dependOn(&check_witness_bench.step);
+
     const consensus_probe = b.addExecutable(.{
         .name = "consensus-probe",
         .root_module = b.createModule(.{

@@ -55,6 +55,26 @@ parent trie before importing it. Both the root binding and node hash matter.
 Scratch is limited to 4 MiB; unknown owners, corrupt preimages, wrong paths and
 wrong expected hashes fail without a latest-state fallback.
 
+The JSON wrappers retain one lazily allocated 16 MiB scratch buffer per API.
+Each request acquires a cancellable exclusive lease and starts a fresh fixed
+allocator with its existing limit: 16 MiB for witnesses, 4 MiB for nodes or
+ancestors. This reuses allocation capacity, never DB views, state values or
+authentication results. Response JSON is copied into caller-owned memory before
+the lease is released, including on alternate-parent requests. Direct typed
+reads continue to use the caller's allocator. The API must not be copied after
+use and must be destroyed only after its RPC callers have joined.
+
+The [matched local benchmark](shadow-witness-benchmark.md) found that allocating
+and freeing the whole workspace dominated small reads. Retaining its backing
+removed that repeated cost while preserving proof authentication and response
+bytes. Allocation-failure, cancelled-waiter, concurrent-parent, response-retention
+and actual HTTP cancellation tests cover the new lifetime. Socket cancellation
+causes are preserved through generic I/O and RPC error handling so shutdown can
+join the server. Debug and ReleaseSafe each pass 192 general/shadow tests;
+[qualification](shadow-workspace-qualification-20261121.json) records exact source
+and binary hashes. Local witness timings do not establish full construction or
+live bidding performance.
+
 `zevm_getStateAncestorsV1` takes `[parent, count]`, where `count` is 1–256 and
 includes the exact parent itself. It returns `parent` and RLP `headers`, newest
 first, following parent hashes only. The immutable header cache may be backfilled

@@ -10,9 +10,17 @@ const rpc = @import("jsonrpc.zig");
 const hex = @import("hex.zig");
 const branches = @import("../db/branches.zig");
 
+/// Once used, this API owns a mutex and workspace and must not be copied.
 pub const Shadow = struct {
     snapshots: *Snapshots,
     eth: *EthDb,
+    workspace: Workspace = .{},
+
+    /// Stop and join every RPC caller before releasing the retained workspace.
+    /// Direct typed reads use caller-owned memory and never borrow this buffer.
+    pub fn deinit(self: *Shadow) void {
+        self.workspace.deinit();
+    }
 
     pub fn register(self: *Shadow, allocator: std.mem.Allocator, server: *rpc.Server) !void {
         try server.register(allocator, "zevm_getStateStatusV1", self, status);
@@ -68,12 +76,11 @@ pub const Shadow = struct {
     pub const Nodes = struct { parent: Stamp, nodes: []const hex.Bytes };
     pub const Ancestors = struct { parent: Stamp, headers: []const hex.Bytes };
 
-    pub fn trieNodes(self: *Shadow, _: std.Io, allocator: std.mem.Allocator, parent: Parent, queries: []const NodeQuery) !rpc.RawJson {
+    pub fn trieNodes(self: *Shadow, io: std.Io, allocator: std.mem.Allocator, parent: Parent, queries: []const NodeQuery) !rpc.RawJson {
         try checkNodeQueries(queries);
-        const backing = try std.heap.page_allocator.alloc(u8, 4 << 20);
-        defer std.heap.page_allocator.free(backing);
-        var scratch = std.heap.FixedBufferAllocator.init(backing);
-        const result = try self.readNodes(scratch.allocator(), parent, queries);
+        var scratch = try self.workspace.acquire(io, 4 << 20);
+        defer scratch.release();
+        const result = try self.readNodes(scratch.buffer.allocator(), parent, queries);
         return .{ .raw = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(result, .{})}) };
     }
 
@@ -107,12 +114,11 @@ pub const Shadow = struct {
         return .{ .parent = stamp(view.header, view.txn.id()), .nodes = out };
     }
 
-    pub fn ancestors(self: *Shadow, _: std.Io, allocator: std.mem.Allocator, parent: Parent, count: u16) !rpc.RawJson {
+    pub fn ancestors(self: *Shadow, io: std.Io, allocator: std.mem.Allocator, parent: Parent, count: u16) !rpc.RawJson {
         if (count == 0 or count > 256) return error.AncestorQueryLimit;
-        const backing = try std.heap.page_allocator.alloc(u8, 4 << 20);
-        defer std.heap.page_allocator.free(backing);
-        var scratch = std.heap.FixedBufferAllocator.init(backing);
-        const result = try self.readAncestors(scratch.allocator(), parent, count);
+        var scratch = try self.workspace.acquire(io, 4 << 20);
+        defer scratch.release();
+        const result = try self.readAncestors(scratch.buffer.allocator(), parent, count);
         return .{ .raw = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(result, .{})}) };
     }
 
@@ -143,17 +149,18 @@ pub const Shadow = struct {
     }
 
     /// Hard bounds apply even to trusted local callers. The response is copied
-    /// out before the DB lease and bounded scratch allocation are released.
-    pub fn witness(self: *Shadow, _: std.Io, allocator: std.mem.Allocator, parent: Parent, queries: []const Query) !rpc.RawJson {
+    /// out before another request can reuse scratch. The DB view is never cached.
+    pub fn witness(self: *Shadow, io: std.Io, allocator: std.mem.Allocator, parent: Parent, queries: []const Query) !rpc.RawJson {
         try checkQueries(queries);
         // The HTTP arena retains capacity and grows geometrically. Combining
         // this fixed workspace with an earlier ancestor response can request
         // a slab larger than its 32 MiB maximum despite a 16 MiB workspace.
-        // Keep bounded scratch separate; only copied JSON uses the RPC arena.
-        const backing = try std.heap.page_allocator.alloc(u8, 16 << 20);
-        defer std.heap.page_allocator.free(backing);
-        var scratch = std.heap.FixedBufferAllocator.init(backing);
-        const result = try self.read(scratch.allocator(), parent, queries);
+        // Keep bounded scratch separate and reuse its backing. Allocating and
+        // freeing 16 MiB for each tiny read touches the entire buffer in safe
+        // mode. Fresh FBA state preserves the per-request cap without that cost.
+        var scratch = try self.workspace.acquire(io, 16 << 20);
+        defer scratch.release();
+        const result = try self.read(scratch.buffer.allocator(), parent, queries);
         return .{ .raw = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(result, .{})}) };
     }
 
@@ -221,3 +228,66 @@ pub const Shadow = struct {
         return out;
     }
 };
+
+/// One bounded buffer belongs to this API, never to a snapshot or candidate.
+/// JSON results must be copied to the caller's allocator while holding the
+/// lease. A failed request releases the lock and the next lease starts at zero.
+/// The current HTTP server is serial; the lock also protects direct RPC callers
+/// and permits cancellation while waiting without resetting another request.
+const Workspace = struct {
+    const capacity = 16 << 20;
+    backing_allocator: std.mem.Allocator = std.heap.page_allocator,
+    backing: ?[]u8 = null,
+    mutex: std.Io.Mutex = .init,
+
+    fn deinit(self: *Workspace) void {
+        if (self.backing) |bytes| self.backing_allocator.free(bytes);
+        self.backing = null;
+    }
+
+    fn acquire(self: *Workspace, io: std.Io, limit: usize) !Lease {
+        std.debug.assert(limit > 0 and limit <= capacity);
+        try self.mutex.lock(io);
+        errdefer self.mutex.unlock(io);
+        if (self.backing == null) self.backing = try self.backing_allocator.alloc(u8, capacity);
+        return .{ .owner = self, .io = io, .buffer = .init(self.backing.?[0..limit]) };
+    }
+
+    const Lease = struct {
+        owner: *Workspace,
+        io: std.Io,
+        buffer: std.heap.FixedBufferAllocator,
+
+        fn release(self: *Lease) void {
+            self.owner.mutex.unlock(self.io);
+            self.* = undefined;
+        }
+    };
+};
+
+test "shadow workspace preserves request limits and releases a cancelled waiter" {
+    const io = std.testing.io;
+    var workspace: Workspace = .{ .backing_allocator = std.testing.allocator };
+    defer workspace.deinit();
+    var first = try workspace.acquire(io, 4 << 20);
+    const bytes = try first.buffer.allocator().alloc(u8, 4 << 20);
+    @memset(bytes, 0x53);
+    try std.testing.expectError(error.OutOfMemory, first.buffer.allocator().alloc(u8, 1));
+    const Waiting = struct {
+        fn run(ws: *Workspace, task_io: std.Io) !void {
+            var lease = try ws.acquire(task_io, 16 << 20);
+            defer lease.release();
+            const scratch = try lease.buffer.allocator().alloc(u8, 1);
+            scratch[0] = 0x99;
+        }
+    };
+    var waiter = try io.concurrent(Waiting.run, .{ &workspace, io });
+    try std.testing.expectError(error.Canceled, waiter.cancel(io));
+    try std.testing.expectEqual(@as(u8, 0x53), bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0x53), bytes[bytes.len - 1]);
+    first.release();
+    var next = try workspace.acquire(io, 16 << 20);
+    defer next.release();
+    _ = try next.buffer.allocator().alloc(u8, 16 << 20);
+    try std.testing.expectError(error.OutOfMemory, next.buffer.allocator().alloc(u8, 1));
+}

@@ -256,6 +256,7 @@ fn runNode(init: std.process.Init, opts: Options) !void {
     defer snapshots.deinit();
     if (opts.shadow_state) try downloader.enableShadow(&snapshots, opts.shadow_beacon_url != null);
     var shadow_api: ShadowApi = .{ .snapshots = &snapshots, .eth = &eth_db };
+    defer shadow_api.deinit(); // RPC futures below are cancelled and joined first.
 
     var consensus_buffer: [4]consensus.Update = undefined;
     var consensus_updates: std.Io.Queue(consensus.Update) = .init(&consensus_buffer);
