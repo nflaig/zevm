@@ -170,3 +170,11 @@ the surviving account against the checkpoint root and checks that selected heade
 account nonce and balance agree. Both cases pass in Debug and safe mode and run
 in CI. This qualifies process-crash boundaries, not host power-loss durability or
 all live downloader failure timing.
+
+Full native construction also exercises ancestor and witness requests on the
+same retained HTTP arena. A regression reproduced `OutOfMemory` when the 4 MiB
+ancestor scratch was followed by the 16 MiB witness scratch: arena growth could
+exceed the slab allocator's 32 MiB single-allocation limit. These bounded scratch
+buffers now use independent page allocations and are released after copying the
+JSON response. The alternating-request regression passes with the real slab
+allocator in both Debug and safe mode; the global slab limit is unchanged.

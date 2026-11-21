@@ -70,8 +70,8 @@ pub const Shadow = struct {
 
     pub fn trieNodes(self: *Shadow, _: std.Io, allocator: std.mem.Allocator, parent: Parent, queries: []const NodeQuery) !rpc.RawJson {
         try checkNodeQueries(queries);
-        const backing = try allocator.alloc(u8, 4 << 20);
-        defer allocator.free(backing);
+        const backing = try std.heap.page_allocator.alloc(u8, 4 << 20);
+        defer std.heap.page_allocator.free(backing);
         var scratch = std.heap.FixedBufferAllocator.init(backing);
         const result = try self.readNodes(scratch.allocator(), parent, queries);
         return .{ .raw = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(result, .{})}) };
@@ -109,8 +109,8 @@ pub const Shadow = struct {
 
     pub fn ancestors(self: *Shadow, _: std.Io, allocator: std.mem.Allocator, parent: Parent, count: u16) !rpc.RawJson {
         if (count == 0 or count > 256) return error.AncestorQueryLimit;
-        const backing = try allocator.alloc(u8, 4 << 20);
-        defer allocator.free(backing);
+        const backing = try std.heap.page_allocator.alloc(u8, 4 << 20);
+        defer std.heap.page_allocator.free(backing);
         var scratch = std.heap.FixedBufferAllocator.init(backing);
         const result = try self.readAncestors(scratch.allocator(), parent, count);
         return .{ .raw = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(result, .{})}) };
@@ -146,8 +146,12 @@ pub const Shadow = struct {
     /// out before the DB lease and bounded scratch allocation are released.
     pub fn witness(self: *Shadow, _: std.Io, allocator: std.mem.Allocator, parent: Parent, queries: []const Query) !rpc.RawJson {
         try checkQueries(queries);
-        const backing = try allocator.alloc(u8, 16 << 20);
-        defer allocator.free(backing);
+        // The HTTP arena retains capacity and grows geometrically. Combining
+        // this fixed workspace with an earlier ancestor response can request
+        // a slab larger than its 32 MiB maximum despite a 16 MiB workspace.
+        // Keep bounded scratch separate; only copied JSON uses the RPC arena.
+        const backing = try std.heap.page_allocator.alloc(u8, 16 << 20);
+        defer std.heap.page_allocator.free(backing);
         var scratch = std.heap.FixedBufferAllocator.init(backing);
         const result = try self.read(scratch.allocator(), parent, queries);
         return .{ .raw = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(result, .{})}) };

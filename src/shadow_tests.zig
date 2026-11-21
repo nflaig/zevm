@@ -257,6 +257,36 @@ test "shadow full ancestor cache remains bounded with the downloader slab alloca
     try txn.commit();
 }
 
+test "shadow RPC witnesses work after ancestor responses in a retained slab arena" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const header = try f.write(1, 42, true);
+    var eth = Eth.init(&f.store);
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    var server: @import("rpc/jsonrpc.zig").Server = .{};
+    defer server.deinit(a);
+    try api.register(a, &server);
+    var backing = std.heap.ArenaAllocator.init(a);
+    defer backing.deinit();
+    var slabs = @import("devp2p/allocator.zig").SlabAllocator.init(backing.allocator());
+    var request_arena = std.heap.ArenaAllocator.init(slabs.allocator());
+    defer request_arena.deinit();
+    const ancestry = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(.{ .jsonrpc = "2.0", .id = 1, .method = "zevm_getStateAncestorsV1", .params = .{ parent(header), 1 } }, .{})});
+    defer a.free(ancestry);
+    const witness = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(.{ .jsonrpc = "2.0", .id = 1, .method = "zevm_getStateWitnessV1", .params = .{ parent(header), queries } }, .{})});
+    defer a.free(witness);
+    for ([_][]const u8{ ancestry, witness, ancestry, witness }) |body| {
+        _ = request_arena.reset(.retain_capacity);
+        const response = try server.handle(std.testing.io, request_arena.allocator(), body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, request_arena.allocator(), response.raw, .{});
+        try std.testing.expect(parsed.value.object.get("error") == null);
+        try std.testing.expect(parsed.value.object.contains("result"));
+    }
+}
+
 test "shadow rejects partial state, unknown parent and incorrect root" {
     var f = try Fixture.init();
     defer f.deinit();
