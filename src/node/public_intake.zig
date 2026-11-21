@@ -98,7 +98,10 @@ pub const Stats = struct {
     sink_full: u64 = 0,
     expired_requests: u64 = 0,
     frame_rate_drops: u64 = 0,
+    frame_refused_requests: u64 = 0,
     signature_rate_drops: u64 = 0,
+    signature_discarded_decoded: u64 = 0,
+    signature_unprocessed_items: u64 = 0,
     peer_pending_drops: u64 = 0,
     backoff_skips: u64 = 0,
 };
@@ -241,7 +244,22 @@ pub const Intake = struct {
     /// remain eligible after this request releases its reservation.
     pub fn response(self: *Intake, a: std.mem.Allocator, peer: Peer, raw: []const u8, receipt: ReceiptTime) !void {
         const now = receipt.mono_ms;
-        try self.reserveFrame(peer, raw.len, now);
+        self.reserveFrame(peer, raw.len, now) catch |err| {
+            if (err == error.FrameRateLimit) {
+                // We deliberately shed this reply. Do not later charge its
+                // responder a timeout/backoff for our local admission refusal.
+                // At most 16 slots and 64 hashes are touched, without parsing
+                // the frame or scanning the unrelated pending inventory.
+                for (self.requests, 0..) |request, i| if (request) |req| {
+                    if (samePeer(peer, req.peer)) {
+                        self.release(i);
+                        self.stats.frame_refused_requests += 1;
+                        break;
+                    }
+                };
+            }
+            return err;
+        };
         if (raw.len > max_message_bytes + 1024) return error.ResponseByteLimit;
         const Response = struct { id: u64, transactions: BoundedList(rlp.RawValue, max_request_hashes) };
         var msg: Response = undefined;
@@ -254,7 +272,7 @@ pub const Intake = struct {
         var records: [max_request_hashes]Record = undefined;
         var record_count: usize = 0;
         var cursor: usize = 0;
-        for (msg.transactions.slice()) |raw_tx| {
+        for (msg.transactions.slice(), 0..) |raw_tx, item_index| {
             const bytes = try canonicalBytes(a, raw_tx.value);
             const tx_hash = hash(bytes);
             while (cursor < request.count and !std.mem.eql(u8, &request.hashes[cursor], &tx_hash)) : (cursor += 1) {}
@@ -266,7 +284,11 @@ pub const Intake = struct {
                 self.stats.duplicate += 1;
                 continue;
             }
-            try self.reserveSignature(peer, now);
+            self.reserveSignature(peer, now) catch |err| {
+                self.stats.signature_discarded_decoded += record_count;
+                self.stats.signature_unprocessed_items += msg.transactions.count - item_index;
+                return err;
+            };
             records[record_count] = try decodeRecord(a, self.chain_id, peer, bytes, entry.at_ms, now);
             records[record_count].frame_received_wall_ms = receipt.wall_ms;
             record_count += 1;
@@ -288,7 +310,7 @@ pub const Intake = struct {
         const txs = msg.slice();
         var records: [max_broadcast_transactions]Record = undefined;
         var count: usize = 0;
-        for (txs) |tx| {
+        for (txs, 0..) |tx, item_index| {
             const bytes = try canonicalBytes(a, tx.value);
             const tx_hash = hash(bytes);
             var duplicate = self.known(tx_hash, now);
@@ -302,7 +324,11 @@ pub const Intake = struct {
                 self.stats.duplicate += 1;
                 continue;
             }
-            try self.reserveSignature(peer, now);
+            self.reserveSignature(peer, now) catch |err| {
+                self.stats.signature_discarded_decoded += count;
+                self.stats.signature_unprocessed_items += txs.len - item_index;
+                return err;
+            };
             records[count] = try decodeRecord(a, self.chain_id, peer, bytes, now, now);
             records[count].frame_received_wall_ms = receipt.wall_ms;
             count += 1;
@@ -830,6 +856,68 @@ test "public intake limits work before parsing or signature recovery" {
     try std.testing.expectEqual(1, recorder.count);
     try std.testing.expectEqual(1, intake.stats.frame_rate_drops);
     try std.testing.expectEqual(1, intake.stats.signature_rate_drops);
+}
+
+test "public intake local response refusal releases only the matching epoch without timeout penalty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recorder: Recorder = .{};
+    var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+    defer intake.deinit();
+    const bytes = try fixture(a);
+    try intake.announce(a, peer_a, try announceOne(a, bytes, 0), 0);
+    try intake.announce(a, peer_b, try announceOne(a, bytes, 0), 0);
+    _ = intake.nextRequest(1, 0).?;
+    intake.frame_budget = .{ .last_ms = 0, .milli_tokens = 0 };
+    const response = try responseOne(a, 1, bytes);
+    const old_epoch: Peer = .{ .index = peer_a.index, .epoch = peer_a.epoch - 1 };
+    try std.testing.expectError(error.FrameRateLimit, intake.response(a, old_epoch, response, .{ .mono_ms = 0 }));
+    try std.testing.expect(intake.findRequest(peer_a, 1) != null);
+    try std.testing.expectError(error.FrameRateLimit, intake.response(a, peer_a, response, .{ .mono_ms = 0 }));
+    try std.testing.expect(intake.findRequest(peer_a, 1) == null);
+    try std.testing.expectEqual(1, intake.stats.frame_refused_requests);
+    intake.expire(request_timeout_ms + 1000);
+    try std.testing.expectEqual(0, intake.stats.expired_requests);
+    try std.testing.expectEqual(0, intake.peer_work[peer_a.index].timeouts);
+    try std.testing.expectEqual(0, intake.peer_work[peer_a.index].retry_after_ms);
+    const alternative = intake.nextRequest(2, request_timeout_ms + 1000).?;
+    try std.testing.expect(samePeer(peer_b, alternative.peer));
+    try intake.response(a, peer_b, try responseOne(a, 2, bytes), .{ .mono_ms = request_timeout_ms + 1001 });
+    try std.testing.expectEqual(1, recorder.count);
+}
+
+test "public intake counts decoded and unprocessed items discarded by signature admission" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first = try fixture(a);
+    const second = try std.fmt.hexToBytes(try a.alloc(u8, typed2_hex.len / 2), typed2_hex);
+    const raw_items = [_]rlp.RawValue{ .{ .value = first }, .{ .value = try encode(a, second) } };
+    for ([_]bool{ false, true }) |is_response| {
+        var recorder: Recorder = .{};
+        var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+        defer intake.deinit();
+        intake.signature_budget = .{ .last_ms = 0, .milli_tokens = 1000 };
+        if (is_response) {
+            const announcement = try encode(a, .{ @as([]const u8, &.{ 0, 2 }), @as([]const u32, &.{ @intCast(first.len), @intCast(second.len) }), @as([]const Hash, &.{ hash(first), hash(second) }) });
+            try intake.announce(a, peer_a, announcement, 0);
+            _ = intake.nextRequest(1, 0).?;
+            const response = try encode(a, .{ @as(u64, 1), @as([]const rlp.RawValue, &raw_items) });
+            try std.testing.expectError(error.SignatureRateLimit, intake.response(a, peer_a, response, .{ .mono_ms = 0 }));
+            try std.testing.expect(intake.findRequest(peer_a, 1) == null);
+            intake.expire(request_timeout_ms + 1000);
+            try std.testing.expectEqual(0, intake.stats.expired_requests);
+        } else {
+            const broadcast = try encode(a, @as([]const rlp.RawValue, &raw_items));
+            try std.testing.expectError(error.SignatureRateLimit, intake.broadcast(a, peer_a, broadcast, .{ .mono_ms = 0 }));
+        }
+        try std.testing.expectEqual(1, intake.stats.decoded);
+        try std.testing.expectEqual(1, intake.stats.signature_discarded_decoded);
+        try std.testing.expectEqual(1, intake.stats.signature_unprocessed_items);
+        try std.testing.expectEqual(0, recorder.count);
+        try std.testing.expectEqual(0, intake.stats.accepted);
+    }
 }
 
 test "public intake signature rate is global and peer scoped across reconnects" {

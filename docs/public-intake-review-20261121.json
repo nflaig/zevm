@@ -1,0 +1,26 @@
+{
+  "initial": {
+    "artifact": "opus-intake-review-final.jsonl",
+    "status": "substantive_review_completed",
+    "closure": "shared sync disconnect removed, throughput/fairness/backoff bounded, full source lifecycle manually audited; ReceiptTime mismatch was stale supplied diff"
+  },
+  "full_hardening_followup": {
+    "artifact": "opus-intake-hardening-review.jsonl",
+    "status": "api_failure_not_review",
+    "reason": "final response is provider safeguard/API error [reasoning_extraction], not review findings; no approval inferred"
+  },
+  "final_delta": {
+    "artifact": "opus-intake-final-delta-review.jsonl",
+    "status": "substantive_review_completed",
+    "medium_finding": "frame-admission refusal retained request and incorrectly charged timeout",
+    "closure": "release only responding peer+epoch own request on FrameRateLimit; bounded 16 slots/64 hashes, no pending scan/drain; Debug and safe 183/183, three new refusal regressions passed",
+    "conditional": "transport max_peers 50 <= intake max_peer_slots 64 now asserted at compile time",
+    "low": "decoded retained as completed work metric; add explicit signature_discarded_decoded and signature_unprocessed_items counters with docs rather than pretending verification work did not occur"
+  },
+  "final_source": {
+    "src/node/public_intake.zig": "42cf1d4414c4eb99ca110d73f81e75798a952e73703dad505c74081e90b62441",
+    "src/node/public_intake_peer.zig": "d1e0dcc5ea1d4c8617b1736e1528822074f4116f0fa8fcd98b57f27c7bfab8d7"
+  },
+  "deployment_scope": "observer-only isolated qualification; no candidate delivery, no blobs, no production Geth retirement",
+  "final_qualification": "public-intake-final-r4-qualification.json"
+}

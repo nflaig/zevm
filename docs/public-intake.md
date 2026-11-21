@@ -73,10 +73,14 @@ The observer never disconnects a shared state-sync peer for an intake verdict;
 it releases only its own reservations. Token buckets charge incoming bytes before
 parsing or hashing and unknown transactions before decoding/signature work.
 Denied work spends neither the other bucket's tokens nor any signature attempt.
-Denied frames return from the adapter immediately; they do not scan pending
-inventory, release requests or drain outgoing work. This prevents a tiny-frame
+Denied frames return from the adapter immediately without scanning pending
+inventory or draining outgoing work. A refused pooled response releases only its
+own peer/epoch's request (at most 16 slots checked and 64 hashes released), so our
+local admission loss is not later charged as a remote timeout/backoff. Denied
+announcements and broadcasts do not release requests. This prevents a tiny-frame
 flood from moving expensive work into the rejection path. Empty announcements
-also return before the pending-ownership scan.
+also return before the pending-ownership scan. A compile-time assertion keeps the
+intake's peer-slot bounds at least as large as the provider's capacity.
 Rate-limit loss is expected under overload and must not be mistaken for complete
 coverage. A frame rejected during validation contributes no records to the sink.
 The bounded work remains on the downloader thread, so this limits additional CPU
@@ -87,7 +91,12 @@ latency guarantee.
 deferred-blob, unsupported, invalid, oversized, stale-response, outstanding,
 pending, capacity-drop, sink-full and timeout counts every minute.
 It also records frame/signature rate drops, per-peer pending drops and backoff
-selection skips. Repeated announcements cannot renew the ten-second pending
+selection skips. `frame_refused_requests` counts local admission releases
+separately from remote timeouts. `decoded` counts completed verification work,
+including records discarded before batch delivery; `signature_discarded_decoded`
+counts that verified work discarded by signature admission, and
+`signature_unprocessed_items` counts the refused item and remaining wire items
+(which may contain duplicates), not unique transactions. Repeated announcements cannot renew the ten-second pending
 lifetime, and a stalled peer is bypassed while a remembered alternative is usable.
 `public_transaction` records monotonic announcement time, frame-dispatch time in
 both clocks, and wall-clock acceptance time after validation. Frame dispatch is

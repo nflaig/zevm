@@ -9,6 +9,11 @@ const Intake = @import("public_intake.zig").Intake;
 const intake = @import("public_intake.zig");
 const log = std.log.scoped(.public_intake);
 
+comptime {
+    if (@import("../devp2p/rlpx.zig").Server.max_peers > intake.max_peer_slots)
+        @compileError("public intake slot bounds must cover the ETH provider");
+}
+
 pub const Driver = struct {
     source: *Intake,
     provider: *eth.Provider,
@@ -32,8 +37,9 @@ pub const Driver = struct {
             switch (err) {
                 error.UnsolicitedResponse, error.ExpiredResponse => self.stale += 1,
                 error.OutOfMemory => self.source.stats.bounded_drops += 1,
-                // Do not scan/release the inventory or drain outgoing work
-                // after admission refusal: tiny denied frames must stay O(1).
+                // Do not scan the inventory or drain outgoing work after
+                // refusal. response() may release that peer's one request,
+                // bounded by 16 request slots and 64 reserved hashes.
                 error.FrameRateLimit, error.SignatureRateLimit => return,
                 error.ResponseByteLimit, error.AnnouncementByteLimit, error.TransactionByteLimit, error.WireItemLimit => {
                     // These are our admission limits, not consensus-invalid
@@ -68,10 +74,11 @@ pub const Driver = struct {
             outstanding += 1;
         };
         const s = self.source.stats;
-        log.info("public_intake_stats accepted={} decoded={} announced={} requested={} duplicate={} deferred_blobs={} unsupported={} invalid={} oversized={} stale={} outstanding={} pending={} capacity_drops={} sink_full={} timeouts={} frame_rate_drops={} signature_rate_drops={} peer_pending_drops={} backoff_skips={}", .{
-            s.accepted,         s.decoded,          s.announced,            s.requested,          s.duplicate,                 s.deferred_blobs, s.unsupported,
-            self.invalid,       self.oversized,     self.stale,             outstanding,          self.source.pending.count(), s.bounded_drops,  s.sink_full,
-            s.expired_requests, s.frame_rate_drops, s.signature_rate_drops, s.peer_pending_drops, s.backoff_skips,
+        log.info("public_intake_stats accepted={} decoded={} announced={} requested={} duplicate={} deferred_blobs={} unsupported={} invalid={} oversized={} stale={} outstanding={} pending={} capacity_drops={} sink_full={} timeouts={} frame_rate_drops={} signature_rate_drops={} peer_pending_drops={} backoff_skips={} frame_refused_requests={} signature_discarded_decoded={} signature_unprocessed_items={}", .{
+            s.accepted,                    s.decoded,          s.announced,            s.requested,          s.duplicate,                 s.deferred_blobs,         s.unsupported,
+            self.invalid,                  self.oversized,     self.stale,             outstanding,          self.source.pending.count(), s.bounded_drops,          s.sink_full,
+            s.expired_requests,            s.frame_rate_drops, s.signature_rate_drops, s.peer_pending_drops, s.backoff_skips,             s.frame_refused_requests, s.signature_discarded_decoded,
+            s.signature_unprocessed_items,
         });
     }
 
@@ -215,4 +222,54 @@ test "public intake denied frames do not scan cleanup or drain outgoing work" {
     try std.testing.expect(source.pending.values()[0].peers[0] != null);
     for (source.requests) |request| try std.testing.expect(request == null);
     try std.testing.expectEqual(16, provider.peers[0].info.load(.acquire).offset);
+}
+
+test "public intake driver drops refused responses without draining or penalizing the responder" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]bool{ false, true }) |deny_signature| {
+        var provider = try eth.Provider.init(a);
+        provider.peers[0].info.store(.{ .epoch = 1, .offset = 16 }, .release);
+        provider.peers[1].info.store(.{ .epoch = 1, .offset = 16 }, .release);
+        const UnexpectedSink = struct {
+            fn accept(_: *anyopaque, _: intake.Record) bool {
+                @panic("refused response cannot reach sink");
+            }
+        };
+        var marker: u8 = 0;
+        var source: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = .{ .context = &marker, .accept = UnexpectedSink.accept } };
+        defer source.deinit();
+        var driver: Driver = .{ .source = &source, .provider = &provider };
+        var announcement: [38]u8 = @splat(0);
+        @memcpy(announcement[0..6], &[_]u8{ 0xe5, 0x00, 0xc1, 0x01, 0xe1, 0xa0 });
+        const tx_hash = @import("../evm/crypto/hash.zig").keccak256(&.{0xc0});
+        @memcpy(announcement[6..], &tx_hash);
+        try source.announce(a, .{ .index = 0, .epoch = 1 }, &announcement, 0);
+        _ = source.nextRequest(1, 0).?;
+        // A second peer's eligible work would call provider.send (and fail on
+        // its deliberately absent server) if the refusal accidentally drained.
+        announcement[37] ^= 1;
+        try source.announce(a, .{ .index = 1, .epoch = 1 }, &announcement, 0);
+        if (deny_signature) {
+            source.signature_budget = .{ .last_ms = 0, .milli_tokens = 0 };
+        } else {
+            source.frame_budget = .{ .last_ms = 0, .milli_tokens = 0 };
+        }
+        const payload = try a.dupe(u8, &.{ 0xc3, 0x01, 0xc1, 0xc0 });
+        driver.handle(a, .{
+            .msg = .{ .pooled_transactions = .{ .value = payload } },
+            .read = .{ .peer = .{ .peer_index = 0, .peer_epoch = 1 }, .id = 10, .payload = payload },
+        }, .{ .mono_ms = 0 });
+        for (source.requests) |request| try std.testing.expect(request == null);
+        try std.testing.expectEqual(2, source.pending.count());
+        try std.testing.expectEqual(@intFromBool(!deny_signature), source.stats.frame_refused_requests);
+        try std.testing.expectEqual(@intFromBool(deny_signature), source.stats.signature_unprocessed_items);
+        source.expire(2500);
+        try std.testing.expectEqual(0, source.stats.expired_requests);
+        try std.testing.expectEqual(0, source.peer_work[0].retry_after_ms);
+        try std.testing.expectEqual(0, driver.invalid);
+        try std.testing.expectEqual(16, provider.peers[0].info.load(.acquire).offset);
+        try std.testing.expectEqual(16, provider.peers[1].info.load(.acquire).offset);
+    }
 }
