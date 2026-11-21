@@ -29,6 +29,7 @@ const metrics = @import("metrics.zig");
 const Shutdown = @import("signals.zig").Shutdown;
 const Snapshots = @import("db/snapshot.zig").Snapshots;
 const ShadowApi = @import("rpc/shadow.zig").Shadow;
+const consensus = @import("node/consensus.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -52,6 +53,7 @@ const params = clap.parseParamsComptime(
     \\    --metrics-addr <str>  Prometheus metrics HTTP listening address (default: 127.0.0.1).
     \\    --metrics-port <u16>  Prometheus metrics HTTP listening port (default: 6060).
     \\    --shadow-state        Enable exact-parent state witness qualification (fresh datadir required).
+    \\    --shadow-beacon-url <str> Follow a trusted local post-Gloas beacon node (requires --shadow-state).
     \\
 );
 
@@ -72,6 +74,7 @@ const Options = struct {
     authrpc_jwtsecret: ?[]const u8,
     metrics_addr: std.Io.net.IpAddress,
     shadow_state: bool,
+    shadow_beacon_url: ?[]const u8,
 
     fn parse(init: std.process.Init) !?Options {
         var diag = clap.Diagnostic{};
@@ -95,8 +98,11 @@ const Options = struct {
         const authrpc_port = res.args.@"authrpc-port" orelse 8551;
         const metrics_addr = res.args.@"metrics-addr" orelse "127.0.0.1";
         const metrics_port = res.args.@"metrics-port" orelse 6060;
+        if (res.args.@"shadow-beacon-url" != null and res.args.@"shadow-state" == 0)
+            return error.ShadowStateRequired;
         return .{
             .shadow_state = res.args.@"shadow-state" != 0,
+            .shadow_beacon_url = res.args.@"shadow-beacon-url",
             .config = switch (network) {
                 .glamsterdam_devnet8 => blockchain.glamsterdam_devnet8_config,
                 .mainnet => blockchain.mainnet_config,
@@ -238,6 +244,20 @@ fn runNode(init: std.process.Init, opts: Options) !void {
     defer snapshots.deinit();
     if (opts.shadow_state) try downloader.enableShadow(&snapshots);
     var shadow_api: ShadowApi = .{ .snapshots = &snapshots, .eth = &eth_db };
+
+    var consensus_buffer: [4]consensus.Update = undefined;
+    var consensus_updates: std.Io.Queue(consensus.Update) = .init(&consensus_buffer);
+    var tracker: ?consensus.Tracker = if (opts.shadow_beacon_url) |url|
+        try .init(init.io, init.gpa, url, &consensus_updates)
+    else
+        null;
+    defer if (tracker) |*t| t.deinit();
+    var tracker_thread: ?std.Io.Future(@typeInfo(@TypeOf(consensus.Tracker.run)).@"fn".return_type.?) = null;
+    if (tracker) |*t| {
+        try downloader.enableConsensus(&consensus_updates);
+        tracker_thread = try init.io.concurrent(consensus.Tracker.run, .{t});
+    }
+    defer if (tracker_thread) |*thread| thread.cancel(init.io) catch {};
 
     const metrics_sources = [_]metrics.Source{
         .from(rlpx.Server, &rlpx_server),

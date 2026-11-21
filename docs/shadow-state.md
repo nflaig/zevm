@@ -60,6 +60,44 @@ Automatic partial-sync recovery and deeper reorg reconstruction remain gaps. The
 peer-driven downloader still does not implement CL forkchoice. Retaining views
 from different branches is not full multi-branch sync.
 
+## Consensus-selected shadow targets
+
+`--shadow-state --shadow-beacon-url http://127.0.0.1:9596` enables the local
+Lodestar target tracker. This is a read-only experimental integration. It never
+calls Geth RPC or Engine methods and never changes the beacon's forkchoice.
+The beacon remains a trust boundary and may itself still use Geth for execution
+validation; this mode does not make the whole stack Geth-independent.
+
+Bootstrap reads a finalized, canonical, non-optimistic beacon header, then the
+post-Gloas block at that exact root. It anchors to the bid's **execution parent**:
+the block's own advertised payload may be absent. The execution header is fetched
+from peers by that exact hash, and the initial SNAP state must hash to its root.
+No state is advertised before account, storage and code verification completes.
+The anchor is persisted in the same transaction as the branch base. A peer-only
+database cannot silently become a consensus-anchored one: use a fresh directory.
+
+After bootstrap, `head_v2`, `head` and `execution_payload` SSE events trigger a
+read of Lodestar's `/eth/v2/debug/fork_choice`. The selected node is matched by
+**both beacon root and FULL/EMPTY status** and must be valid and non-optimistic.
+An identical beacon root can identify different execution parents. Five-second
+reconciliation repairs missed events; SSE reconnects after one second. Ordinary
+HTTP lookups have a two-second timeout and a 4 MiB body limit. Only explicit
+loopback HTTP endpoints are allowed, and redirects are not followed.
+
+The downloader accepts same-height and lower-height targets, fetches the target
+header by hash, and fences obsolete header results with a generation. Existing
+BAL work completes against its original selected branch before any rewind.
+Header/BAL responses advance the pipeline immediately instead of waiting for the
+one-second recovery tick. `shadow consensus ready` logs the time from the
+tracker's observation to a verified selected checkpoint; this is not transaction
+arrival latency or a proposer deadline measurement.
+
+Current limits: the finalized bootstrap pivot stays fixed until complete; an
+interrupted initial sync requires a new directory; recovery is bounded by retained
+undo history; this is tracking the CL-selected branch, not independently building
+every FULL/EMPTY/ancestor alternative. It depends on Lodestar's debug V2 API, not
+a standardized Engine forkchoice implementation.
+
 Before production adoption, qualify independent live sync, restart/corruption,
 reorg recovery, exact-parent availability at builder deadlines, full candidate
 root/receipt/value parity, and performance against an independent EL oracle.

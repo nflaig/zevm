@@ -14,6 +14,10 @@ const a = std.testing.allocator;
 const undo = @import("db/undo.zig");
 const branches = @import("db/branches.zig");
 
+test {
+    _ = @import("node/consensus.zig");
+}
+
 const queries = [_]Shadow.Query{
     .{ .address = .{ .bytes = @splat(0x11) }, .storageKeys = &.{ .init(0), .init(1), .init(2), .init(99) } },
     .{ .address = .{ .bytes = @splat(0xee) }, .storageKeys = &.{.init(0)} },

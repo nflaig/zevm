@@ -24,7 +24,7 @@ pub const Blockchain = struct {
     allocator: std.mem.Allocator,
     eth_db: *EthDb,
     file_storage: *FileStorage,
-    shadow_branches: bool = false,
+    shadow_branches: std.atomic.Value(bool) = .init(false),
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, cfg: Config, file_storage: *FileStorage, eth_db: *EthDb) !Self {
         var bc = Self{
@@ -54,7 +54,7 @@ pub const Blockchain = struct {
     }
 
     pub fn headHeader(self: *Self) !types.BlockHeader {
-        if (self.shadow_branches) {
+        if (self.shadow_branches.load(.acquire)) {
             const txn = try self.eth_db.kv_store.transaction_ro();
             defer txn.abort() catch unreachable;
             return (try branches.state(self.eth_db.kv_store, txn) orelse return error.StateNotReady).head;
@@ -64,7 +64,7 @@ pub const Blockchain = struct {
     }
 
     pub fn readHeader(self: *Self, number: u64) !?types.BlockHeader {
-        if (self.shadow_branches) {
+        if (self.shadow_branches.load(.acquire)) {
             const txn = try self.eth_db.kv_store.transaction_ro();
             defer txn.abort() catch unreachable;
             const selected = try branches.state(self.eth_db.kv_store, txn) orelse return error.StateNotReady;

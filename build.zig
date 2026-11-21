@@ -256,6 +256,18 @@ pub fn build(b: *std.Build) void {
     b.step("test-shadow-state", "Qualify exact-parent shadow state snapshots and authenticated reads")
         .dependOn(&b.addRunArtifact(shadow_tests).step);
 
+    const consensus_probe = b.addExecutable(.{
+        .name = "consensus-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/consensus_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .use_llvm = true,
+    });
+    b.step("consensus-probe", "Build the read-only native beacon tracker qualification tool")
+        .dependOn(&b.addInstallArtifact(consensus_probe, .{}).step);
+
     // Example user
     const example_step = b.step("example", "Run the example program");
     const example_zevm_mod = createZevmModule(
