@@ -209,3 +209,23 @@ test "shadow missing and corrupted code never become empty code" {
         try std.testing.expectError(expected, api.read(arena.allocator(), parent(header), &queries));
     }
 }
+
+fn readAllocationCase(backing: std.mem.Allocator, api: *Shadow, header: types.BlockHeader) !void {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    _ = try api.read(arena.allocator(), parent(header), &queries);
+}
+
+test "shadow allocation failures release DB cursors and read leases" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var eth = Eth.init(&f.store);
+    const header = try f.write(1, 42, true);
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    try std.testing.checkAllAllocationFailures(a, readAllocationCase, .{ &api, header });
+    try readAllocationCase(a, &api, header);
+    try std.testing.expectEqual(header.hash(), views.status().headers[0].hash());
+}

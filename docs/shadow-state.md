@@ -7,8 +7,8 @@ transactions, or authorize use as a production execution client.
 Build with Zig 0.17.0:
 
 ```sh
-zig build zevm test-shadow-state -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3
-zig build test-shadow-state -Doptimize=Debug
+zig build zevm test-shadow-state -Doptimize=safe -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3
+zig build test-shadow-state -Doptimize=debug
 ```
 
 Start in a fresh, dedicated directory with `--shadow-state`, independent peer
@@ -53,3 +53,12 @@ reconstruct arbitrary historical branches. This is not full multi-branch sync.
 Before production adoption, qualify independent live sync, restart/corruption,
 reorg recovery, exact-parent availability at builder deadlines, full candidate
 root/receipt/value parity, and performance against an independent EL oracle.
+
+The first Plataberget qualification on 2026-11-21 reproduced a downloader reorg
+failure: the persisted header at height 627188 was `bd23ae2d…`, while the next
+persisted header's parent was the competing `f9b3c70e…` header at the same height.
+State application returned `Reorg` and the process exited. The header downloader
+currently appends a height extension without reconciling its cutoff hash against
+the existing branch. A fresh initial sync and a clean restart therefore do not
+qualify recovery or continuous availability. Do not deploy this as a production
+state source until branch-aware sync and recovery have passed the same tests.
