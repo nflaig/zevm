@@ -13,6 +13,7 @@ pub const Table = enum {
     codes,
     account_trie,
     storage_tries,
+    state_meta,
 
     pub fn options(self: Table) lmdbx.Database.Options {
         return switch (self) {
@@ -29,6 +30,11 @@ pub const Store = struct {
     dbis: [table_count]lmdbx.Database.DBI,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !Store {
+        return initBounded(allocator, path, 8 << 40, 16 << 30);
+    }
+
+    pub fn initBounded(allocator: std.mem.Allocator, path: []const u8, upper_size: isize, growth_step: isize) !Store {
+        if (growth_step <= 0 or growth_step > upper_size) return error.InvalidDatabaseLimit;
         const init_path = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(init_path);
 
@@ -41,8 +47,8 @@ pub const Store = struct {
             .no_read_ahead = true,
             .geometry = .{
                 .lower_size = 0,
-                .upper_size = 8 << 40,
-                .growth_step = 16 << 30,
+                .upper_size = upper_size,
+                .growth_step = growth_step,
                 .shrink_threshold = 0,
             },
             .no_sticky_threads = true,

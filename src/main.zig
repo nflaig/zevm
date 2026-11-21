@@ -27,6 +27,8 @@ const RpcHttpServer = @import("rpc/http.zig").HttpServer;
 const jwt = @import("rpc/jwt.zig");
 const metrics = @import("metrics.zig");
 const Shutdown = @import("signals.zig").Shutdown;
+const Snapshots = @import("db/snapshot.zig").Snapshots;
+const ShadowApi = @import("rpc/shadow.zig").Shadow;
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -49,6 +51,7 @@ const params = clap.parseParamsComptime(
     \\    --authrpc-jwtsecret <str> Path to the hex-encoded JWT secret; created if missing (default: <datadir>/jwt.hex).
     \\    --metrics-addr <str>  Prometheus metrics HTTP listening address (default: 127.0.0.1).
     \\    --metrics-port <u16>  Prometheus metrics HTTP listening port (default: 6060).
+    \\    --shadow-state        Enable exact-parent state witness qualification (fresh datadir required).
     \\
 );
 
@@ -68,6 +71,7 @@ const Options = struct {
     authrpc_addr: std.Io.net.IpAddress,
     authrpc_jwtsecret: ?[]const u8,
     metrics_addr: std.Io.net.IpAddress,
+    shadow_state: bool,
 
     fn parse(init: std.process.Init) !?Options {
         var diag = clap.Diagnostic{};
@@ -92,6 +96,7 @@ const Options = struct {
         const metrics_addr = res.args.@"metrics-addr" orelse "127.0.0.1";
         const metrics_port = res.args.@"metrics-port" orelse 6060;
         return .{
+            .shadow_state = res.args.@"shadow-state" != 0,
             .config = switch (network) {
                 .glamsterdam_devnet8 => blockchain.glamsterdam_devnet8_config,
                 .mainnet => blockchain.mainnet_config,
@@ -169,7 +174,10 @@ fn runNode(init: std.process.Init, opts: Options) !void {
     var fs = try FileStorage.init(init.io, slabs.allocator(), static_path);
     defer fs.deinit(init.io, slabs.allocator()) catch |e| std.log.err("closing file storage failed: {}", .{e});
 
-    var store = try kv.Store.init(slabs.allocator(), mdbx_path);
+    var store = if (opts.shadow_state)
+        try kv.Store.initBounded(slabs.allocator(), mdbx_path, 16 << 30, 256 << 20)
+    else
+        try kv.Store.init(slabs.allocator(), mdbx_path);
     defer store.deinit() catch |e| std.log.err("closing mdbx failed: {}", .{e});
     var eth_db = EthDb.init(&store);
 
@@ -226,6 +234,11 @@ fn runNode(init: std.process.Init, opts: Options) !void {
         &snapproto,
     );
 
+    var snapshots: Snapshots = .{ .io = init.io, .store = &store };
+    defer snapshots.deinit();
+    if (opts.shadow_state) try downloader.enableShadow(&snapshots);
+    var shadow_api: ShadowApi = .{ .snapshots = &snapshots, .eth = &eth_db };
+
     const metrics_sources = [_]metrics.Source{
         .from(rlpx.Server, &rlpx_server),
         .from(Downloader, &downloader),
@@ -237,6 +250,7 @@ fn runNode(init: std.process.Init, opts: Options) !void {
     var eth_api: EthApi = .init(&bc, &downloader);
     var jsonrpc_server: RpcServer = .{};
     try eth_api.register(init.arena.allocator(), &jsonrpc_server);
+    if (opts.shadow_state) try shadow_api.register(init.arena.allocator(), &jsonrpc_server);
 
     var jsonrpc_http: RpcHttpServer = try .init(init.io, slabs.allocator(), &jsonrpc_server, opts.http_addr);
     var rpc_thread = try init.io.concurrent(RpcHttpServer.run, .{&jsonrpc_http});

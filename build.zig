@@ -241,6 +241,21 @@ pub fn build(b: *std.Build) void {
     unit_tests.root_module.addImport("metrics", metrics_dep.module("metrics"));
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
+    const shadow_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/shadow_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .use_llvm = true,
+    });
+    shadow_tests.root_module.link_libcpp = true;
+    shadow_tests.root_module.addOptions("build_options", native_opts);
+    linkDeps(shadow_tests.root_module, deps, .native);
+    shadow_tests.root_module.addImport("lmdbx", mdbx_dep.module("lmdbx"));
+    b.step("test-shadow-state", "Qualify exact-parent shadow state snapshots and authenticated reads")
+        .dependOn(&b.addRunArtifact(shadow_tests).step);
+
     // Example user
     const example_step = b.step("example", "Run the example program");
     const example_zevm_mod = createZevmModule(

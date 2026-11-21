@@ -18,6 +18,8 @@ comptime {
     _ = @import("devp2p/rlpx.zig");
     _ = @import("db/file.zig");
     _ = @import("db/eth.zig");
+    _ = @import("db/snapshot.zig");
+    _ = @import("rpc/shadow.zig");
     _ = @import("node/blockchain.zig");
     _ = @import("node/downloader.zig");
     _ = @import("node/engine.zig");

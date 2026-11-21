@@ -184,6 +184,72 @@ pub const Trie = struct {
         }
     }
 
+    pub const Proof = struct { value: ?[]const u8, nodes: []const []const u8 };
+
+    /// Read an immutable DB trie and produce an inclusion/absence witness.
+    /// Every resolved node, including a leaf reconstructed from flat state,
+    /// must match the hash committed by the requested root. Missing nodes are
+    /// errors, never evidence of absence. Memory belongs to the caller's arena.
+    pub fn prove(self: *const Self, key: [32]u8) !Proof {
+        var reader = self.*;
+        var root = self.root;
+        var node = &root;
+        var key_buf: [64]u8 = undefined;
+        const nibbles = writeHexKey(&key, &key_buf);
+        var depth: usize = 0;
+        var nodes = std.array_list.Managed([]const u8).init(self.allocator);
+        while (true) {
+            switch (node.*) {
+                .hashed => |hashed| {
+                    if (hashed.len != 32 or nodes.items.len >= 65) return error.MalformedTrieNode;
+                    const resolver = self.resolver orelse return error.SubTrieNotAvailable;
+                    const resolved = try resolver.resolveFn(resolver.ptr, self.allocator, nibbles[0..depth], hashed.data) orelse
+                        return error.SubTrieNotAvailable;
+                    const encoded = switch (resolved) {
+                        .rlp => |bytes| bytes,
+                        .node => |resolved_node| leaf: {
+                            if (resolved_node != .leaf) return error.MalformedTrieNode;
+                            var leaf = resolved_node.leaf;
+                            if (depth + leaf.key_len != 64) return error.MalformedTrieNode;
+                            leaf.key[leaf.key_len] = 16;
+                            var list = std.array_list.Managed(u8).init(self.allocator);
+                            try rlp.serialize(struct { key: []const u8, value: []const u8 }, self.allocator, .{
+                                .key = hexToCompact(leaf.key[0 .. leaf.key_len + 1]),
+                                .value = leaf.val,
+                            }, &list);
+                            break :leaf list.items;
+                        },
+                    };
+                    if (!std.meta.eql(keccak256(encoded), hashed.data)) return error.StateRootMismatch;
+                    const owned = try self.allocator.dupe(u8, encoded);
+                    try nodes.append(owned);
+                    try reader.decodeNode(node, owned, null);
+                },
+                .branch => |*branch| {
+                    if (depth >= 64) return error.MalformedTrieNode;
+                    const child = branch.children[nibbles[depth]] orelse return .{ .value = null, .nodes = nodes.items };
+                    node = child;
+                    depth += 1;
+                },
+                .ext => |*ext| {
+                    if (ext.key_len == 0 or depth + ext.key_len > 64) return error.MalformedTrieNode;
+                    if (!std.mem.startsWith(u8, nibbles[depth..], ext.key[0..ext.key_len]))
+                        return .{ .value = null, .nodes = nodes.items };
+                    depth += ext.key_len;
+                    node = ext.child;
+                },
+                .leaf => |leaf| {
+                    if (depth + leaf.key_len != 64) return error.MalformedTrieNode;
+                    return .{
+                        .value = if (std.mem.eql(u8, nibbles[depth..], leaf.key[0..leaf.key_len])) leaf.val else null,
+                        .nodes = nodes.items,
+                    };
+                },
+                .empty => return .{ .value = null, .nodes = nodes.items },
+            }
+        }
+    }
+
     pub fn update(self: *Self, keys: []const [32]u8, values: [][]const u8) !void {
         std.debug.assert(keys.len != 0);
         std.debug.assert(keys.len == values.len);
