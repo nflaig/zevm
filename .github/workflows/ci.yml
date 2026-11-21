@@ -7,6 +7,21 @@ on:
   pull_request:
 
 jobs:
+  shadow-state:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        optimize: [safe, debug]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig build test-shadow-state -Doptimize=${{ matrix.optimize }}
+
   test-and-build-example-bench:
     runs-on: ubuntu-24.04
     steps:
