@@ -59,7 +59,7 @@ pub const Server = struct {
             resp.result = result_json;
         } else |e| {
             resp.err = .{
-                .code = @intFromEnum(switch (e) {
+                .code = @backingInt(switch (e) {
                     Errors.InvalidJSON => ErrorCodes.InvalidJSON,
                     Errors.InvalidRequest => ErrorCodes.InvalidRequest,
                     Errors.MethodNotFound => ErrorCodes.MethodNotFound,
@@ -102,12 +102,15 @@ const Handler = struct {
                 args[1] = io;
                 args[2] = allocator;
 
+                // Parsed slices can be borrowed by the handler and its result.
+                // Keep them alive until the result has been serialized too.
+                var args_arena = std.heap.ArenaAllocator.init(allocator);
+                defer args_arena.deinit();
                 if (args.len > 3) {
                     const JsonArgs = ExtractSubTuple(FullArgs, 3);
-                    const parsed = try std.json.parseFromSlice(JsonArgs, allocator, args_json.raw, .{});
-                    defer parsed.deinit();
+                    const parsed = try std.json.parseFromSliceLeaky(JsonArgs, args_arena.allocator(), args_json.raw, .{});
                     inline for (3..args.len) |index| {
-                        args[index] = parsed.value[index - 3];
+                        args[index] = parsed[index - 3];
                     }
                 }
 
@@ -201,6 +204,29 @@ pub const RawJson = struct {
 
 fn ExtractSubTuple(comptime FullTuple: type, comptime start_idx: usize) type {
     return @Tuple(@typeInfo(FullTuple).@"struct".field_types[start_idx..]);
+}
+
+test "allocated RPC arguments survive handler allocations and response serialization" {
+    const API = struct {
+        fn echo(_: *@This(), _: std.Io, allocator: std.mem.Allocator, values: []const u64) ![]const u64 {
+            const scratch = try allocator.alloc(u8, 4096);
+            defer allocator.free(scratch);
+            @memset(scratch, 0);
+            return values;
+        }
+    };
+    var api: API = .{};
+    var server: Server = .{};
+    defer server.deinit(std.testing.allocator);
+    try server.register(std.testing.allocator, "echo", &api, API.echo);
+    var buffer: [32768]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    const result = try server.handle(std.testing.io, fixed.allocator(),
+        \\{"jsonrpc":"2.0","method":"echo","params":[[1,2,3]],"id":1}
+    );
+    try std.testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","result":[1,2,3],"id":1}
+    , result.raw);
 }
 
 test "server" {
