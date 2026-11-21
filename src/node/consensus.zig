@@ -25,6 +25,32 @@ pub const Anchor = struct { beacon_root: [32]u8, execution_hash: [32]u8, slot: u
 pub const Head = struct { hash: [32]u8, slot: u64 };
 pub const Update = struct { anchor: Anchor, head: Head, observed_at_ms: i64 };
 
+pub const TargetHint = struct {
+    beacon_root: [32]u8,
+    execution_hash: [32]u8,
+    slot: ?u64 = null,
+    full_only: bool = false,
+};
+
+const Node = struct {
+    slot: []const u8,
+    block_root: HexHash,
+    payload_status: []const u8,
+    validity: []const u8,
+    execution_block_hash: HexHash,
+    extra_data: struct { execution_optimistic: bool = true },
+
+    fn verified(self: Node) !Head {
+        if (!std.mem.eql(u8, self.validity, "valid") or self.extra_data.execution_optimistic)
+            return error.UnverifiedConsensusHead;
+        return .{ .hash = try nonzero(self.execution_block_hash.bytes), .slot = try std.fmt.parseInt(u64, self.slot, 10) };
+    }
+};
+const ForkChoice = struct { data: struct {
+    extra_data: struct { head: struct { block_root: HexHash, payload_status: []const u8 } },
+    fork_choice_nodes: []Node,
+} };
+
 fn nonzero(hash: [32]u8) ![32]u8 {
     if (std.mem.allEqual(u8, &hash, 0)) return error.UnavailableExecutionHead;
     return hash;
@@ -66,31 +92,82 @@ pub fn finalizedParent(a: std.mem.Allocator, json: []const u8, root: [32]u8, slo
 }
 
 pub fn selectedHead(a: std.mem.Allocator, json: []const u8) !Head {
-    const Node = struct {
-        slot: []const u8,
-        block_root: HexHash,
-        payload_status: []const u8,
-        validity: []const u8,
-        execution_block_hash: HexHash,
-        extra_data: struct { execution_optimistic: bool = true },
-    };
-    const Response = struct { data: struct {
-        extra_data: struct { head: struct { block_root: HexHash, payload_status: []const u8 } },
-        fork_choice_nodes: []Node,
-    } };
-    const parsed = try std.json.parseFromSlice(Response, a, json, .{ .ignore_unknown_fields = true });
+    const parsed = try std.json.parseFromSlice(ForkChoice, a, json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    const data = parsed.value.data;
+    return selectedNode(parsed.value);
+}
+
+fn selectedNode(graph: ForkChoice) !Head {
+    const data = graph.data;
     const head = data.extra_data.head;
     if (!std.mem.eql(u8, head.payload_status, "full") and !std.mem.eql(u8, head.payload_status, "empty")) return error.UnavailableExecutionHead;
     var result: ?Head = null;
     for (data.fork_choice_nodes) |node| {
         if (!std.meta.eql(node.block_root.bytes, head.block_root.bytes) or !std.mem.eql(u8, node.payload_status, head.payload_status)) continue;
-        if (result != null or !std.mem.eql(u8, node.validity, "valid") or node.extra_data.execution_optimistic)
-            return error.UnverifiedConsensusHead;
-        result = .{ .hash = try nonzero(node.execution_block_hash.bytes), .slot = try std.fmt.parseInt(u64, node.slot, 10) };
+        if (result != null) return error.UnverifiedConsensusHead;
+        result = try node.verified();
     }
     return result orelse error.UnavailableExecutionHead;
+}
+
+/// Warm a verified payload before forkchoice's timeliness decision selects FULL.
+/// This selects work for a read-only state cache, not the beacon's canonical head.
+pub fn targetHead(a: std.mem.Allocator, json: []const u8, hint: ?TargetHint) !Head {
+    const parsed = try std.json.parseFromSlice(ForkChoice, a, json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const graph = parsed.value;
+    if (hint) |wanted| {
+        var result: ?Head = null;
+        for (graph.data.fork_choice_nodes) |node| {
+            if (!std.meta.eql(node.block_root.bytes, wanted.beacon_root) or
+                !std.meta.eql(node.execution_block_hash.bytes, wanted.execution_hash)) continue;
+            if (!std.mem.eql(u8, node.payload_status, "full") and
+                (wanted.full_only or !std.mem.eql(u8, node.payload_status, "empty"))) continue;
+            const head = try node.verified();
+            if (result != null or (wanted.slot != null and wanted.slot.? != head.slot)) return error.UnverifiedConsensusHead;
+            result = head;
+        }
+        return result orelse error.UnavailableExecutionHead;
+    }
+    const selected = try selectedNode(graph);
+    // Reconciliation must not undo warm FULL state just because the beacon still
+    // selects EMPTY. Its execution parent remains available in a retained view.
+    if (std.mem.eql(u8, graph.data.extra_data.head.payload_status, "empty")) {
+        var full: ?Head = null;
+        for (graph.data.fork_choice_nodes) |node| {
+            if (!std.meta.eql(node.block_root.bytes, graph.data.extra_data.head.block_root.bytes) or
+                !std.mem.eql(u8, node.payload_status, "full")) continue;
+            const verified = node.verified() catch continue;
+            if (full != null) return error.UnverifiedConsensusHead;
+            full = verified;
+        }
+        if (full) |head| return head;
+    }
+    return selected;
+}
+
+pub const EventKind = enum { head, execution_payload, payload_attributes };
+
+pub fn eventHint(a: std.mem.Allocator, kind: EventKind, json: []const u8) !?TargetHint {
+    switch (kind) {
+        .head => return null,
+        .execution_payload => {
+            const Event = struct { slot: []const u8, block_root: HexHash, block_hash: HexHash, execution_optimistic: bool = true };
+            const parsed = try std.json.parseFromSlice(Event, a, json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const event = parsed.value;
+            if (event.execution_optimistic) return error.UnverifiedConsensusHead;
+            return .{ .beacon_root = try nonzero(event.block_root.bytes), .execution_hash = try nonzero(event.block_hash.bytes), .slot = try std.fmt.parseInt(u64, event.slot, 10), .full_only = true };
+        },
+        .payload_attributes => {
+            const Event = struct { version: []const u8, data: struct { parent_block_root: HexHash, parent_block_hash: HexHash } };
+            const parsed = try std.json.parseFromSlice(Event, a, json, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const event = parsed.value;
+            if (!std.mem.eql(u8, event.version, "gloas") and !std.mem.eql(u8, event.version, "heze")) return error.PostGloasRequired;
+            return .{ .beacon_root = try nonzero(event.data.parent_block_root.bytes), .execution_hash = try nonzero(event.data.parent_block_hash.bytes) };
+        },
+    }
 }
 
 pub const Tracker = struct {
@@ -157,7 +234,8 @@ pub const Tracker = struct {
         log.info("trusted post-Gloas anchor: slot {} beacon {x} execution {x}", .{ checkpoint.slot, checkpoint.root, self.anchor.?.execution_hash });
     }
 
-    fn publishHead(self: *Tracker) !void {
+    fn publishHead(self: *Tracker, kind: EventKind, data: []const u8) !void {
+        const observed_at_ms: i64 = @intCast(std.Io.Clock.real.now(self.io).toMilliseconds());
         // Serialize lookups as well as publication: a slower reconciliation
         // response must not overwrite a newer event-triggered target.
         try self.publish_mutex.lock(self.io);
@@ -165,16 +243,17 @@ pub const Tracker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const head = try selectedHead(a, try self.timedGet(a, "/eth/v2/debug/fork_choice"));
+        const hint = try eventHint(a, kind, data);
+        const head = try targetHead(a, try self.timedGet(a, "/eth/v2/debug/fork_choice"), hint);
         if (self.latest_hash) |previous| if (std.meta.eql(previous, head.hash)) return;
-        try self.updates.putOne(self.io, .{ .anchor = self.anchor.?, .head = head, .observed_at_ms = @intCast(std.Io.Clock.real.now(self.io).toMilliseconds()) });
+        try self.updates.putOne(self.io, .{ .anchor = self.anchor.?, .head = head, .observed_at_ms = observed_at_ms });
         self.latest_hash = head.hash;
     }
 
     fn stream(self: *Tracker) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const url = try std.fmt.allocPrint(arena.allocator(), "{s}/eth/v1/events?topics=head_v2,head,execution_payload", .{self.url});
+        const url = try std.fmt.allocPrint(arena.allocator(), "{s}/eth/v1/events?topics=head_v2,head,execution_payload,payload_attributes", .{self.url});
         var request = try self.client.request(.GET, try std.Uri.parse(url), .{
             .redirect_behavior = .unhandled,
             .headers = .{ .accept_encoding = .{ .override = "identity" } },
@@ -187,7 +266,9 @@ pub const Tracker = struct {
         if (response.head.status != .ok) return error.ConsensusEventStreamUnavailable;
         var transfer: [8192]u8 = undefined;
         const reader = response.reader(&transfer);
-        var interesting = false;
+        var kind: ?EventKind = null;
+        var data = std.array_list.Managed(u8).init(self.allocator);
+        defer data.deinit();
         var frame_size: usize = 0;
         while (true) {
             const line = (reader.takeDelimiter('\n') catch |e| return requestError(&request, e)) orelse return error.EndOfStream;
@@ -195,15 +276,22 @@ pub const Tracker = struct {
             frame_size += line.len;
             const text = std.mem.trimEnd(u8, line, "\r");
             if (text.len == 0) {
-                if (interesting) self.publishHead() catch |e| {
+                if (kind) |event_kind| self.publishHead(event_kind, data.items) catch |e| {
                     if (e == error.Canceled) return e;
                     log.warn("head event lookup: {t}", .{e});
                 };
-                interesting = false;
+                kind = null;
+                data.clearRetainingCapacity();
                 frame_size = 0;
             } else if (std.mem.startsWith(u8, text, "event:")) {
                 const name = std.mem.trim(u8, text[6..], " ");
-                interesting = std.mem.eql(u8, name, "head_v2") or std.mem.eql(u8, name, "head") or std.mem.eql(u8, name, "execution_payload");
+                kind = if (std.mem.eql(u8, name, "head_v2") or std.mem.eql(u8, name, "head")) .head else std.meta.stringToEnum(EventKind, name);
+            } else if (std.mem.startsWith(u8, text, "data:")) {
+                // SSE permits multiple data lines; bound their aggregate too.
+                const value = std.mem.trimStart(u8, text[5..], " ");
+                if (data.items.len + value.len + 1 > 65536) return error.ConsensusEventTooLarge;
+                try data.appendSlice(value);
+                try data.append('\n');
             }
         }
     }
@@ -220,7 +308,7 @@ pub const Tracker = struct {
 
     fn reconcileLoop(self: *Tracker) !void {
         while (true) {
-            self.publishHead() catch |e| {
+            self.publishHead(.head, "") catch |e| {
                 if (e == error.Canceled) return e;
                 log.warn("head reconciliation: {t}", .{e});
             };
@@ -319,4 +407,48 @@ test "consensus tracker accepts only explicit trusted local endpoints" {
     }
     for ([_][]const u8{ "https://example.com", "http://example.com", "http://127.0.0.1@external.test", "http://user:password@localhost", "http://localhost?test", "http://localhost#test" }) |url|
         try std.testing.expectError(error.TrustedLocalBeaconRequired, Tracker.init(std.testing.io, a, url, &queue));
+}
+
+test "verified FULL state warms before EMPTY selection changes and hints bind exact parents" {
+    const a = std.testing.allocator;
+    const json = try testForkChoice(a, "empty");
+    defer a.free(json);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x22)), (try selectedHead(a, json)).hash);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x33)), (try targetHead(a, json, null)).hash);
+    const hint: TargetHint = .{ .beacon_root = @splat(0x11), .execution_hash = @splat(0x33), .slot = 124, .full_only = true };
+    try std.testing.expectEqual(@as([32]u8, @splat(0x33)), (try targetHead(a, json, hint)).hash);
+    var bad = hint;
+    bad.beacon_root = @splat(0x99);
+    try std.testing.expectError(error.UnavailableExecutionHead, targetHead(a, json, bad));
+    bad = hint;
+    bad.slot = 125;
+    try std.testing.expectError(error.UnverifiedConsensusHead, targetHead(a, json, bad));
+    bad = hint;
+    bad.execution_hash = @splat(0x22);
+    try std.testing.expectError(error.UnavailableExecutionHead, targetHead(a, json, bad));
+    bad.full_only = false;
+    try std.testing.expectEqual(@as([32]u8, @splat(0x22)), (try targetHead(a, json, bad)).hash);
+    // A verified EMPTY node must not make an optimistic FULL payload eligible.
+    const optimistic = try std.mem.replaceOwned(u8, a, json, "\"execution_block_hash\":\"" ++ test_payload ++ "\",\"extra_data\":{\"execution_optimistic\":false}", "\"execution_block_hash\":\"" ++ test_payload ++ "\",\"extra_data\":{\"execution_optimistic\":true}");
+    defer a.free(optimistic);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x22)), (try targetHead(a, optimistic, null)).hash);
+    try std.testing.expectError(error.UnverifiedConsensusHead, targetHead(a, optimistic, hint));
+}
+
+test "parent notifications reject optimistic payloads and pre-Gloas attributes" {
+    const a = std.testing.allocator;
+    const payload = "{\"slot\":\"124\",\"block_root\":\"" ++ test_root ++ "\",\"block_hash\":\"" ++ test_payload ++ "\",\"execution_optimistic\":false}";
+    const hint = (try eventHint(a, .execution_payload, payload)).?;
+    try std.testing.expect(hint.full_only);
+    try std.testing.expectEqual(@as(u64, 124), hint.slot.?);
+    const bad = try std.mem.replaceOwned(u8, a, payload, "false", "true");
+    defer a.free(bad);
+    try std.testing.expectError(error.UnverifiedConsensusHead, eventHint(a, .execution_payload, bad));
+    const attrs = "{\"version\":\"gloas\",\"data\":{\"parent_block_root\":\"" ++ test_root ++ "\",\"parent_block_hash\":\"" ++ test_parent ++ "\"}}";
+    const parent = (try eventHint(a, .payload_attributes, attrs)).?;
+    try std.testing.expect(!parent.full_only and parent.slot == null);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x22)), parent.execution_hash);
+    const old_fork = try std.mem.replaceOwned(u8, a, attrs, "gloas", "fulu");
+    defer a.free(old_fork);
+    try std.testing.expectError(error.PostGloasRequired, eventHint(a, .payload_attributes, old_fork));
 }

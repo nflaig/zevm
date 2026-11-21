@@ -16,7 +16,7 @@ class Beacon(http.server.ThreadingHTTPServer):
     def __init__(self, mode):
         super().__init__(("127.0.0.1", 0), Handler)
         self.mode = mode
-        self.phase = "full"
+        self.phase = "empty_pending" if mode == "warm" else "full"
         self.headers = self.streams = self.lookups = 0
 
 
@@ -35,8 +35,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass  # expected when the native two-second deadline cancels a request
 
-    def event(self, name="head_v2"):
-        self.wfile.write(f"event: {name}\ndata: {{}}\n\n".encode())
+    def event(self, name="head_v2", payload=None):
+        encoded = json.dumps(payload or {}, indent=2)
+        data = "\n".join(f"data: {line}" for line in encoded.splitlines())
+        self.wfile.write(f"event: {name}\n{data}\n\n".encode())
         self.wfile.flush()
 
     def do_GET(self):
@@ -55,10 +57,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/eth/v2/debug/fork_choice":
             s.lookups += 1
             phase = s.phase
-            status = "empty" if phase == "empty" else "full"
+            status = "empty" if phase.startswith("empty") else "full"
             full_hash = NEXT if phase == "next" else FULL
             nodes = [{"block_root": ROOT, "slot": "101", "payload_status": p, "validity": "valid",
-                      "execution_block_hash": h, "extra_data": {"execution_optimistic": phase == "optimistic"}}
+                      "execution_block_hash": h, "extra_data": {"execution_optimistic": phase == "optimistic" or
+                                                                 (phase == "empty_pending" and p == "full")}}
                      for p, h in (("empty", PARENT), ("full", full_hash))]
             return self.respond({"data": {"extra_data": {"head": {"block_root": ROOT, "payload_status": status}},
                                           "fork_choice_nodes": nodes}})
@@ -70,15 +73,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             try:
                 time.sleep(.8)
+                attrs = {"version": "gloas", "data": {"parent_block_root": ROOT, "parent_block_hash": PARENT}}
+                payload = {"slot": "101", "block_root": ROOT, "block_hash": FULL, "execution_optimistic": False}
+                if s.mode == "warm":
+                    # The verified payload arrives while canonical selection is
+                    # still EMPTY. Waiting for a FULL head event would time out.
+                    s.phase = "empty"
+                    self.event("execution_payload", payload)
+                    time.sleep(.3)
+                    self.event("payload_attributes", attrs)
+                    time.sleep(2)
                 if s.mode == "events":
                     if connection == 1:
                         s.phase = "empty"
-                        self.event()
+                        self.event("payload_attributes", attrs)
                         time.sleep(.3)
-                        self.event()  # duplicate notification must not duplicate the target
+                        self.event("payload_attributes", attrs)  # duplicate must not duplicate the target
                         time.sleep(.3)
                         s.phase = "optimistic"
-                        self.event("execution_payload")
+                        self.event("execution_payload", payload)
                         time.sleep(.3)
                         return  # exercise reconnect before the next valid FULL head
                     s.phase = "next"
@@ -115,6 +128,10 @@ def trial(probe, mode, count, deadline):
                 assert [row["executionHead"] for row in rows] == [FULL, PARENT, NEXT], rows
                 assert server.streams >= 2 and server.lookups >= 4
                 assert "UnverifiedConsensusHead" in run.stderr
+            if mode == "warm":
+                assert [row["executionHead"] for row in rows] == [PARENT, FULL, PARENT], rows
+                assert elapsed < 3, elapsed
+                assert server.phase == "empty"  # no selected-FULL event was emitted
             if mode == "timeout":
                 assert server.headers >= 2 and elapsed >= 3 and "ConsensusTimeout" in run.stderr
         return {"scenario": mode, "passed": True, "seconds": elapsed,
@@ -130,7 +147,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--probe", required=True)
     args = parser.parse_args()
-    for mode, count, deadline in (("events", 3, 10), ("timeout", 1, 9), ("unfinalized", 1, 3)):
+    for mode, count, deadline in (("warm", 3, 5), ("events", 3, 10), ("timeout", 1, 9), ("unfinalized", 1, 3)):
         print(json.dumps(trial(args.probe, mode, count, deadline)), flush=True)
 
 

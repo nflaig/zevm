@@ -76,11 +76,22 @@ No state is advertised before account, storage and code verification completes.
 The anchor is persisted in the same transaction as the branch base. A peer-only
 database cannot silently become a consensus-anchored one: use a fresh directory.
 
-After bootstrap, `head_v2`, `head` and `execution_payload` SSE events trigger a
-read of Lodestar's `/eth/v2/debug/fork_choice`. The selected node is matched by
-**both beacon root and FULL/EMPTY status** and must be valid and non-optimistic.
-An identical beacon root can identify different execution parents. Five-second
-reconciliation repairs missed events; SSE reconnects after one second. Ordinary
+After bootstrap, `head_v2`, `head`, `execution_payload` and `payload_attributes`
+SSE events trigger a read of Lodestar's `/eth/v2/debug/fork_choice`. Execution
+payload notifications warm their exact FULL hash immediately, before the beacon's
+timeliness decision selects FULL. Payload attributes request their exact parent.
+Both hints must match a **valid, non-optimistic node with the same beacon root
+and execution hash**; payload notifications also bind the slot and FULL status.
+The earlier `execution_payload_available` event is deliberately not used: its
+payload has not yet passed execution validation.
+
+For head notifications and reconciliation, the selected node is matched by both
+beacon root and FULL/EMPTY status. If it is EMPTY but that same beacon block has
+a verified FULL variant, warm FULL while retaining the EMPTY parent. This is a
+read-only cache policy, not a change to canonical forkchoice. Requests for a
+retained parent reuse its immutable view without rewinding the writer. A new
+uncached branch still requires header linkage, bounded undo and root checks.
+Five-second reconciliation repairs missed events; SSE reconnects after one second. Ordinary
 HTTP lookups have a two-second timeout and a 4 MiB body limit. Only explicit
 loopback HTTP endpoints are allowed, and redirects are not followed.
 
@@ -89,13 +100,14 @@ header by hash, and fences obsolete header results with a generation. Existing
 BAL work completes against its original selected branch before any rewind.
 Header/BAL responses advance the pipeline immediately instead of waiting for the
 one-second recovery tick. `shadow consensus ready` logs the time from the
-tracker's observation to a verified selected checkpoint; this is not transaction
+tracker's observation, including lookup time, to a verified retained view; this is not transaction
 arrival latency or a proposer deadline measurement.
 
 Current limits: the finalized bootstrap pivot stays fixed until complete; an
 interrupted initial sync requires a new directory; recovery is bounded by retained
-undo history; this is tracking the CL-selected branch, not independently building
-every FULL/EMPTY/ancestor alternative. It depends on Lodestar's debug V2 API, not
+undo history; only eight recent views are retained and one writer processes
+targets at a time, so arbitrary FULL/EMPTY/ancestor coverage is not guaranteed.
+It depends on Lodestar's debug V2 API, not
 a standardized Engine forkchoice implementation.
 
 Before production adoption, qualify independent live sync, restart/corruption,
@@ -109,5 +121,9 @@ State application returned `Reorg` and the process exited. The captured headers
 are now a regression fixture: a disconnected height extension is rejected before
 selection changes. Tests also cover ancestor rewind, an alternate branch, database
 reopen, retention limits, corruption, allocation failures and retained read
-leases. Live downloader recovery and continuous exact-parent availability still
-need separate qualification; these tests alone do not authorize production use.
+leases. The repaired downloader subsequently survived a live depth-one reorg and
+passed authenticated reads afterward. The first selected-head tracker was slower:
+an event capture showed verified execution payloads arriving 4.7–6.2 seconds before
+FULL selection. This motivated immediate verified-payload warming. Continuous
+exact-parent availability still needs separate qualification; these tests alone
+do not authorize production use.

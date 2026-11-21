@@ -98,6 +98,11 @@ pub const Snapshots = struct {
         headers: [capacity]types.BlockHeader = undefined,
         versions: [capacity]u64 = undefined,
         count: usize = 0,
+
+        pub fn find(self: *const Status, hash: [32]u8) ?types.BlockHeader {
+            for (self.headers[0..self.count]) |header| if (std.meta.eql(header.hash(), hash)) return header;
+            return null;
+        }
     };
 
     pub fn status(self: *Snapshots) Status {

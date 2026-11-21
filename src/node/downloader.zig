@@ -699,7 +699,10 @@ pub const Downloader = struct {
 
     fn advanceConsensusTarget(self: *Self) !void {
         const desired = self.desiredConsensusHash() orelse return;
-        const already_selected = self.consensus_anchor != null and std.meta.eql(self.syncTarget().hash, desired);
+        // A builder can ask for EMPTY while the writer has warmed FULL. The
+        // immutable parent view already serves that request: do not rewind it.
+        const already_selected = self.consensus_anchor != null and
+            (std.meta.eql(self.syncTarget().hash, desired) or self.shadow_snapshots.?.status().find(desired) != null);
         if (self.consensus_probe) |pending| {
             if (!already_selected and std.meta.eql(pending, desired)) return;
             self.cancelHeaderRequests(.consensus);
@@ -731,6 +734,7 @@ pub const Downloader = struct {
         if (header.block_access_list_hash == null or header.slot_number == null) return error.PostGloasRequired;
         self.free_eth_requests.push(req);
         self.consensus_probe = null;
+        if (self.consensus_anchor != null and self.shadow_snapshots.?.status().find(expected) != null) return;
 
         if (self.consensus_anchor == null) {
             const anchor = self.consensus_update.?.anchor;
@@ -790,11 +794,11 @@ pub const Downloader = struct {
         if (self.state_heal != null) try self.advanceStateHeal();
         const update = self.consensus_update orelse return;
         const status = self.shadow_snapshots.?.status();
-        if (status.count == 0 or !std.meta.eql(status.headers[0].hash(), update.head.hash)) return;
+        const ready = status.find(update.head.hash) orelse return;
         if (self.consensus_reported) |reported| if (std.meta.eql(reported, update.head.hash)) return;
         self.consensus_reported = update.head.hash;
         log.info("shadow consensus ready: slot {} execution {} hash {x} observed_age_ms {}", .{
-            update.head.slot,                                                        status.headers[0].number, update.head.hash,
+            update.head.slot,                                                        ready.number, update.head.hash,
             std.Io.Clock.real.now(self.io).toMilliseconds() - update.observed_at_ms,
         });
     }
@@ -2391,6 +2395,61 @@ test "shadow superseded consensus lookup cannot replace the newly selected targe
     try downloader.handleHeaders(req, error.StaleResponseMustNotBeConsumed);
     try std.testing.expectEqual(req, downloader.free_eth_requests.pop().?);
     try std.testing.expectEqual(null, downloader.consensus_probe);
+}
+
+test "retained EMPTY parent cancels obsolete probes without rewinding warmed FULL state" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.createDir(io, "db", .default_dir);
+    var path: [1024]u8 = undefined;
+    const length = try dir.dir.realPathFile(io, "db", &path);
+    var store = try kv.Store.initBounded(a, path[0..length], 64 << 20, 1 << 20);
+    defer store.deinit() catch unreachable;
+    var snapshots: snapshots_db.Snapshots = .{ .io = io, .store = &store };
+    defer snapshots.deinit();
+    var parent = @import("blockchain.zig").glamsterdam_devnet8_config.genesis_header;
+    parent.number = 1;
+    var full = parent;
+    full.number = 2;
+    full.parent_hash = parent.hash();
+    for ([_]types.BlockHeader{ parent, full }) |header| {
+        const txn = try store.transaction_rw();
+        errdefer txn.abort() catch unreachable;
+        try snapshots_db.writeCheckpoint(&store, txn, a, header);
+        try txn.commit();
+        try snapshots.publish(a);
+    }
+    var pool = try List(Request(eth.Message)).init(a, 1);
+    defer pool.deinit(a);
+    const obsolete = pool.pop().?;
+    obsolete.header_purpose = .consensus;
+    obsolete.msg = .{ .get_block_headers = .{ .range = .{ .origin = .{ .hash = @splat(9) }, .amount = 1, .skip = 0, .reverse = true } } };
+    // No peer provider or writable blockchain is installed. Serving a retained
+    // parent must neither request a header nor touch the active writer branch.
+    var downloader: Downloader = undefined;
+    downloader.io = io;
+    downloader.shadow_snapshots = &snapshots;
+    downloader.consensus_anchor = .{ .beacon_root = @splat(8), .execution_hash = parent.hash(), .slot = 100 };
+    downloader.consensus_update = .{ .anchor = downloader.consensus_anchor.?, .head = .{ .hash = parent.hash(), .slot = 101 }, .observed_at_ms = 0 };
+    downloader.consensus_probe = @splat(9);
+    downloader.sync_target_mutex = .init;
+    downloader.sync_target = .{ .number = full.number, .hash = full.hash(), .cutoff_number = full.number, .cutoff_hash = full.hash() };
+    downloader.header_generation = 42;
+    downloader.inflight_eth_requests = .{};
+    downloader.pending_eth_requests = .{};
+    downloader.free_eth_requests = .{};
+    downloader.inflight_eth_requests.push(obsolete);
+    try downloader.advanceConsensusTarget();
+    try std.testing.expectEqual(null, downloader.consensus_probe);
+    try std.testing.expectEqual(obsolete, downloader.free_eth_requests.pop().?);
+    try std.testing.expectEqual(@as(u64, 42), downloader.header_generation);
+    try std.testing.expectEqual(full.hash(), downloader.sync_target.hash);
+    try std.testing.expectEqual(full.hash(), snapshots.status().headers[0].hash());
+    const old = try snapshots.acquire(parent.hash(), parent.state_root);
+    defer old.deinit();
+    try std.testing.expectEqual(parent.hash(), old.header.hash());
 }
 
 test "shadow cancellation preserves in-validation ownership and BAL requests" {
