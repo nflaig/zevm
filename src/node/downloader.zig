@@ -43,6 +43,7 @@ pub const Downloader = struct {
     bc: *Blockchain,
     eth_db: *EthDb,
     shadow_snapshots: ?*@import("../db/snapshot.zig").Snapshots = null,
+    pending_bootstrap: ?types.BlockHeader = null,
     consensus_updates: ?*std.Io.Queue(consensus.Update) = null,
     consensus_update: ?consensus.Update = null,
     consensus_anchor: ?consensus.Anchor = null,
@@ -630,9 +631,9 @@ pub const Downloader = struct {
     }
 
     /// Shadow mode resumes the committed state checkpoint, never the header
-    /// head. A partial initial sync has no checkpoint and must start in a fresh
-    /// directory; silently interpreting those flat tables as complete is unsafe.
-    pub fn enableShadow(self: *Self, snapshots: *@import("../db/snapshot.zig").Snapshots) !void {
+    /// head. Only a persisted fixed consensus anchor authorizes restarting an
+    /// incomplete bootstrap. Partial flat tables never become readable views.
+    pub fn enableShadow(self: *Self, snapshots: *@import("../db/snapshot.zig").Snapshots, restart_bootstrap: bool) !void {
         const txn = try self.eth_db.kv_store.transaction_rw();
         var committed = false;
         defer if (!committed) txn.abort() catch unreachable;
@@ -654,25 +655,55 @@ pub const Downloader = struct {
             try snapshots.publish(self.allocator);
             const head = try self.bc.head();
             self.sync_target = .{ .number = head.number, .hash = head.hash, .cutoff_number = head.number, .cutoff_hash = head.hash };
-        } else if (try branches.state(self.eth_db.kv_store, txn) != null or (try self.bc.head()).number != 0)
-            return error.IncompleteStateCheckpoint;
+        } else if (try branches.state(self.eth_db.kv_store, txn) != null) {
+            if (!restart_bootstrap) return error.IncompleteStateCheckpoint;
+            const anchor = try self.readConsensusAnchor(txn, arena.allocator()) orelse return error.IncompleteStateCheckpoint;
+            const header = try @import("../db/bootstrap.zig").restart(self.eth_db.kv_store, txn, arena.allocator(), anchor.execution_hash);
+            if (header.slot_number.? > anchor.slot) return error.BootstrapBranchMismatch;
+            try txn.commit();
+            committed = true;
+            self.pending_bootstrap = header;
+            log.info("shadow restarting incomplete bootstrap at fixed anchor {} hash {x}; no state view published", .{ header.number, header.hash() });
+        } else if ((try self.bc.head()).number != 0) return error.IncompleteStateCheckpoint;
         self.shadow_snapshots = snapshots;
+    }
+
+    fn readConsensusAnchor(self: *Self, txn: kv.Transaction, allocator: std.mem.Allocator) !?consensus.Anchor {
+        const encoded = try self.eth_db.kv_store.table(txn, .state_meta).get("consensus-anchor-v1") orelse return null;
+        var anchor: consensus.Anchor = undefined;
+        if (encoded.len > 256 or try rlp.deserialize(consensus.Anchor, allocator, encoded, &anchor) != encoded.len)
+            return error.InvalidConsensusAnchor;
+        return anchor;
     }
 
     pub fn enableConsensus(self: *Self, updates: *std.Io.Queue(consensus.Update)) !void {
         const snapshots = self.shadow_snapshots orelse return error.ShadowStateRequired;
         const txn = try self.eth_db.kv_store.transaction_ro();
         defer txn.abort() catch unreachable;
-        if (try self.eth_db.kv_store.table(txn, .state_meta).get("consensus-anchor-v1")) |encoded| {
-            var arena = std.heap.ArenaAllocator.init(self.allocator);
-            defer arena.deinit();
-            var anchor: consensus.Anchor = undefined;
-            if (encoded.len > 256 or try rlp.deserialize(consensus.Anchor, arena.allocator(), encoded, &anchor) != encoded.len)
-                return error.InvalidConsensusAnchor;
-            if (snapshots.status().count == 0) return error.IncompleteStateCheckpoint;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        if (try self.readConsensusAnchor(txn, arena.allocator())) |anchor| {
+            if (snapshots.status().count == 0) {
+                const header = self.pending_bootstrap orelse return error.IncompleteStateCheckpoint;
+                if (!std.meta.eql(header.hash(), anchor.execution_hash)) return error.BootstrapBranchMismatch;
+            }
             self.consensus_anchor = anchor;
         } else if (snapshots.status().count != 0) return error.UnanchoredStateCheckpoint;
         self.consensus_updates = updates;
+        if (self.pending_bootstrap) |header| {
+            try self.startBootstrap(header);
+            self.pending_bootstrap = null;
+        }
+    }
+
+    fn startBootstrap(self: *Self, header: types.BlockHeader) !void {
+        self.bc.shadow_branches.store(true, .release);
+        self.sync_target_mutex.lockUncancelable(self.io);
+        self.sync_target = .{ .number = header.number, .hash = header.hash(), .cutoff_number = header.number, .cutoff_hash = header.hash() };
+        self.sync_target_mutex.unlock(self.io);
+        self.state = .{ .pivot = header };
+        try self.state.?.code_hashes.ensureTotalCapacity(std.heap.page_allocator, expected_code_count);
+        self.requestAccountRange(self.free_snap_requests.pop() orelse return error.NoFreeRequest, header.state_root, 0, std.math.maxInt(u256));
     }
 
     fn desiredConsensusHash(self: *Self) ?[32]u8 {
@@ -753,13 +784,7 @@ pub const Downloader = struct {
             try branches.initialize(store, txn, allocator, header);
             try txn.commit();
             self.consensus_anchor = anchor;
-            self.bc.shadow_branches.store(true, .release);
-            self.sync_target_mutex.lockUncancelable(self.io);
-            self.sync_target = .{ .number = header.number, .hash = expected, .cutoff_number = header.number, .cutoff_hash = expected };
-            self.sync_target_mutex.unlock(self.io);
-            self.state = .{ .pivot = header };
-            try self.state.?.code_hashes.ensureTotalCapacity(std.heap.page_allocator, expected_code_count);
-            self.requestAccountRange(self.free_snap_requests.pop() orelse return error.NoFreeRequest, header.state_root, 0, std.math.maxInt(u256));
+            try self.startBootstrap(header);
             log.info("shadow anchored bootstrap: beacon slot {}, execution {} hash {x}", .{ anchor.slot, header.number, expected });
         } else {
             try self.selectConsensusTarget(header);

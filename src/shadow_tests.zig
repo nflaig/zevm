@@ -14,6 +14,7 @@ const a = std.testing.allocator;
 const undo = @import("db/undo.zig");
 const branches = @import("db/branches.zig");
 const keccak256 = @import("evm/crypto/hash.zig").keccak256;
+const bootstrap = @import("db/bootstrap.zig");
 
 test {
     _ = @import("node/consensus.zig");
@@ -23,6 +24,76 @@ const queries = [_]Shadow.Query{
     .{ .address = .{ .bytes = @splat(0x11) }, .storageKeys = &.{ .init(0), .init(1), .init(2), .init(99) } },
     .{ .address = .{ .bytes = @splat(0xee) }, .storageKeys = &.{.init(0)} },
 };
+
+fn prepareIncompleteBootstrap(fixture: *Fixture) !types.BlockHeader {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var header = try fixture.write(10, 123, false);
+    header.slot_number = 20;
+    header.block_access_list_hash = @splat(0x44);
+    const txn = try fixture.store.transaction_rw();
+    errdefer txn.abort() catch unreachable;
+    try branches.initialize(&fixture.store, txn, arena.allocator(), header);
+    try txn.commit();
+    return header;
+}
+
+test "shadow incomplete bootstrap reset is atomic and never publishes partial state" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const header = try prepareIncompleteBootstrap(&fixture);
+    const key = types.keccakOfU160(std.mem.readInt(u160, &queries[0].address.bytes, .big));
+    const old = try fixture.store.transaction_ro();
+    defer old.abort() catch unreachable;
+    try std.testing.expect((try fixture.store.table(old, .accounts).get(&key)) != null);
+    const cancelled = try fixture.store.transaction_rw();
+    _ = try bootstrap.restart(&fixture.store, cancelled, a, header.hash());
+    try std.testing.expect((try fixture.store.table(cancelled, .accounts).get(&key)) == null);
+    try cancelled.abort();
+    const resumed = try fixture.store.transaction_rw();
+    try std.testing.expect((try fixture.store.table(resumed, .accounts).get(&key)) != null);
+    try std.testing.expectEqual(header.hash(), (try bootstrap.restart(&fixture.store, resumed, a, header.hash())).hash());
+    try resumed.commit();
+    const latest = try fixture.store.transaction_ro();
+    defer latest.abort() catch unreachable;
+    try std.testing.expect((try fixture.store.table(latest, .accounts).get(&key)) == null);
+    try std.testing.expect((try fixture.store.table(old, .accounts).get(&key)) != null);
+    try std.testing.expectEqual(null, try snapshots.readCheckpoint(&fixture.store, latest, a));
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &fixture.store };
+    defer views.deinit();
+    try std.testing.expectError(error.StateNotReady, views.publish(a));
+    try std.testing.expectEqual(0, views.status().count);
+    try std.testing.expectError(error.StateViewUnavailable, views.acquire(header.hash(), header.state_root));
+}
+
+test "shadow bootstrap reset rejects wrong anchors and never clears verified state" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const header = try prepareIncompleteBootstrap(&fixture);
+    const key = types.keccakOfU160(std.mem.readInt(u160, &queries[0].address.bytes, .big));
+    const txn = try fixture.store.transaction_rw();
+    defer txn.abort() catch unreachable;
+    try std.testing.expectError(error.BootstrapBranchMismatch, bootstrap.restart(&fixture.store, txn, a, @splat(0x55)));
+    try std.testing.expect((try fixture.store.table(txn, .accounts).get(&key)) != null);
+    try snapshots.writeCheckpoint(&fixture.store, txn, a, header);
+    try std.testing.expectError(error.StateAlreadyVerified, bootstrap.restart(&fixture.store, txn, a, header.hash()));
+    try std.testing.expect((try fixture.store.table(txn, .accounts).get(&key)) != null);
+}
+
+test "shadow bootstrap reset rejects a progressed branch without a checkpoint" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const header = try prepareIncompleteBootstrap(&fixture);
+    var child = header;
+    child.number += 1;
+    child.parent_hash = header.hash();
+    const txn = try fixture.store.transaction_rw();
+    defer txn.abort() catch unreachable;
+    try branches.select(&fixture.store, txn, arena.allocator(), header, &.{child});
+    try std.testing.expectError(error.BootstrapBranchMismatch, bootstrap.restart(&fixture.store, txn, a, child.hash()));
+}
 
 const Fixture = struct {
     dir: std.testing.TmpDir,

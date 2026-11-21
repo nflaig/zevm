@@ -138,8 +138,18 @@ one-second recovery tick. `shadow consensus ready` logs the time from the
 tracker's observation, including lookup time, to a verified retained view; this is not transaction
 arrival latency or a proposer deadline measurement.
 
-Current limits: the finalized bootstrap pivot stays fixed until complete; an
-interrupted initial sync requires a new directory; recovery is bounded by retained
+An interrupted bootstrap with a persisted trusted consensus anchor restarts
+automatically in the same directory when `--shadow-beacon-url` is supplied.
+It clears only unverified account/storage/code/trie tables, in one transaction,
+and repeats the full scan of that same fixed anchor. Ordered append ingestion
+cannot safely resume into partially populated tables. No state view is published
+until full root hashing and code download finish. A verified checkpoint is never
+cleared; missing/mismatched anchor metadata still fails closed. The database tests
+cover reset commit/abort, wrong anchors, progressed branches and preserving a
+verified checkpoint (77 shadow tests and 81 general tests in Debug and safe).
+
+Current limits: the finalized bootstrap pivot stays fixed until complete; peers
+must still serve its state after an interruption. Recovery is bounded by retained
 undo history; only eight recent views are retained and one writer processes
 targets at a time, so arbitrary FULL/EMPTY/ancestor coverage is not guaranteed.
 It depends on Lodestar's debug V2 API, not

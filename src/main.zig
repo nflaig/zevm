@@ -52,7 +52,7 @@ const params = clap.parseParamsComptime(
     \\    --authrpc-jwtsecret <str> Path to the hex-encoded JWT secret; created if missing (default: <datadir>/jwt.hex).
     \\    --metrics-addr <str>  Prometheus metrics HTTP listening address (default: 127.0.0.1).
     \\    --metrics-port <u16>  Prometheus metrics HTTP listening port (default: 6060).
-    \\    --shadow-state        Enable exact-parent state witness qualification (fresh datadir required).
+    \\    --shadow-state        Enable exact-parent state witness qualification.
     \\    --shadow-beacon-url <str> Follow a trusted local post-Gloas beacon node (requires --shadow-state).
     \\
 );
@@ -242,7 +242,7 @@ fn runNode(init: std.process.Init, opts: Options) !void {
 
     var snapshots: Snapshots = .{ .io = init.io, .store = &store };
     defer snapshots.deinit();
-    if (opts.shadow_state) try downloader.enableShadow(&snapshots);
+    if (opts.shadow_state) try downloader.enableShadow(&snapshots, opts.shadow_beacon_url != null);
     var shadow_api: ShadowApi = .{ .snapshots = &snapshots, .eth = &eth_db };
 
     var consensus_buffer: [4]consensus.Update = undefined;
