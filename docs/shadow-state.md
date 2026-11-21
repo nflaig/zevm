@@ -9,6 +9,8 @@ Build with Zig 0.17.0:
 ```sh
 zig build zevm test-shadow-state -Doptimize=safe -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3
 zig build test-shadow-state -Doptimize=debug
+zig build shadow-crash-probe -Doptimize=safe
+python3 test/shadow_crash_test.py --probe ./zig-out/bin/shadow-crash-probe
 ```
 
 Start in a fresh, dedicated directory with `--shadow-state`, independent peer
@@ -160,3 +162,11 @@ an event capture showed verified execution payloads arriving 4.7–6.2 seconds b
 FULL selection. This motivated immediate verified-payload warming. Continuous
 exact-parent availability still needs separate qualification; these tests alone
 do not authorize production use.
+
+The dedicated crash probe uses a temporary MDBX environment and real account
+trie/checkpoint/branch writes. The driver sends SIGKILL while those writes are
+uncommitted, then repeats immediately after commit. A fresh process authenticates
+the surviving account against the checkpoint root and checks that selected header,
+account nonce and balance agree. Both cases pass in Debug and safe mode and run
+in CI. This qualifies process-crash boundaries, not host power-loss durability or
+all live downloader failure timing.

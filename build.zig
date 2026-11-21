@@ -256,6 +256,18 @@ pub fn build(b: *std.Build) void {
     b.step("test-shadow-state", "Qualify exact-parent shadow state snapshots and authenticated reads")
         .dependOn(&b.addRunArtifact(shadow_tests).step);
 
+    const crash_probe = b.addExecutable(.{
+        .name = "shadow-crash-probe",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/shadow_crash_probe.zig"), .target = target, .optimize = optimize }),
+        .use_llvm = true,
+    });
+    crash_probe.root_module.link_libcpp = true;
+    crash_probe.root_module.addOptions("build_options", native_opts);
+    linkDeps(crash_probe.root_module, deps, .native);
+    crash_probe.root_module.addImport("lmdbx", mdbx_dep.module("lmdbx"));
+    b.step("shadow-crash-probe", "Build the isolated state-commit SIGKILL qualification target")
+        .dependOn(&b.addInstallArtifact(crash_probe, .{}).step);
+
     const consensus_probe = b.addExecutable(.{
         .name = "consensus-probe",
         .root_module = b.createModule(.{
