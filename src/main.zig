@@ -33,6 +33,20 @@ const consensus = @import("node/consensus.zig");
 const public_intake = @import("node/public_intake.zig");
 const public_intake_peer = @import("node/public_intake_peer.zig");
 
+// A combined constructor imports this node module once. Re-exporting the
+// owner's types avoids compiling a second, nominally distinct MDBX/state graph.
+pub const NativeState = @import("native_state.zig");
+pub const PublicHandoff = @import("node/public_handoff.zig");
+pub const PublicIntake = public_intake;
+pub const Consensus = consensus;
+pub const BuilderOptions = struct {
+    chain_id: u64,
+    fee_recipient: u160,
+    blobs: bool,
+    output_dir: ?[]const u8,
+    every_slots: u16 = 1,
+};
+
 pub const std_options: std.Options = .{
     .log_level = .info,
     .logFn = @import("log.zig").timestamped,
@@ -57,6 +71,11 @@ const params = clap.parseParamsComptime(
     \\    --shadow-state        Enable exact-parent state witness qualification.
     \\    --shadow-beacon-url <str> Follow a trusted local post-Gloas beacon node (requires --shadow-state).
     \\    --public-intake-observer Observe independent public transaction hashes/times (requires --shadow-state; never feeds construction).
+    \\    --native-builder       Run an embedded shadow constructor (requires a combined binary and trusted beacon; never publishes bids).
+    \\    --native-builder-fee-recipient <str> Explicit execution fee recipient for shadow construction.
+    \\    --native-builder-blobs Enable verified live blob intake in the embedded constructor.
+    \\    --native-builder-output-dir <str> Existing directory for bounded rotating qualification payloads.
+    \\    --native-builder-every-slots <u16> Shadow duty: admit only slots divisible by this number (1..64; default 1).
     \\
 );
 
@@ -79,6 +98,11 @@ const Options = struct {
     shadow_state: bool,
     shadow_beacon_url: ?[]const u8,
     public_intake_observer: bool,
+    native_builder: bool,
+    builder_fee_recipient: u160,
+    builder_blobs: bool,
+    builder_output_dir: ?[]const u8,
+    builder_every_slots: u16,
 
     fn parse(init: std.process.Init) !?Options {
         var diag = clap.Diagnostic{};
@@ -106,7 +130,25 @@ const Options = struct {
             return error.ShadowStateRequired;
         if (res.args.@"public-intake-observer" != 0 and res.args.@"shadow-state" == 0)
             return error.ShadowStateRequired;
+        const native_builder = res.args.@"native-builder" != 0;
+        if (native_builder and (res.args.@"shadow-state" == 0 or res.args.@"shadow-beacon-url" == null))
+            return error.NativeBuilderRequiresTrustedState;
+        if (!native_builder and (res.args.@"native-builder-fee-recipient" != null or
+            res.args.@"native-builder-blobs" != 0 or res.args.@"native-builder-output-dir" != null or res.args.@"native-builder-every-slots" != null))
+            return error.NativeBuilderRequired;
+        const every_slots = res.args.@"native-builder-every-slots" orelse 1;
+        if (every_slots == 0 or every_slots > 64) return error.InvalidBuilderDuty;
+        const fee_recipient = if (res.args.@"native-builder-fee-recipient") |value| blk: {
+            if (value.len != 42 or !std.mem.startsWith(u8, value, "0x")) return error.InvalidBuilderFeeRecipient;
+            break :blk try std.fmt.parseInt(u160, value[2..], 16);
+        } else 0;
+        if (native_builder and fee_recipient == 0) return error.ExplicitBuilderFeeRecipientRequired;
         return .{
+            .native_builder = native_builder,
+            .builder_fee_recipient = fee_recipient,
+            .builder_blobs = res.args.@"native-builder-blobs" != 0,
+            .builder_output_dir = res.args.@"native-builder-output-dir",
+            .builder_every_slots = every_slots,
             .shadow_state = res.args.@"shadow-state" != 0,
             .shadow_beacon_url = res.args.@"shadow-beacon-url",
             .public_intake_observer = res.args.@"public-intake-observer" != 0,
@@ -149,19 +191,33 @@ fn openDataSubdir(io: std.Io, allocator: std.mem.Allocator, datadir: std.Io.Dir,
 }
 
 pub fn main(init: std.process.Init) !void {
+    return mainWithBuilder(init, void);
+}
+
+/// Builder is a specialized native adapter, not an RPC service. Its callbacks
+/// copy bounded inputs; its own joined task owns construction and intake drain.
+pub fn mainWithBuilder(init: std.process.Init, comptime Builder: type) !void {
     var shutdown = try Shutdown.init();
     defer shutdown.deinit(init.io);
 
     const opts = try Options.parse(init) orelse return;
+    if (comptime Builder == void) {
+        if (opts.native_builder) return error.NativeBuilderNotLinked;
+    }
 
     const Event = union(enum) {
-        node: @typeInfo(@TypeOf(runNode)).@"fn".return_type.?,
+        node: anyerror!void,
         signal: @typeInfo(@TypeOf(Shutdown.wait)).@"fn".return_type.?,
     };
     var buf: [2]Event = undefined;
     var select: std.Io.Select(Event) = .init(init.io, &buf);
     defer select.cancelDiscard();
-    try select.concurrent(.node, runNode, .{ init, opts });
+    const Runner = struct {
+        fn run(state: std.process.Init, options: Options) anyerror!void {
+            return runNode(state, options, Builder);
+        }
+    };
+    try select.concurrent(.node, Runner.run, .{ init, opts });
     try select.concurrent(.signal, Shutdown.wait, .{ &shutdown, init.io });
 
     switch (try select.await()) {
@@ -174,7 +230,7 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn runNode(init: std.process.Init, opts: Options) !void {
+fn runNode(init: std.process.Init, opts: Options, comptime Builder: type) !void {
     const kp = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256.KeyPair.generate(init.io);
 
     var slabs = SlabAllocator.init(init.arena.allocator());
@@ -248,12 +304,28 @@ fn runNode(init: std.process.Init, opts: Options) !void {
     );
 
     var snapshots: Snapshots = .{ .io = init.io, .store = &store };
+    defer snapshots.deinit();
+    var builder: ?*Builder = null;
+    if (comptime Builder != void) {
+        if (opts.native_builder) builder = try Builder.create(init.gpa, init.io, &eth_db, &snapshots, .{
+            .chain_id = opts.config.chain_id,
+            .fee_recipient = opts.builder_fee_recipient,
+            .blobs = opts.builder_blobs,
+            .output_dir = opts.builder_output_dir,
+            .every_slots = opts.builder_every_slots,
+        });
+    }
+    defer if (comptime Builder != void) {
+        if (builder) |value| value.deinit();
+    };
     var public_observer: public_intake_peer.Observer = .{ .io = init.io };
     var public_source: public_intake.Intake = .{ .allocator = init.gpa, .chain_id = opts.config.chain_id, .sink = public_observer.sink() };
     defer public_source.deinit();
+    if (comptime Builder != void) {
+        if (builder) |value| public_source.sink = public_intake.handoffSink(value.sink());
+    }
     var public_driver: public_intake_peer.Driver = .{ .source = &public_source, .provider = &ethproto };
-    if (opts.public_intake_observer) downloader.public_intake = &public_driver;
-    defer snapshots.deinit();
+    if (opts.public_intake_observer or opts.native_builder) downloader.public_intake = &public_driver;
     if (opts.shadow_state) try downloader.enableShadow(&snapshots, opts.shadow_beacon_url != null);
     var shadow_api: ShadowApi = .{ .snapshots = &snapshots, .eth = &eth_db };
     defer shadow_api.deinit(); // RPC futures below are cancelled and joined first.
@@ -265,6 +337,9 @@ fn runNode(init: std.process.Init, opts: Options) !void {
     else
         null;
     defer if (tracker) |*t| t.deinit();
+    if (comptime Builder != void) {
+        if (builder) |value| tracker.?.attributes_sink = value.attributesSink();
+    }
     var tracker_thread: ?std.Io.Future(@typeInfo(@TypeOf(consensus.Tracker.run)).@"fn".return_type.?) = null;
     if (tracker) |*t| {
         try downloader.enableConsensus(&consensus_updates);
@@ -300,5 +375,22 @@ fn runNode(init: std.process.Init, opts: Options) !void {
     var authrpc_thread = try init.io.concurrent(RpcHttpServer.run, .{&authrpc_http});
     defer authrpc_thread.cancel(init.io) catch {};
 
+    if (comptime Builder != void) {
+        if (builder) |value| {
+            // Observe both owners. A failed builder must not leave a seemingly
+            // healthy sync process with silently stopped construction. Cancellation
+            // joins both tasks before tracker callbacks and owner storage retire.
+            const Event = union(enum) { sync: anyerror!void, builder: anyerror!void };
+            var events: [2]Event = undefined;
+            var tasks: std.Io.Select(Event) = .init(init.io, &events);
+            defer tasks.cancelDiscard();
+            try tasks.concurrent(.sync, Downloader.run, .{&downloader});
+            try tasks.concurrent(.builder, Builder.run, .{value});
+            return switch (try tasks.await()) {
+                .sync => |result| result,
+                .builder => |result| result,
+            };
+        }
+    }
     try downloader.run();
 }

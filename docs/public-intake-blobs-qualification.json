@@ -1,0 +1,168 @@
+{
+  "scope": "Optional ETH/71 blob request, owned handoff and real KZG qualification; no deployment or production bid readiness claim",
+  "date": "2026-11-22",
+  "toolchain": "Zig 0.17.0",
+  "target": "x86_64-linux-gnu.2.35",
+  "cpu": "baseline+cx16",
+  "sourceSha256": {
+    "zevm/src/node/public_handoff.zig": "c8571542993415d1ef80b5cab336739b2b463aa0d37d57140f330e9d3a47fcd0",
+    "zevm/src/node/public_blob.zig": "29ffaf63d2806675fdb69a730ad8aac062703bf67e9465ce781e796cf6904e6a",
+    "zevm/src/node/public_intake.zig": "1fbe8482809e61c7ee326bf4dd30d3740a8a16a0571e414d378511f1de448a4d",
+    "zevm/src/node/public_intake_peer.zig": "4c02642ed1f81690c1bd26d074d032f9d60d681676a7c414badcd546c0ba6db9",
+    "zbuilder/src/native_intake.zig": "51cdb138121e9adc66dbd6f6b9bbd2222c174a3febd9b618d09a6146442cd3be",
+    "zbuilder/native-node/peer_blobs.zig": "96e330b3534dab5e0c32138ffed004db92a24078ab028da3cd552d5cfaade35d"
+  },
+  "checks": [
+    {
+      "manifest": "eth71-zevm-debug-final-r1.json",
+      "manifestSha256": "7b171434332e8c327a69fa1017b764e17156cf4d6e2b341219cac6da02f68ecf",
+      "log": "eth71-zevm-debug-final-r1.log",
+      "logSha256": "41b62536424c7522229a81814d8fe8b2f777929af2172d4dcb12765e75a56bba",
+      "command": [
+        "/home/nico/debug/zig-payload-plan-20261011/qualification/toolchain/zig-x86_64-linux-0.17.0/zig",
+        "build",
+        "test",
+        "-Doptimize=debug",
+        "-Dtarget=x86_64-linux-gnu.2.35",
+        "-Dcpu=baseline+cx16",
+        "--cache-dir",
+        "/home/nico/debug/zevm-geth-retirement-20261121/zig-native-handoff-zevm-debug",
+        "--summary",
+        "all"
+      ],
+      "cwd": "/home/nico/debug/zevm-geth-retirement-20261121/zevm",
+      "exitCode": 0,
+      "passed": 126,
+      "total": 126,
+      "sourceUnchanged": true
+    },
+    {
+      "manifest": "eth71-zevm-safe-final-r1.json",
+      "manifestSha256": "58fff6a5bebf3d12b6716cd266c45d728ec17a2ee6833f2d139c310b96b81e7c",
+      "log": "eth71-zevm-safe-final-r1.log",
+      "logSha256": "52dc0dcc95c914b5d42cc7bb8c29b4036a36dbbda4379144615a204d95a33dab",
+      "command": [
+        "/home/nico/debug/zig-payload-plan-20261011/qualification/toolchain/zig-x86_64-linux-0.17.0/zig",
+        "build",
+        "test",
+        "-Doptimize=safe",
+        "-Dtarget=x86_64-linux-gnu.2.35",
+        "-Dcpu=baseline+cx16",
+        "--cache-dir",
+        "/home/nico/debug/zevm-geth-retirement-20261121/zig-eth71-zevm-safe",
+        "--summary",
+        "all"
+      ],
+      "cwd": "/home/nico/debug/zevm-geth-retirement-20261121/zevm",
+      "exitCode": 0,
+      "passed": 126,
+      "total": 126,
+      "sourceUnchanged": true
+    },
+    {
+      "manifest": "eth71-combined-debug-r2.json",
+      "manifestSha256": "0c9d702fb312352386235de89c667019ccc5456cd63f185306ccbeb0165935fa",
+      "log": "eth71-combined-debug-r2.log",
+      "logSha256": "100975ac17b756096c2c50ab17dc66d6e06d279153e7f1df79379ef8383f28d1",
+      "command": [
+        "/home/nico/debug/zig-payload-plan-20261011/qualification/toolchain/zig-x86_64-linux-0.17.0/zig",
+        "build",
+        "test",
+        "-Doptimize=debug",
+        "-Dtarget=x86_64-linux-gnu.2.35",
+        "-Dcpu=baseline+cx16",
+        "--cache-dir",
+        "/home/nico/debug/zevm-geth-retirement-20261121/zig-eth71-combined-debug",
+        "--summary",
+        "all"
+      ],
+      "cwd": "/home/nico/debug/zevm-geth-retirement-20261121/zbuilder/native-node",
+      "exitCode": 0,
+      "passed": 7,
+      "total": 7,
+      "sourceUnchanged": true
+    },
+    {
+      "manifest": "eth71-combined-safe-final-r1.json",
+      "manifestSha256": "5eac113cc330a9d0a85f7236a3fe08fa2e0b8bfb2a89e6c9613e6f0f976d822b",
+      "log": "eth71-combined-safe-final-r1.log",
+      "logSha256": "cbb130432ed4622e120725464192fe6c26b049390d606ac0cd6f329951f24d34",
+      "command": [
+        "/home/nico/debug/zig-payload-plan-20261011/qualification/toolchain/zig-x86_64-linux-0.17.0/zig",
+        "build",
+        "test",
+        "-Doptimize=safe",
+        "-Dtarget=x86_64-linux-gnu.2.35",
+        "-Dcpu=baseline+cx16",
+        "--cache-dir",
+        "/home/nico/debug/zevm-geth-retirement-20261121/zig-eth71-combined-safe",
+        "--summary",
+        "all"
+      ],
+      "cwd": "/home/nico/debug/zevm-geth-retirement-20261121/zbuilder/native-node",
+      "exitCode": 0,
+      "passed": 7,
+      "total": 7,
+      "sourceUnchanged": true
+    }
+  ],
+  "priorFailedAttempts": [
+    {
+      "log": "eth71-initial-debug-r1.log",
+      "reason": "Initial runtime if expression inferred comptime_int; fixed with usize limits."
+    },
+    {
+      "log": "eth71-combined-debug-r1.log",
+      "reason": "Duplicate generated MCL module identity before test execution; combined build now shares byte-identical MCL/BLST wrapper module instances only."
+    }
+  ],
+  "coreAssertions": [
+    "Observer without capable prewarmed blob sink defers blobs",
+    "Full ETH71 v1 wrapper hash/type/size/peer/id binding",
+    "At most6 blobs,128 proofs each,exact ordered commitments and hash binding",
+    "No asynchronous queue admission enters seen or ready before verification",
+    "Bad last blob KZG fails atomic6-blob readiness; alternate peer succeeds",
+    "Ordinary transaction progresses while blob verification pending",
+    "Owning queue backpressure permits paced retry from same peer",
+    "Malformed peer responses release intake reservations without disconnecting shared sync peers",
+    "Byte,inventory,request,signature,KZG and retention bounds remain finite",
+    "First ordinary type advertisement cannot bypass later blob inventory quota",
+    "Invalid chain,zero/high-s signatures,malformed/missing/extra sidecars and response rejection",
+    "Allocation failure and verifier timeout preserve ready-state absence",
+    "Native peer bytes have no Geth or RPC fallback"
+  ],
+  "limits": {
+    "pendingBlobs": 128,
+    "pendingBlobsPerFirstAdvertiser": 32,
+    "blobRequests": 2,
+    "blobTransactionsPerRequest": 1,
+    "verificationObservations": 4,
+    "blobRequestRatePerSecond": 2,
+    "blobRequestRatePerPeerPerSecond": 1,
+    "blobResponseBytesPerSecond": 2097152,
+    "blobResponseBytesPerPeerPerSecond": 1048576,
+    "maxWrapperBytes": 2097152,
+    "maxSignedBytes": 131072,
+    "requestLifetimeMs": 1500,
+    "pendingLifetimeMs": 10000,
+    "verificationObservationCeilingMs": 10000,
+    "nativeDefaultJobDeadlineMs": 1500,
+    "cryptoFixtureJobDeadlineMs": 10000
+  },
+  "caveats": [
+    "No live ETH71 peer acquisition measurement in this evidence",
+    "Combined crypto fixtures use zero polynomials and repeated blobs; prior native-intake fixture separately covers distinct ordered blobs",
+    "10s fixture ceiling does not qualify production1500ms deadline or actual throughput",
+    "Concurrent compilation/run timing is not a performance benchmark",
+    "KZG is cooperative between calls and not interruptible within C",
+    "Blob failed includes local deadline/work refusal,not necessarily peer fault",
+    "Blob request quota counts transactions; verification quota counts blobs,sustained6-blob traffic can lose bounded coverage",
+    "No claim of generic mempool coverage,fee gain,propagation,reveal/data-column success or mainnet readiness",
+    "ZeVM test logs include expected mailbox-full warnings; final process exit is0 and126/126 pass"
+  ],
+  "primarySources": [
+    "https://github.com/ethereum/devp2p/blob/0dfc043453940de2bec50ec7f0ebddc8741b485d/caps/eth.md",
+    "https://eips.ethereum.org/EIPS/eip-7594",
+    "https://github.com/ethereum/go-ethereum/blob/v1.16.7/core/types/transaction.go"
+  ]
+}

@@ -80,6 +80,9 @@ pub const Driver = struct {
             s.expired_requests,            s.frame_rate_drops, s.signature_rate_drops, s.peer_pending_drops, s.backoff_skips,             s.frame_refused_requests, s.signature_discarded_decoded,
             s.signature_unprocessed_items,
         });
+        log.info("public_blob_intake_stats requested={} queued={} ready={} failed={} sink_full={} inventory_drops={} request_rate_drops={} frame_rate_drops={}", .{
+            s.blob_requested, s.blob_queued, s.blob_ready, s.blob_failed, s.blob_sink_full, s.blob_inventory_drops, s.blob_request_rate_drops, s.blob_frame_rate_drops,
+        });
     }
 
     fn drain(self: *Driver, a: std.mem.Allocator, now: i64) void {
@@ -272,4 +275,49 @@ test "public intake driver drops refused responses without draining or penalizin
         try std.testing.expectEqual(16, provider.peers[0].info.load(.acquire).offset);
         try std.testing.expectEqual(16, provider.peers[1].info.load(.acquire).offset);
     }
+}
+
+test "malformed blob response cannot disconnect the shared state sync peer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var provider = try eth.Provider.init(a);
+    provider.peers[0].info.store(.{ .epoch = 1, .offset = 16 }, .release);
+    const Receiver = struct {
+        fn ordinary(_: *anyopaque, _: intake.Record) bool {
+            @panic("blob cannot enter ordinary sink");
+        }
+        fn available(_: *anyopaque) bool {
+            return true;
+        }
+        fn accept(_: *anyopaque, _: intake.Handoff.Transaction) bool {
+            @panic("malformed blob cannot reach owner");
+        }
+        fn status(_: *anyopaque, _: intake.Hash, _: i64) intake.Handoff.BlobStatus {
+            return .missing;
+        }
+    };
+    var context: u8 = 0;
+    var source: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = .{
+        .context = &context,
+        .accept = Receiver.ordinary,
+        .blobs = .{ .context = &context, .available = Receiver.available, .accept = Receiver.accept, .status = Receiver.status },
+    } };
+    defer source.deinit();
+    // One type-3 hash, advertised size 2. Its response carries bare 03 c0.
+    var announcement: [38]u8 = @splat(0);
+    @memcpy(announcement[0..6], &[_]u8{ 0xe5, 0x03, 0xc1, 0x02, 0xe1, 0xa0 });
+    try source.announce(a, .{ .index = 0, .epoch = 1 }, &announcement, 0);
+    _ = source.nextRequest(1, 0).?;
+    const payload = try a.dupe(u8, &.{ 0xc5, 0x01, 0xc3, 0x82, 0x03, 0xc0 });
+    var driver: Driver = .{ .source = &source, .provider = &provider };
+    driver.handle(a, .{ .msg = .{ .pooled_transactions = .{ .value = payload } }, .read = .{
+        .peer = .{ .peer_index = 0, .peer_epoch = 1 },
+        .id = 10,
+        .payload = payload,
+    } }, .{ .mono_ms = 1 });
+    try std.testing.expectEqual(1, driver.invalid);
+    try std.testing.expectEqual(16, provider.peers[0].info.load(.acquire).offset);
+    for (source.requests) |request| try std.testing.expect(request == null);
+    try std.testing.expectEqual(0, source.stats.blob_queued);
 }

@@ -25,6 +25,25 @@ pub const Anchor = struct { beacon_root: [32]u8, execution_hash: [32]u8, slot: u
 pub const Head = struct { hash: [32]u8, slot: u64 };
 pub const Update = struct { anchor: Anchor, head: Head, observed_at_ms: i64 };
 
+/// Borrowed only for accept(). This event's exact EL/beacon parent was matched
+/// to an execution-verified forkchoice node. It is a permitted branch target,
+/// not a claim that warm FULL is currently canonical. The sink must copy into a
+/// bounded mailbox and return; execution, state reads and KZG cannot run here.
+pub const AttributesEvent = struct {
+    json: []const u8,
+    parent: Head,
+    beacon_root: [32]u8,
+    received_wall_ms: i64,
+    received_mono_ms: i64,
+};
+pub const AttributesSink = struct {
+    context: *anyopaque,
+    accept: *const fn (*anyopaque, AttributesEvent) bool,
+    /// Invalidate queued authority after loss of the trusted feed/validation.
+    /// This only signals the owner; it must not wait for construction to stop.
+    invalidate: *const fn (*anyopaque) void,
+};
+
 pub const TargetHint = struct {
     beacon_root: [32]u8,
     execution_hash: [32]u8,
@@ -179,6 +198,7 @@ pub const Tracker = struct {
     anchor: ?Anchor = null,
     latest_hash: ?[32]u8 = null,
     publish_mutex: std.Io.Mutex = .init,
+    attributes_sink: ?AttributesSink = null,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, url: []const u8, updates: *std.Io.Queue(Update)) !Tracker {
         const uri = try std.Uri.parse(url);
@@ -236,6 +256,7 @@ pub const Tracker = struct {
 
     fn publishHead(self: *Tracker, kind: EventKind, data: []const u8) !void {
         const observed_at_ms: i64 = @intCast(std.Io.Clock.real.now(self.io).toMilliseconds());
+        const observed_mono_ms: i64 = @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds());
         // Serialize lookups as well as publication: a slower reconciliation
         // response must not overwrite a newer event-triggered target.
         try self.publish_mutex.lock(self.io);
@@ -245,9 +266,31 @@ pub const Tracker = struct {
         const a = arena.allocator();
         const hint = try eventHint(a, kind, data);
         const head = try targetHead(a, try self.timedGet(a, "/eth/v2/debug/fork_choice"), hint);
+        try self.publishVerified(kind, data, hint, head, observed_at_ms, observed_mono_ms);
+    }
+
+    fn publishVerified(self: *Tracker, kind: EventKind, data: []const u8, hint: ?TargetHint, head: Head, observed_at_ms: i64, observed_mono_ms: i64) !void {
+        // Attribute identity includes target slot, beacon parent and all fields.
+        // Repeated EL parents can describe distinct legitimate build requests.
+        // Deliver before the sync-target dedup and before any queue backpressure.
+        if (kind == .payload_attributes) if (self.attributes_sink) |sink| {
+            const wanted = hint orelse return error.UnverifiedConsensusHead;
+            if (!std.meta.eql(wanted.execution_hash, head.hash)) return error.UnverifiedConsensusHead;
+            if (!sink.accept(sink.context, .{
+                .json = data,
+                .parent = head,
+                .beacon_root = wanted.beacon_root,
+                .received_wall_ms = observed_at_ms,
+                .received_mono_ms = observed_mono_ms,
+            })) log.warn("native attribute mailbox full", .{});
+        };
         if (self.latest_hash) |previous| if (std.meta.eql(previous, head.hash)) return;
         try self.updates.putOne(self.io, .{ .anchor = self.anchor.?, .head = head, .observed_at_ms = observed_at_ms });
         self.latest_hash = head.hash;
+    }
+
+    fn invalidate(self: *Tracker) void {
+        if (self.attributes_sink) |sink| sink.invalidate(sink.context);
     }
 
     fn stream(self: *Tracker) !void {
@@ -278,6 +321,10 @@ pub const Tracker = struct {
             if (text.len == 0) {
                 if (kind) |event_kind| self.publishHead(event_kind, data.items) catch |e| {
                     if (e == error.Canceled) return e;
+                    // Reject only this uncertified target. An early FULL event
+                    // or transient lookup timeout does not revoke a previously
+                    // verified EMPTY/parent context. Stream loss invalidates the
+                    // feed below; every accepted request has a short deadline.
                     log.warn("head event lookup: {t}", .{e});
                 };
                 kind = null;
@@ -299,6 +346,7 @@ pub const Tracker = struct {
     fn streamLoop(self: *Tracker) !void {
         while (true) {
             self.stream() catch |e| {
+                self.invalidate();
                 if (e == error.Canceled) return e;
                 log.warn("event stream reconnect: {t}", .{e});
             };
@@ -451,4 +499,193 @@ test "parent notifications reject optimistic payloads and pre-Gloas attributes" 
     const old_fork = try std.mem.replaceOwned(u8, a, attrs, "gloas", "fulu");
     defer a.free(old_fork);
     try std.testing.expectError(error.PostGloasRequired, eventHint(a, .payload_attributes, old_fork));
+}
+
+const AttributesTestSink = struct {
+    const Copy = struct {
+        bytes: [1024]u8 = undefined,
+        len: usize = 0,
+        parent: Head = undefined,
+        beacon_root: [32]u8 = undefined,
+        wall_ms: i64 = 0,
+        mono_ms: i64 = 0,
+    };
+    copies: [4]Copy = undefined,
+    count: usize = 0,
+    accepting: bool = true,
+    invalidations: usize = 0,
+
+    fn sink(self: *AttributesTestSink) AttributesSink {
+        return .{ .context = self, .accept = accept, .invalidate = invalidate };
+    }
+
+    fn accept(context: *anyopaque, event: AttributesEvent) bool {
+        const self: *AttributesTestSink = @ptrCast(@alignCast(context));
+        std.debug.assert(self.count < self.copies.len and event.json.len <= 1024);
+        const copy = &self.copies[self.count];
+        copy.* = .{
+            .len = event.json.len,
+            .parent = event.parent,
+            .beacon_root = event.beacon_root,
+            .wall_ms = event.received_wall_ms,
+            .mono_ms = event.received_mono_ms,
+        };
+        @memcpy(copy.bytes[0..copy.len], event.json);
+        self.count += 1;
+        return self.accepting;
+    }
+
+    fn invalidate(context: *anyopaque) void {
+        const self: *AttributesTestSink = @ptrCast(@alignCast(context));
+        self.invalidations += 1;
+    }
+};
+
+const test_attributes = "{\"version\":\"gloas\",\"data\":{\"proposal_slot\":\"125\",\"parent_block_root\":\"" ++ test_root ++ "\",\"parent_block_hash\":\"" ++ test_parent ++ "\"}}";
+const test_anchor: Anchor = .{ .beacon_root = @splat(0x44), .execution_hash = @splat(0x55), .slot = 120 };
+
+test "consensus attributes repeat on the same parent before sync dedup with exact receipt stamps" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var buffer: [1]Update = undefined;
+    var queue: std.Io.Queue(Update) = .init(&buffer);
+    var tracker = try Tracker.init(io, a, "http://127.0.0.1:9596", &queue);
+    defer tracker.deinit();
+    tracker.anchor = test_anchor;
+    var sink: AttributesTestSink = .{};
+    tracker.attributes_sink = sink.sink();
+    const graph = try testForkChoice(a, "empty");
+    defer a.free(graph);
+    const hint = try eventHint(a, .payload_attributes, test_attributes);
+    const head = try targetHead(a, graph, hint);
+    const wall: i64 = 1795357860123;
+    const mono: i64 = 490123;
+    try tracker.publishVerified(.payload_attributes, test_attributes, hint, head, wall, mono);
+
+    // Closing the now-full sync queue makes this a bounded regression: each
+    // later attribute must still reach the sink but must not enqueue a target.
+    queue.close(io);
+    const next_slot = try std.mem.replaceOwned(u8, a, test_attributes, "125", "126");
+    defer a.free(next_slot);
+    try tracker.publishVerified(.payload_attributes, next_slot, hint, head, wall + 12000, mono + 12000);
+    try tracker.publishVerified(.payload_attributes, next_slot, hint, head, wall + 12007, mono + 12007);
+    try std.testing.expectEqual(@as(usize, 3), sink.count);
+    for (sink.copies[0..sink.count], 0..) |copy, i| {
+        const expected = if (i == 0) test_attributes else next_slot;
+        try std.testing.expectEqualStrings(expected, copy.bytes[0..copy.len]);
+        try std.testing.expectEqualDeep(head, copy.parent);
+        try std.testing.expectEqual(hint.?.beacon_root, copy.beacon_root);
+        const delta: i64 = if (i == 0) 0 else if (i == 1) 12000 else 12007;
+        try std.testing.expectEqual(wall + delta, copy.wall_ms);
+        try std.testing.expectEqual(mono + delta, copy.mono_ms);
+    }
+    const update = try queue.getOne(io);
+    try std.testing.expectEqualDeep(test_anchor, update.anchor);
+    try std.testing.expectEqualDeep(head, update.head);
+    try std.testing.expectEqual(wall, update.observed_at_ms);
+    try std.testing.expectError(error.Closed, queue.getOne(io));
+    try std.testing.expectEqual(head.hash, tracker.latest_hash.?);
+}
+
+test "declined attribute delivery preserves sync updates and same-parent dedup" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var buffer: [2]Update = undefined;
+    var queue: std.Io.Queue(Update) = .init(&buffer);
+    var tracker = try Tracker.init(io, a, "http://localhost:9596", &queue);
+    defer tracker.deinit();
+    tracker.anchor = test_anchor;
+    var sink: AttributesTestSink = .{ .accepting = false };
+    tracker.attributes_sink = sink.sink();
+    const graph = try testForkChoice(a, "empty");
+    defer a.free(graph);
+    const empty_hint = try eventHint(a, .payload_attributes, test_attributes);
+    const empty = try targetHead(a, graph, empty_hint);
+    try tracker.publishVerified(.payload_attributes, test_attributes, empty_hint, empty, 101, 51);
+    const full_json = try std.mem.replaceOwned(u8, a, test_attributes, test_parent, test_payload);
+    defer a.free(full_json);
+    const full_hint = try eventHint(a, .payload_attributes, full_json);
+    const full = try targetHead(a, graph, full_hint);
+    try tracker.publishVerified(.payload_attributes, full_json, full_hint, full, 102, 52);
+    queue.close(io);
+    try tracker.publishVerified(.payload_attributes, full_json, full_hint, full, 103, 53);
+
+    try std.testing.expectEqual(@as(usize, 3), sink.count);
+    const first = try queue.getOne(io);
+    const second = try queue.getOne(io);
+    try std.testing.expectEqualDeep(empty, first.head);
+    try std.testing.expectEqualDeep(full, second.head);
+    try std.testing.expectEqual(@as(i64, 101), first.observed_at_ms);
+    try std.testing.expectEqual(@as(i64, 102), second.observed_at_ms);
+    try std.testing.expectError(error.Closed, queue.getOne(io));
+    try std.testing.expectEqual(full.hash, tracker.latest_hash.?);
+}
+
+test "unbound or mismatched verified attributes never reach the sink or change sync target" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var buffer: [1]Update = undefined;
+    var queue: std.Io.Queue(Update) = .init(&buffer);
+    queue.close(io);
+    var tracker = try Tracker.init(io, a, "http://localhost:9596", &queue);
+    defer tracker.deinit();
+    tracker.anchor = test_anchor;
+    var sink: AttributesTestSink = .{};
+    tracker.attributes_sink = sink.sink();
+    const head: Head = .{ .hash = @splat(0x22), .slot = 124 };
+    tracker.latest_hash = head.hash;
+    try std.testing.expectError(error.UnverifiedConsensusHead, tracker.publishVerified(.payload_attributes, test_attributes, null, head, 1, 2));
+    var hint = (try eventHint(a, .payload_attributes, test_attributes)).?;
+    hint.execution_hash = @splat(0x99);
+    try std.testing.expectError(error.UnverifiedConsensusHead, tracker.publishVerified(.payload_attributes, test_attributes, hint, head, 1, 2));
+    try std.testing.expectEqual(@as(usize, 0), sink.count);
+    try std.testing.expectEqual(head.hash, tracker.latest_hash.?);
+    try std.testing.expectError(error.Closed, queue.getOne(io));
+}
+
+test "consensus attribute invalidation is optional and independent of sync state" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var buffer: [1]Update = undefined;
+    var queue: std.Io.Queue(Update) = .init(&buffer);
+    var tracker = try Tracker.init(io, a, "http://localhost:9596", &queue);
+    defer tracker.deinit();
+    tracker.anchor = test_anchor;
+    tracker.invalidate(); // The default node has no constructor callback.
+    var sink: AttributesTestSink = .{};
+    tracker.attributes_sink = sink.sink();
+    const hint = try eventHint(a, .payload_attributes, test_attributes);
+    const head: Head = .{ .hash = hint.?.execution_hash, .slot = 124 };
+    try tracker.publishVerified(.payload_attributes, test_attributes, hint, head, 9, 4);
+    queue.close(io);
+    tracker.invalidate();
+    tracker.invalidate();
+    try std.testing.expectEqual(@as(usize, 2), sink.invalidations);
+    try std.testing.expectEqual(@as(usize, 1), sink.count);
+    try std.testing.expectEqual(head.hash, tracker.latest_hash.?);
+    try std.testing.expectEqualDeep(head, (try queue.getOne(io)).head);
+    try std.testing.expectError(error.Closed, queue.getOne(io));
+    // A renewed verified event reaches the sink even if the sync target stayed
+    // unchanged across invalidation. Host generation admission owns its policy.
+    try tracker.publishVerified(.payload_attributes, test_attributes, hint, head, 10, 5);
+    try std.testing.expectEqual(@as(usize, 2), sink.count);
+}
+
+test "ordinary consensus head notifications never enter the attribute sink" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var buffer: [1]Update = undefined;
+    var queue: std.Io.Queue(Update) = .init(&buffer);
+    var tracker = try Tracker.init(io, a, "http://localhost:9596", &queue);
+    defer tracker.deinit();
+    tracker.anchor = test_anchor;
+    var sink: AttributesTestSink = .{};
+    tracker.attributes_sink = sink.sink();
+    const head: Head = .{ .hash = @splat(0x33), .slot = 124 };
+    try tracker.publishVerified(.head, "", null, head, 1, 2);
+    queue.close(io);
+    try tracker.publishVerified(.execution_payload, "opaque payload event", null, head, 3, 4);
+    try std.testing.expectEqual(@as(usize, 0), sink.count);
+    try std.testing.expectEqualDeep(head, (try queue.getOne(io)).head);
+    try std.testing.expectError(error.Closed, queue.getOne(io));
 }

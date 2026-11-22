@@ -4,13 +4,14 @@
 //! drives this object; it neither serves transactions nor knows private orders.
 //! The sink borrows canonical bytes and decoded fields only during accept().
 //! State-dependent eligibility, replacement and block selection belong to the
-//! builder. Blob announcements are deliberately deferred until a sidecar source
-//! can authenticate availability: a bare blob transaction is never ready input.
+//! builder. Blob requests require an optional prewarmed owning verifier. A copied
+//! wrapper is pending, never ready until that verifier authenticates all sidecars.
 const std = @import("std");
 const rlp = @import("rlp");
 const types = @import("../types.zig");
 const processor = @import("../processor/processor.zig");
 const hash = @import("../evm/crypto/hash.zig").keccak256;
+const BlobWire = @import("public_blob.zig");
 
 pub const Hash = [32]u8;
 pub const Peer = struct { index: usize, epoch: usize };
@@ -21,8 +22,14 @@ pub const max_peer_slots = 64;
 pub const max_requests = 16;
 pub const max_request_hashes = 64;
 pub const max_broadcast_transactions = 256;
-pub const max_tx_bytes = 128 * 1024;
-pub const max_message_bytes = 2 * 1024 * 1024;
+pub const max_tx_bytes: usize = 128 * 1024;
+pub const max_message_bytes: usize = 2 * 1024 * 1024;
+pub const max_blob_requests = 2;
+pub const max_blob_verifications = 4;
+pub const max_pending_blobs = 128;
+pub const max_pending_blobs_per_peer = 32;
+const verification_timeout_ms = 10000;
+const blob_retry_ms = 250;
 const max_seen = 8192;
 const request_timeout_ms = 1500;
 const pending_lifetime_ms = 10000;
@@ -49,6 +56,8 @@ const PeerWork = struct {
     frames: Bucket = .{},
     bytes: Bucket = .{},
     signatures: Bucket = .{},
+    blob_bytes: Bucket = .{},
+    blob_requests: Bucket = .{},
     retry_after_ms: i64 = 0,
     timeouts: u8 = 0,
 };
@@ -69,12 +78,19 @@ pub const Sink = struct {
     context: *anyopaque,
     /// Return false under backpressure. No borrowed field may survive this call.
     accept: *const fn (*anyopaque, Record) bool,
+    status: ?*const fn (*anyopaque, Hash, i64) Handoff.AdmissionStatus = null,
+    blobs: ?Handoff.BlobSink = null,
 };
 pub const Handoff = @import("public_handoff.zig");
 /// Adapt the validated peer sink to engine-independent fields. The Handoff.Sink
 /// owner must outlive Intake; no decoded transaction or frame borrow escapes.
 pub fn handoffSink(target: *Handoff.Sink) Sink {
-    return .{ .context = target, .accept = struct {
+    return .{ .context = target, .blobs = target.blobs, .status = if (target.status != null) struct {
+        fn status(ctx: *anyopaque, tx_hash: Hash, now: i64) Handoff.AdmissionStatus {
+            const sink: *Handoff.Sink = @ptrCast(@alignCast(ctx));
+            return sink.status.?(sink.context, tx_hash, now);
+        }
+    }.status else null, .accept = struct {
         fn accept(ctx: *anyopaque, record: Record) bool {
             const sink: *Handoff.Sink = @ptrCast(@alignCast(ctx));
             return sink.accept(sink.context, .{
@@ -95,6 +111,7 @@ pub const Request = struct {
     announced: [max_request_hashes]struct { kind: u8, size: u32, at_ms: i64 } = undefined,
     count: usize = 0,
     deadline_ms: i64,
+    blob: bool = false,
 };
 const Advertisement = struct { peer: Peer, kind: u8, size: u32 };
 const Pending = struct {
@@ -103,7 +120,13 @@ const Pending = struct {
     expires_ms: i64,
     peers: [2]?Advertisement = .{ null, null },
     requested: ?u64 = null,
+    blob: bool = false,
+    blob_owner_index: usize = 0,
+    verifying: bool = false,
+    retry_after_ms: i64 = 0,
+    retry_advertisement: ?Advertisement = null,
 };
+const Verification = struct { hash: Hash, deadline_ms: i64 };
 pub const Stats = struct {
     announced: u64 = 0,
     duplicate: u64 = 0,
@@ -122,6 +145,14 @@ pub const Stats = struct {
     signature_unprocessed_items: u64 = 0,
     peer_pending_drops: u64 = 0,
     backoff_skips: u64 = 0,
+    blob_inventory_drops: u64 = 0,
+    blob_requested: u64 = 0,
+    blob_queued: u64 = 0,
+    blob_ready: u64 = 0,
+    blob_failed: u64 = 0,
+    blob_sink_full: u64 = 0,
+    blob_request_rate_drops: u64 = 0,
+    blob_frame_rate_drops: u64 = 0,
 };
 
 pub const Intake = struct {
@@ -135,6 +166,9 @@ pub const Intake = struct {
     byte_budget: Bucket = .{},
     frame_budget: Bucket = .{},
     signature_budget: Bucket = .{},
+    blob_byte_budget: Bucket = .{},
+    blob_request_budget: Bucket = .{},
+    verifications: [max_blob_verifications]?Verification = @splat(null),
     peer_work: [max_peer_slots]PeerWork = @splat(.{}),
 
     pub fn deinit(self: *Intake) void {
@@ -158,31 +192,53 @@ pub const Intake = struct {
             if (kind <= 4 and size == 0) return error.AnnouncementSize;
         }
         var owned: usize = 0;
+        var blob_owned: usize = 0;
+        var blob_total: usize = 0;
         for (self.pending.values()) |entry| {
             if (entry.owner_index == peer.index) owned += 1;
+            if (entry.blob) {
+                blob_total += 1;
+                if (entry.blob_owner_index == peer.index) blob_owned += 1;
+            }
         }
+        const blobs_available = self.blobsAvailable();
         for (msg.kinds, msg.sizes.slice(), msg.hashes.slice()) |kind, size, tx_hash| {
             self.stats.announced += 1;
-            if (kind == 3) {
+            if (kind == 3 and !blobs_available) {
                 self.stats.deferred_blobs += 1;
                 continue;
             }
-            if (kind > 4 or size > max_tx_bytes) {
+            if (kind > 4 or size > (if (kind == 3) BlobWire.max_wrapper_bytes else max_tx_bytes)) {
                 self.stats.unsupported += 1;
                 continue;
             }
-            if (self.seen.get(tx_hash)) |until| {
-                if (now < until) {
-                    self.stats.duplicate += 1;
-                    continue;
-                }
-                _ = self.seen.swapRemove(tx_hash);
+            if (self.known(tx_hash, now)) {
+                self.stats.duplicate += 1;
+                continue;
             }
             if (self.pending.getPtr(tx_hash)) |entry| {
                 // Bind metadata to its advertiser: a dishonest first peer must
                 // not poison a correct announcement from another peer.
+                // A first ordinary claim cannot bypass blob inventory quotas
+                // when another peer subsequently announces that hash as type 3.
+                if (kind == 3 and !entry.blob) {
+                    if (blob_total >= max_pending_blobs or blob_owned >= max_pending_blobs_per_peer) {
+                        self.stats.blob_inventory_drops += 1;
+                        self.stats.bounded_drops += 1;
+                        continue;
+                    }
+                    entry.blob = true;
+                    entry.blob_owner_index = peer.index;
+                    blob_owned += 1;
+                    blob_total += 1;
+                }
                 addPeer(entry, .{ .peer = peer, .kind = kind, .size = size });
                 self.stats.duplicate += 1;
+                continue;
+            }
+            if (kind == 3 and (blob_total >= max_pending_blobs or blob_owned >= max_pending_blobs_per_peer)) {
+                self.stats.blob_inventory_drops += 1;
+                self.stats.bounded_drops += 1;
                 continue;
             }
             if (self.pending.count() >= max_pending) {
@@ -196,11 +252,17 @@ pub const Intake = struct {
             }
             try self.pending.put(self.allocator, tx_hash, .{
                 .owner_index = peer.index,
+                .blob = kind == 3,
+                .blob_owner_index = peer.index,
                 .first_seen_ms = now,
                 .expires_ms = now +| pending_lifetime_ms,
                 .peers = .{ .{ .peer = peer, .kind = kind, .size = size }, null },
             });
             owned += 1;
+            if (kind == 3) {
+                blob_owned += 1;
+                blob_total += 1;
+            }
         }
     }
 
@@ -217,31 +279,51 @@ pub const Intake = struct {
             }
         }
         const slot = free orelse return null;
-        for (self.pending.values()) |entry| {
-            if (entry.requested != null or now >= entry.expires_ms) continue;
-            for (entry.peers) |optional_peer| {
-                const peer = (optional_peer orelse continue).peer;
-                if (now < self.peer_work[peer.index].retry_after_ms) {
-                    self.stats.backoff_skips += 1;
-                    continue;
+        var blob_outstanding: usize = 0;
+        var verifying: usize = 0;
+        for (self.requests) |request| if (request) |req| {
+            if (req.blob) blob_outstanding += 1;
+        };
+        for (self.verifications) |item| if (item != null) {
+            verifying += 1;
+        };
+        // Ordinary inventory is always considered first. Blob requests reserve
+        // their own two slots/work credits and never batch with ordinary txs.
+        for ([_]bool{ false, true }) |blob| {
+            if (blob and (!self.blobsAvailable() or blob_outstanding >= max_blob_requests or
+                verifying + blob_outstanding >= max_blob_verifications)) continue;
+            for (self.pending.values()) |entry| {
+                if (entry.requested != null or entry.verifying or now >= entry.expires_ms or now < entry.retry_after_ms) continue;
+                for (entry.peers) |optional_peer| {
+                    const advertisement = optional_peer orelse continue;
+                    if ((advertisement.kind == 3) != blob) continue;
+                    const peer = advertisement.peer;
+                    if (now < self.peer_work[peer.index].retry_after_ms) {
+                        self.stats.backoff_skips += 1;
+                        continue;
+                    }
+                    if (self.peerBusy(peer)) continue;
+                    if (blob and !self.reserveBlobRequest(peer, now)) continue;
+                    var request: Request = .{ .id = id, .peer = peer, .deadline_ms = now +| request_timeout_ms, .blob = blob };
+                    var bytes: usize = 0;
+                    for (self.pending.keys(), self.pending.values()) |tx_hash, *candidate| {
+                        if (candidate.requested != null or candidate.verifying or now >= candidate.expires_ms or now < candidate.retry_after_ms) continue;
+                        const item = getAdvertisement(candidate, peer) orelse continue;
+                        if ((item.kind == 3) != blob) continue;
+                        if (request.count == (if (blob) @as(usize, 1) else max_request_hashes) or bytes + item.size > max_message_bytes) break;
+                        request.hashes[request.count] = tx_hash;
+                        request.announced[request.count] = .{ .kind = item.kind, .size = item.size, .at_ms = candidate.first_seen_ms };
+                        request.count += 1;
+                        bytes += item.size;
+                        candidate.requested = id;
+                        removePeer(candidate, peer);
+                    }
+                    std.debug.assert(request.count != 0);
+                    self.requests[slot] = request;
+                    self.stats.requested += request.count;
+                    if (blob) self.stats.blob_requested += 1;
+                    return request;
                 }
-                if (self.peerBusy(peer)) continue;
-                var request: Request = .{ .id = id, .peer = peer, .deadline_ms = now +| request_timeout_ms };
-                var bytes: usize = 0;
-                for (self.pending.keys(), self.pending.values()) |tx_hash, *candidate| {
-                    if (candidate.requested != null or now >= candidate.expires_ms) continue;
-                    const advertisement = getAdvertisement(candidate, peer) orelse continue;
-                    if (request.count == max_request_hashes or bytes + advertisement.size > max_message_bytes) break;
-                    request.hashes[request.count] = tx_hash;
-                    request.announced[request.count] = .{ .kind = advertisement.kind, .size = advertisement.size, .at_ms = candidate.first_seen_ms };
-                    request.count += 1;
-                    bytes += advertisement.size;
-                    candidate.requested = id;
-                    removePeer(candidate, peer);
-                }
-                self.requests[slot] = request;
-                self.stats.requested += request.count;
-                return request;
             }
         }
         return null;
@@ -262,7 +344,8 @@ pub const Intake = struct {
     /// remain eligible after this request releases its reservation.
     pub fn response(self: *Intake, a: std.mem.Allocator, peer: Peer, raw: []const u8, receipt: ReceiptTime) !void {
         const now = receipt.mono_ms;
-        self.reserveFrame(peer, raw.len, now) catch |err| {
+        const expected_blob = if (self.peerRequest(peer)) |slot| self.requests[slot].?.blob else false;
+        self.reserveFrameClass(peer, raw.len, now, expected_blob) catch |err| {
             if (err == error.FrameRateLimit) {
                 // We deliberately shed this reply. Do not later charge its
                 // responder a timeout/backoff for our local admission refusal.
@@ -287,6 +370,7 @@ pub const Intake = struct {
         defer self.release(slot);
         if (now >= request.deadline_ms) return error.ExpiredResponse;
         if (msg.transactions.count > request.count) return error.ResponseCountLimit;
+        if (request.blob) return self.blobResponse(a, request, msg.transactions.slice(), receipt);
         var records: [max_request_hashes]Record = undefined;
         var record_count: usize = 0;
         var cursor: usize = 0;
@@ -355,24 +439,131 @@ pub const Intake = struct {
         for (records[0..count]) |record| try self.deliver(record, now);
     }
 
-    fn known(self: *const Intake, tx_hash: Hash, now: i64) bool {
-        return now < (self.seen.get(tx_hash) orelse return false);
+    fn known(self: *Intake, tx_hash: Hash, now: i64) bool {
+        const until = self.seen.get(tx_hash) orelse return false;
+        if (now < until) {
+            // Query only this previously delivered hash. Never walk the seen
+            // table or run validation on the peer/sync thread. Observers without
+            // an owning status callback retain the existing suppression policy.
+            const status = self.sink.status orelse return true;
+            if (status(self.sink.context, tx_hash, now) != .missing) return true;
+        }
+        _ = self.seen.swapRemove(tx_hash);
+        return false;
+    }
+
+    fn blobsAvailable(self: *const Intake) bool {
+        const sink = self.sink.blobs orelse return false;
+        return sink.available(sink.context);
+    }
+
+    fn reserveBlobRequest(self: *Intake, peer: Peer, now: i64) bool {
+        const local = &self.peer_work[peer.index].blob_requests;
+        self.blob_request_budget.replenish(now, 2, 2);
+        local.replenish(now, 1, 1);
+        if (self.blob_request_budget.milli_tokens < 1000 or local.milli_tokens < 1000) {
+            self.stats.blob_request_rate_drops += 1;
+            return false;
+        }
+        self.blob_request_budget.milli_tokens -= 1000;
+        local.milli_tokens -= 1000;
+        return true;
+    }
+
+    fn blobResponse(self: *Intake, a: std.mem.Allocator, request: Request, items: []const rlp.RawValue, receipt: ReceiptTime) !void {
+        std.debug.assert(request.count == 1);
+        // Empty responses are normal evictions. release() retains another peer.
+        if (items.len == 0) return;
+        const bytes = try pooledBytes(a, items[0].value, BlobWire.max_wrapper_bytes);
+        const frame = try BlobWire.parse(bytes);
+        if (!std.mem.eql(u8, &frame.hash, &request.hashes[0])) return error.UnrequestedTransaction;
+        if (bytes.len != request.announced[0].size) return error.AnnouncementMismatch;
+        if (self.known(frame.hash, receipt.mono_ms)) {
+            self.stats.duplicate += 1;
+            return;
+        }
+        // Hash/shape/size are checked before signature work or owning copies.
+        try self.reserveSignature(request.peer, receipt.mono_ms);
+        const canonical = try frame.canonical(a);
+        _ = try decodeSigned(a, self.chain_id, request.peer, canonical, request.announced[0].at_ms, receipt.mono_ms);
+        self.stats.decoded += 1;
+        const sink = self.sink.blobs orelse return error.BlobSinkUnavailable;
+        var free: ?usize = null;
+        for (self.verifications, 0..) |item, i| if (item == null) {
+            free = i;
+            break;
+        };
+        if (free == null or !sink.available(sink.context) or !sink.accept(sink.context, .{
+            .hash = frame.hash,
+            .bytes = bytes,
+            .peer = .{ .index = request.peer.index, .epoch = request.peer.epoch },
+            .announced_at_ms = request.announced[0].at_ms,
+            .received_at_ms = receipt.mono_ms,
+            .frame_received_wall_ms = receipt.wall_ms,
+        })) {
+            self.stats.blob_sink_full += 1;
+            // The peer supplied its response correctly; preserve its metadata
+            // after request release and pace a bounded retry under local load.
+            if (self.pending.getPtr(frame.hash)) |entry| {
+                entry.retry_after_ms = receipt.mono_ms +| blob_retry_ms;
+                entry.retry_advertisement = .{ .peer = request.peer, .kind = 3, .size = request.announced[0].size };
+            }
+            return;
+        }
+        self.verifications[free.?] = .{ .hash = frame.hash, .deadline_ms = receipt.mono_ms +| verification_timeout_ms };
+        if (self.pending.getPtr(frame.hash)) |entry| entry.verifying = true;
+        self.stats.blob_queued += 1;
+        self.peer_work[request.peer.index].timeouts = 0;
+        self.peer_work[request.peer.index].retry_after_ms = 0;
+    }
+
+    /// Poll only four copied jobs, never run signature/KZG work here. A failed
+    /// job does not enter seen, so another advertiser can supply the same hash.
+    pub fn pollBlobResults(self: *Intake, now: i64) void {
+        const sink = self.sink.blobs orelse return;
+        for (&self.verifications) |*optional| {
+            const item = optional.* orelse continue;
+            const status = sink.status(sink.context, item.hash, now);
+            if (status == .pending and now < item.deadline_ms) continue;
+            if (status == .ready) {
+                self.seen.ensureUnusedCapacity(self.allocator, 1) catch {
+                    self.stats.bounded_drops += 1;
+                    continue;
+                };
+                if (self.seen.count() == max_seen) self.seen.swapRemoveAt(0);
+                self.seen.putAssumeCapacity(item.hash, now +| seen_lifetime_ms);
+                _ = self.pending.swapRemove(item.hash);
+                self.stats.blob_ready += 1;
+            } else {
+                if (self.pending.getPtr(item.hash)) |entry| {
+                    entry.verifying = false;
+                    entry.retry_after_ms = now +| blob_retry_ms;
+                }
+                self.stats.blob_failed += 1;
+            }
+            optional.* = null;
+        }
     }
 
     fn reserveFrame(self: *Intake, peer: Peer, bytes: usize, now: i64) !void {
+        return self.reserveFrameClass(peer, bytes, now, false);
+    }
+    fn reserveFrameClass(self: *Intake, peer: Peer, bytes: usize, now: i64, blob: bool) !void {
         if (peer.index >= max_peer_slots) return error.PeerSlotLimit;
-        const local = &self.peer_work[peer.index].bytes;
+        const local = if (blob) &self.peer_work[peer.index].blob_bytes else &self.peer_work[peer.index].bytes;
+        const global = if (blob) &self.blob_byte_budget else &self.byte_budget;
         const local_frames = &self.peer_work[peer.index].frames;
-        self.byte_budget.replenish(now, 4 * 1024 * 1024, 4 * 1024 * 1024);
+        global.replenish(now, if (blob) 2 * 1024 * 1024 else 4 * 1024 * 1024, if (blob) max_message_bytes + 1024 else 4 * 1024 * 1024);
         local.replenish(now, 1024 * 1024, max_message_bytes + 1024);
         self.frame_budget.replenish(now, 512, 256);
         local_frames.replenish(now, 128, 128);
         const cost: u64 = @as(u64, @intCast(bytes)) *| 1000;
-        if (self.frame_budget.milli_tokens < 1000 or local_frames.milli_tokens < 1000 or self.byte_budget.milli_tokens < cost or local.milli_tokens < cost) {
+        if (self.frame_budget.milli_tokens < 1000 or local_frames.milli_tokens < 1000 or global.milli_tokens < cost or local.milli_tokens < cost) {
             self.stats.frame_rate_drops += 1;
+            if (blob) self.stats.blob_frame_rate_drops += 1;
             return error.FrameRateLimit;
         }
-        self.byte_budget.milli_tokens -= cost;
+        global.milli_tokens -= cost;
         local.milli_tokens -= cost;
         self.frame_budget.milli_tokens -= 1000;
         local_frames.milli_tokens -= 1000;
@@ -391,11 +582,9 @@ pub const Intake = struct {
     }
 
     fn deliver(self: *Intake, record: Record, now: i64) !void {
-        if (self.seen.get(record.hash)) |until| {
-            if (now < until) {
-                self.stats.duplicate += 1;
-                return;
-            }
+        if (self.known(record.hash, now)) {
+            self.stats.duplicate += 1;
+            return;
         }
         // Reserve bookkeeping before invoking the sink, so successful delivery
         // cannot be followed by an allocation failure and accidental redelivery.
@@ -411,6 +600,7 @@ pub const Intake = struct {
     }
 
     pub fn expire(self: *Intake, now: i64) void {
+        self.pollBlobResults(now);
         for (self.requests, 0..) |request, i| if (request) |req| {
             if (now >= req.deadline_ms) {
                 const work = &self.peer_work[req.peer.index];
@@ -424,7 +614,7 @@ pub const Intake = struct {
         var i: usize = 0;
         while (i < self.pending.count()) {
             const entry = self.pending.values()[i];
-            if (entry.requested == null and (now >= entry.expires_ms or (entry.peers[0] == null and entry.peers[1] == null))) {
+            if (!entry.verifying and entry.requested == null and (now >= entry.expires_ms or (entry.peers[0] == null and entry.peers[1] == null))) {
                 self.pending.swapRemoveAt(i);
             } else i += 1;
         }
@@ -450,6 +640,10 @@ pub const Intake = struct {
                     // Re-announcements during a stalled request must not put
                     // that same peer ahead of the retained alternative again.
                     removePeer(entry, request.peer);
+                    if (entry.retry_advertisement) |retry| {
+                        addPeer(entry, retry);
+                        entry.retry_advertisement = null;
+                    }
                 }
             }
         }
@@ -458,6 +652,12 @@ pub const Intake = struct {
     fn findRequest(self: *const Intake, peer: Peer, id: u64) ?usize {
         for (self.requests, 0..) |request, i| if (request) |req| {
             if (req.id == id and samePeer(peer, req.peer)) return i;
+        };
+        return null;
+    }
+    fn peerRequest(self: *const Intake, peer: Peer) ?usize {
+        for (self.requests, 0..) |request, i| if (request) |req| {
+            if (samePeer(peer, req.peer)) return i;
         };
         return null;
     }
@@ -495,9 +695,12 @@ fn transactionKind(bytes: []const u8) u8 {
     return if (bytes[0] >= 0xc0) 0 else bytes[0];
 }
 fn canonicalBytes(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    return pooledBytes(a, raw, max_tx_bytes);
+}
+fn pooledBytes(a: std.mem.Allocator, raw: []const u8, maximum: usize) ![]const u8 {
     if (raw.len == 0) return error.EmptyTransaction;
     if (raw[0] >= 0xc0) {
-        if (raw.len > max_tx_bytes) return error.TransactionByteLimit;
+        if (raw.len > maximum) return error.TransactionByteLimit;
         return raw;
     }
     // Typed transactions are byte strings in the ETH message's RLP list.
@@ -505,14 +708,17 @@ fn canonicalBytes(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
     var bytes: []const u8 = undefined;
     if (try rlp.deserialize([]const u8, a, raw, &bytes) != raw.len) return error.TrailingRlp;
     if (bytes.len == 0) return error.EmptyTransaction;
-    if (bytes.len > max_tx_bytes) return error.TransactionByteLimit;
+    if (bytes.len > maximum) return error.TransactionByteLimit;
     if (bytes[0] == 0 or bytes[0] >= 0x80) return error.InvalidTypedWrapper;
     return bytes;
 }
 
 fn decodeRecord(a: std.mem.Allocator, chain_id: u64, peer: Peer, bytes: []const u8, announced: i64, now: i64) !Record {
+    if (transactionKind(bytes) == 3) return error.BlobSidecarRequired;
+    return decodeSigned(a, chain_id, peer, bytes, announced, now);
+}
+fn decodeSigned(a: std.mem.Allocator, chain_id: u64, peer: Peer, bytes: []const u8, announced: i64, now: i64) !Record {
     const kind = transactionKind(bytes);
-    if (kind == 3) return error.BlobSidecarRequired;
     if (kind > 4) return error.UnsupportedTransaction;
     var tx: types.Transaction = undefined;
     const consumed = try tx.decodeFromRLP(a, bytes);
@@ -644,6 +850,104 @@ test "public intake primitive handoff owns bytes and preserves backpressure sema
     try std.testing.expectEqual(201, owner.record.?.frame_received_wall_ms.?);
     try std.testing.expectEqual(peer_a.epoch, owner.record.?.peer.epoch);
     try std.testing.expectEqual(1, intake.stats.accepted);
+}
+
+test "public intake owning status retries failed ordinary admission on announcement broadcast and delivery" {
+    const Owner = struct {
+        admission: Handoff.AdmissionStatus = .pending,
+        accepted: usize = 0,
+        queried: usize = 0,
+        queried_hash: Hash = undefined,
+        queried_at: i64 = 0,
+        fn accept(ctx: *anyopaque, _: Handoff.Transaction) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.accepted += 1;
+            self.admission = .pending;
+            return true;
+        }
+        fn status(ctx: *anyopaque, tx_hash: Hash, now: i64) Handoff.AdmissionStatus {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.queried += 1;
+            self.queried_hash = tx_hash;
+            self.queried_at = now;
+            return self.admission;
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var owner: Owner = .{};
+    var handoff: Handoff.Sink = .{ .context = &owner, .accept = Owner.accept, .status = Owner.status };
+    var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = handoffSink(&handoff) };
+    defer intake.deinit();
+    const bytes = try fixture(a);
+    const tx_hash = hash(bytes);
+    const announcement = try announceOne(a, bytes, 0);
+    const broadcast = try encode(a, @as([]const rlp.RawValue, &.{.{ .value = bytes }}));
+    try intake.broadcast(a, peer_a, broadcast, .{ .mono_ms = 100 });
+    try std.testing.expectEqual(0, owner.queried);
+    try intake.announce(a, peer_b, announcement, 101);
+    try intake.broadcast(a, peer_b, broadcast, .{ .mono_ms = 102 });
+    try std.testing.expectEqual(1, owner.accepted);
+    try std.testing.expect(intake.nextRequest(1, 102) == null);
+    owner.admission = .ready;
+    try intake.announce(a, peer_b, announcement, 103);
+    try std.testing.expectEqual(1, owner.accepted);
+    try std.testing.expectEqual(tx_hash, owner.queried_hash);
+    try std.testing.expectEqual(103, owner.queried_at);
+
+    owner.admission = .missing;
+    try intake.announce(a, peer_b, announcement, 104);
+    try std.testing.expectEqual(0, intake.seen.count());
+    const request = intake.nextRequest(2, 105).?;
+    try std.testing.expectEqual(peer_b, request.peer);
+    try intake.response(a, peer_b, try responseOne(a, 2, bytes), .{ .mono_ms = 106 });
+    try std.testing.expectEqual(2, owner.accepted);
+    owner.admission = .missing;
+    try intake.broadcast(a, peer_a, broadcast, .{ .mono_ms = 107 });
+    try std.testing.expectEqual(3, owner.accepted);
+    // Delivery can follow decoding in a batch. It must also recheck ownership,
+    // independently of the earlier broadcast/request duplicate filter.
+    owner.admission = .missing;
+    try intake.deliver(try decodeRecord(a, 1, peer_a, bytes, 107, 108), 108);
+    try std.testing.expectEqual(4, owner.accepted);
+    try std.testing.expectEqual(1, intake.seen.count());
+}
+
+test "public intake status probes only the queried seen hash and preserves observer suppression" {
+    const Owner = struct {
+        calls: usize = 0,
+        fn accept(_: *anyopaque, _: Record) bool {
+            return true;
+        }
+        fn status(ctx: *anyopaque, _: Hash, _: i64) Handoff.AdmissionStatus {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return .missing;
+        }
+    };
+    var owner: Owner = .{};
+    var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = .{ .context = &owner, .accept = Owner.accept, .status = Owner.status } };
+    defer intake.deinit();
+    for (0..max_seen) |i| {
+        var tx_hash: Hash = @splat(0);
+        std.mem.writeInt(u64, tx_hash[0..8], @intCast(i), .big);
+        try intake.seen.put(std.testing.allocator, tx_hash, 30000);
+    }
+    const queried: Hash = @splat(0);
+    try std.testing.expect(!intake.known(@splat(0xff), 10));
+    try std.testing.expectEqual(0, owner.calls);
+    try std.testing.expect(!intake.known(queried, 11));
+    try std.testing.expectEqual(1, owner.calls);
+    try std.testing.expectEqual(max_seen - 1, intake.seen.count());
+    intake.expire(12);
+    try std.testing.expectEqual(1, owner.calls);
+    try std.testing.expectEqual(max_seen - 1, intake.seen.count());
+    intake.sink.status = null;
+    try intake.seen.put(std.testing.allocator, queried, 30000);
+    try std.testing.expect(intake.known(queried, 13));
+    try std.testing.expect(!intake.known(queried, 30000));
+    try std.testing.expectEqual(1, owner.calls);
 }
 
 test "public intake authenticates an announced transaction and deduplicates both peer paths" {
@@ -1100,4 +1404,395 @@ fn typedAllocationCase(allocator: std.mem.Allocator) !void {
 
 test "public intake typed ownership survives every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, typedAllocationCase, .{});
+}
+
+const BlobTestVector = struct { canonical: []const u8, wrapper: []const u8, hash: Hash };
+fn blobTestVector(a: std.mem.Allocator, nonce: u64, count: usize, version: u8, proof_count: usize) !BlobTestVector {
+    const secp = @import("zig-eth-secp256k1");
+    const C = struct {
+        extern fn secp256k1_context_destroy(context: *anyopaque) void;
+    };
+    const signer = try secp.Secp256k1.init();
+    defer C.secp256k1_context_destroy(signer.context);
+    const commitment: [48]u8 = .{0xc0} ++ @as([47]u8, @splat(0));
+    var versioned: Hash = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&commitment, &versioned, .{});
+    versioned[0] = 1;
+    const hashes = try a.alloc(Hash, count);
+    @memset(hashes, versioned);
+    var tx: types.Transaction = .{ .blob = .{
+        .chain_id = 1,
+        .nonce = nonce,
+        .gas_priority_fee = 2,
+        .gas_price = 10,
+        .gas_limit = 100000,
+        .to = @splat(0x11),
+        .value = 0,
+        .data = &.{},
+        .access_list = &.{},
+        .max_fee_per_blob_gas = 2,
+        .blob_hashes = hashes,
+        .v = 0,
+        .r = 0,
+        .s = 0,
+    } };
+    const signature = try signer.sign(try tx.signingHash(a, 1), @as([31]u8, @splat(0)) ++ [_]u8{1});
+    tx.blob.r = std.mem.readInt(u256, signature[0..32], .big);
+    tx.blob.s = std.mem.readInt(u256, signature[32..64], .big);
+    tx.blob.v = signature[64];
+    const body = try encode(a, tx.blob);
+    const canonical = try std.mem.concat(a, u8, &.{ &.{3}, body });
+    const blob = try a.alloc(u8, BlobWire.bytes_per_blob);
+    @memset(blob, 0);
+    const blobs = try a.alloc([]const u8, count);
+    @memset(blobs, blob);
+    const commitments = try a.alloc([48]u8, count);
+    @memset(commitments, commitment);
+    const proofs = try a.alloc([48]u8, proof_count);
+    @memset(proofs, commitment);
+    const outer = try encode(a, .{ rlp.RawValue{ .value = body }, version, @as([]const []const u8, blobs), @as([]const [48]u8, commitments), @as([]const [48]u8, proofs) });
+    return .{ .canonical = canonical, .hash = hash(canonical), .wrapper = try std.mem.concat(a, u8, &.{ &.{3}, outer }) };
+}
+fn announceBlob(a: std.mem.Allocator, vector: BlobTestVector) ![]const u8 {
+    return encode(a, .{ @as([]const u8, &.{3}), @as([]const u32, &.{@intCast(vector.wrapper.len)}), @as([]const Hash, &.{vector.hash}) });
+}
+const BlobQueue = struct {
+    allocator: std.mem.Allocator,
+    warm: bool = true,
+    full: bool = false,
+    state: Handoff.BlobStatus = .pending,
+    bytes: ?[]u8 = null,
+    hash: ?Hash = null,
+    calls: usize = 0,
+    fn available(ctx: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.warm;
+    }
+    fn accept(ctx: *anyopaque, tx: Handoff.Transaction) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (self.full or !self.warm) return false;
+        const bytes = self.allocator.dupe(u8, tx.bytes) catch return false;
+        if (self.bytes) |previous| self.allocator.free(previous);
+        self.bytes = bytes;
+        self.hash = tx.hash;
+        self.calls += 1;
+        return true;
+    }
+    fn status(ctx: *anyopaque, _: Hash, _: i64) Handoff.BlobStatus {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.state;
+    }
+    fn sink(self: *@This()) Handoff.BlobSink {
+        return .{ .context = self, .available = available, .accept = accept, .status = status };
+    }
+    fn deinit(self: *@This()) void {
+        if (self.bytes) |bytes| self.allocator.free(bytes);
+    }
+};
+
+test "ETH71 blob handoff retains full wrapper and awaits verifier readiness" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const a = arena.allocator();
+    var recorder: Recorder = .{};
+    var queue: BlobQueue = .{ .allocator = std.testing.allocator, .warm = false };
+    defer queue.deinit();
+    var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+    defer intake.deinit();
+    intake.sink.blobs = queue.sink();
+    const vector = try blobTestVector(a, 0, 6, 1, 768);
+    const expected = vector.hash;
+    const ann = try announceBlob(a, vector);
+    try intake.announce(a, peer_a, ann, 0);
+    try std.testing.expectEqual(1, intake.stats.deferred_blobs);
+    try std.testing.expect(intake.nextRequest(1, 0) == null);
+    queue.warm = true;
+    try intake.announce(a, peer_a, ann, 1);
+    const request = intake.nextRequest(2, 1).?;
+    try std.testing.expect(request.blob);
+    try std.testing.expectEqual(1, request.count);
+    try intake.response(a, peer_a, try responseOne(a, 2, vector.wrapper), .{ .mono_ms = 2, .wall_ms = 1234 });
+    arena.deinit();
+    try std.testing.expectEqual(expected, (try BlobWire.parse(queue.bytes.?)).hash);
+    try std.testing.expectEqual(1, intake.stats.blob_queued);
+    try std.testing.expectEqual(0, intake.stats.blob_ready);
+    try std.testing.expectEqual(0, intake.seen.count());
+    try std.testing.expectEqual(0, recorder.count);
+    intake.pollBlobResults(3);
+    try std.testing.expectEqual(0, intake.seen.count());
+    queue.state = .ready;
+    intake.pollBlobResults(4);
+    try std.testing.expectEqual(1, intake.stats.blob_ready);
+    try std.testing.expect(intake.known(expected, 5));
+    try std.testing.expectEqual(0, intake.pending.count());
+}
+
+test "ETH71 blob failed asynchronous verification retries another peer without hash poisoning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recorder: Recorder = .{};
+    var queue: BlobQueue = .{ .allocator = std.testing.allocator };
+    defer queue.deinit();
+    var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+    defer intake.deinit();
+    intake.sink.blobs = queue.sink();
+    const vector = try blobTestVector(a, 0, 1, 1, 128);
+    const ann = try announceBlob(a, vector);
+    try intake.announce(a, peer_a, ann, 0);
+    try intake.announce(a, peer_b, ann, 0);
+    _ = intake.nextRequest(1, 0).?;
+    try intake.response(a, peer_a, try responseOne(a, 1, vector.wrapper), .{ .mono_ms = 1 });
+    // Queue state is mocked here; native integration separately runs real KZG.
+    queue.state = .missing;
+    intake.expire(2);
+    try std.testing.expectEqual(1, intake.stats.blob_failed);
+    try std.testing.expect(!intake.known(vector.hash, 2));
+    try std.testing.expect(intake.nextRequest(2, 3) == null);
+    const alternate = intake.nextRequest(3, 502).?;
+    try std.testing.expectEqual(peer_b, alternate.peer);
+    try intake.response(a, peer_b, try responseOne(a, 3, vector.wrapper), .{ .mono_ms = 503 });
+    queue.state = .ready;
+    intake.expire(504);
+    try std.testing.expectEqual(1, intake.stats.blob_ready);
+    try std.testing.expectEqual(2, queue.calls);
+}
+
+test "ETH71 blob backpressure preserves retry metadata and ordinary traffic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recorder: Recorder = .{};
+    var queue: BlobQueue = .{ .allocator = std.testing.allocator, .full = true };
+    defer queue.deinit();
+    var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+    defer intake.deinit();
+    intake.sink.blobs = queue.sink();
+    const vector = try blobTestVector(a, 0, 1, 1, 128);
+    try intake.announce(a, peer_a, try announceBlob(a, vector), 0);
+    _ = intake.nextRequest(1, 0).?;
+    try intake.response(a, peer_a, try responseOne(a, 1, vector.wrapper), .{ .mono_ms = 1 });
+    try std.testing.expectEqual(1, intake.stats.blob_sink_full);
+    try std.testing.expect(getAdvertisement(intake.pending.getPtr(vector.hash).?, peer_a) != null);
+    try std.testing.expect(intake.nextRequest(2, 2) == null);
+    const ordinary = try fixture(a);
+    try intake.announce(a, peer_b, try announceOne(a, ordinary, 0), 2);
+    const request = intake.nextRequest(3, 2).?;
+    try std.testing.expect(!request.blob);
+    try intake.response(a, peer_b, try responseOne(a, 3, ordinary), .{ .mono_ms = 3 });
+    try std.testing.expectEqual(1, recorder.count);
+    queue.full = false;
+    _ = intake.nextRequest(4, 1001).?;
+    try intake.response(a, peer_a, try responseOne(a, 4, vector.wrapper), .{ .mono_ms = 1002 });
+    try std.testing.expectEqual(1, intake.stats.blob_queued);
+}
+
+test "ETH71 blob parser rejects missing version sidecars wrong cardinality and noncanonical framing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const good = try blobTestVector(a, 0, 1, 1, 128);
+    const unknown = try blobTestVector(a, 0, 1, 2, 128);
+    const missing = try blobTestVector(a, 0, 1, 1, 127);
+    const extra = try blobTestVector(a, 0, 1, 1, 129);
+    const too_many = try blobTestVector(a, 0, 7, 1, 896);
+    try std.testing.expectError(error.BlobSidecarRequired, BlobWire.parse(good.canonical));
+    try std.testing.expectError(error.UnsupportedBlobSidecarVersion, BlobWire.parse(unknown.wrapper));
+    try std.testing.expectError(error.InvalidBlobWrapper, BlobWire.parse(missing.wrapper));
+    try std.testing.expectError(error.InvalidBlobSidecar, BlobWire.parse(extra.wrapper));
+    try std.testing.expectError(error.TooManyBlobs, BlobWire.parse(too_many.wrapper));
+    try std.testing.expectError(error.InvalidBlobWrapper, BlobWire.parse(try std.mem.concat(a, u8, &.{ good.wrapper, &.{0} })));
+    try std.testing.expectError(error.InvalidBlobWrapper, BlobWire.parse(good.wrapper[0 .. good.wrapper.len - 1]));
+    try std.testing.expectError(error.NonCanonicalTransaction, BlobWire.parse(&.{ 3, 0xf8, 1, 0xc0 }));
+    for (0..@min(good.wrapper.len, 256)) |end| {
+        if (BlobWire.parse(good.wrapper[0..end])) |_| return error.AcceptedTruncatedBlob else |_| {}
+    }
+}
+
+test "ETH71 blob response binds peer epoch id signed hash type and exact pooled size atomically" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const vector = try blobTestVector(a, 0, 1, 1, 128);
+    const other = try blobTestVector(a, 1, 1, 1, 128);
+    const ordinary = try fixture(a);
+    for (0..6) |scenario| {
+        var recorder: Recorder = .{};
+        var queue: BlobQueue = .{ .allocator = std.testing.allocator };
+        defer queue.deinit();
+        var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+        defer intake.deinit();
+        intake.sink.blobs = queue.sink();
+        const ann = if (scenario == 4)
+            try encode(a, .{ @as([]const u8, &.{3}), @as([]const u32, &.{@intCast(vector.canonical.len)}), @as([]const Hash, &.{vector.hash}) })
+        else
+            try announceBlob(a, vector);
+        try intake.announce(a, peer_a, ann, 0);
+        try intake.announce(a, peer_b, try announceBlob(a, vector), 0);
+        _ = intake.nextRequest(1, 0).?;
+        switch (scenario) {
+            0 => try std.testing.expectError(error.UnsolicitedResponse, intake.response(a, .{ .index = peer_a.index, .epoch = peer_a.epoch + 1 }, try responseOne(a, 1, vector.wrapper), .{ .mono_ms = 1 })),
+            1 => try std.testing.expectError(error.UnsolicitedResponse, intake.response(a, peer_a, try responseOne(a, 2, vector.wrapper), .{ .mono_ms = 1 })),
+            2 => try std.testing.expectError(error.UnrequestedTransaction, intake.response(a, peer_a, try responseOne(a, 1, other.wrapper), .{ .mono_ms = 1 })),
+            3 => try std.testing.expectError(error.InvalidBlobWrapper, intake.response(a, peer_a, try responseOne(a, 1, ordinary), .{ .mono_ms = 1 })),
+            4 => try std.testing.expectError(error.AnnouncementMismatch, intake.response(a, peer_a, try responseOne(a, 1, vector.wrapper), .{ .mono_ms = 1 })),
+            5 => {
+                const wrapped = try encode(a, vector.wrapper);
+                const response = try encode(a, .{ @as(u64, 1), @as([]const rlp.RawValue, &.{ .{ .value = wrapped }, .{ .value = wrapped } }) });
+                try std.testing.expectError(error.ResponseCountLimit, intake.response(a, peer_a, response, .{ .mono_ms = 1 }));
+            },
+            else => unreachable,
+        }
+        try std.testing.expectEqual(0, queue.calls);
+        try std.testing.expectEqual(0, intake.seen.count());
+        intake.disconnect(peer_a);
+        const alternate = intake.nextRequest(3, 1001).?;
+        try std.testing.expectEqual(peer_b, alternate.peer);
+        try intake.response(a, peer_b, try responseOne(a, 3, vector.wrapper), .{ .mono_ms = 1002 });
+        try std.testing.expectEqual(1, queue.calls);
+    }
+}
+
+test "ETH71 blob acquisition bounds inventory concurrent requests and independent byte rates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recorder: Recorder = .{};
+    var queue: BlobQueue = .{ .allocator = std.testing.allocator };
+    defer queue.deinit();
+    var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+    defer intake.deinit();
+    intake.sink.blobs = queue.sink();
+    const kinds = try a.alloc(u8, max_pending_blobs_per_peer + 1);
+    const sizes = try a.alloc(u32, kinds.len);
+    const hashes = try a.alloc(Hash, kinds.len);
+    @memset(kinds, 3);
+    @memset(sizes, 150000);
+    for (0..5) |index| {
+        for (hashes, 0..) |*item, i| std.mem.writeInt(u256, item, index * 1000 + i, .big);
+        try intake.announce(a, .{ .index = index, .epoch = 1 }, try encode(a, .{ @as([]const u8, kinds), @as([]const u32, sizes), @as([]const Hash, hashes) }), 0);
+    }
+    try std.testing.expectEqual(max_pending_blobs, intake.pending.count());
+    try std.testing.expectEqual(37, intake.stats.blob_inventory_drops);
+    try std.testing.expect(intake.nextRequest(1, 0).?.blob);
+    try std.testing.expect(intake.nextRequest(2, 0).?.blob);
+    try std.testing.expect(intake.nextRequest(3, 0) == null);
+    // Blob traffic consumes its own bytes; exhausting it preserves ordinary
+    // frame admission on both the same peer and unrelated peers.
+    try intake.reserveFrameClass(peer_a, max_message_bytes, 1, true);
+    try std.testing.expectError(error.FrameRateLimit, intake.reserveFrameClass(peer_b, 2048, 1, true));
+    try intake.reserveFrame(peer_a, max_message_bytes / 2, 1);
+    try std.testing.expectEqual(1, intake.stats.blob_frame_rate_drops);
+    intake.expire(1501);
+    try std.testing.expectEqual(2, intake.stats.expired_requests);
+    try std.testing.expect(intake.nextRequest(4, 1502) != null);
+}
+
+test "ETH71 blob signature and chain validation precede queue delivery" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const vector = try blobTestVector(a, 0, 1, 1, 128);
+    const Fields = struct { body: rlp.RawValue, version: u8, blobs: rlp.RawValue, commitments: rlp.RawValue, proofs: rlp.RawValue };
+    var fields: Fields = undefined;
+    _ = try rlp.deserialize(Fields, a, vector.wrapper[1..], &fields);
+    for (0..3) |scenario| {
+        var recorder: Recorder = .{};
+        var queue: BlobQueue = .{ .allocator = std.testing.allocator };
+        defer queue.deinit();
+        var source: Intake = .{ .allocator = std.testing.allocator, .chain_id = if (scenario == 0) 2 else 1, .sink = recorder.sink() };
+        defer source.deinit();
+        source.sink.blobs = queue.sink();
+        var changed = vector;
+        if (scenario != 0) {
+            var tx: types.Transaction = undefined;
+            _ = try tx.decodeFromRLP(a, vector.canonical);
+            tx.blob.s = if (scenario == 1) 0 else 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - tx.blob.s;
+            fields.body.value = try encode(a, tx.blob);
+            changed.canonical = try std.mem.concat(a, u8, &.{ &.{3}, fields.body.value });
+            changed.hash = hash(changed.canonical);
+            changed.wrapper = try std.mem.concat(a, u8, &.{ &.{3}, try encode(a, fields) });
+        }
+        try source.announce(a, peer_a, try announceBlob(a, changed), 0);
+        _ = source.nextRequest(1, 0).?;
+        const reply = try responseOne(a, 1, changed.wrapper);
+        if (scenario == 0)
+            try std.testing.expectError(error.InvalidChainId, source.response(a, peer_a, reply, .{ .mono_ms = 1 }))
+        else
+            try std.testing.expectError(error.InvalidSignature, source.response(a, peer_a, reply, .{ .mono_ms = 1 }));
+        try std.testing.expectEqual(0, queue.calls);
+        try std.testing.expectEqual(0, source.seen.count());
+    }
+}
+
+fn blobAllocationCase(allocator: std.mem.Allocator, ann: []const u8, response: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var recorder: Recorder = .{};
+    var queue: BlobQueue = .{ .allocator = std.testing.allocator };
+    defer queue.deinit();
+    var source: Intake = .{ .allocator = allocator, .chain_id = 1, .sink = recorder.sink() };
+    defer source.deinit();
+    source.sink.blobs = queue.sink();
+    try source.announce(arena.allocator(), peer_a, ann, 0);
+    _ = source.nextRequest(1, 0).?;
+    try source.response(arena.allocator(), peer_a, response, .{ .mono_ms = 1 });
+    try std.testing.expectEqual(1, queue.calls);
+    try std.testing.expectEqual(0, source.seen.count());
+}
+
+test "ETH71 blob request decode ownership survives allocation failures and bounded verifier timeout" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const vector = try blobTestVector(a, 0, 1, 1, 128);
+    const ann = try announceBlob(a, vector);
+    const response = try responseOne(a, 1, vector.wrapper);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, blobAllocationCase, .{ ann, response });
+    var recorder: Recorder = .{};
+    var queue: BlobQueue = .{ .allocator = std.testing.allocator };
+    defer queue.deinit();
+    var source: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+    defer source.deinit();
+    source.sink.blobs = queue.sink();
+    try source.announce(a, peer_a, ann, 0);
+    _ = source.nextRequest(1, 0).?;
+    try source.response(a, peer_a, response, .{ .mono_ms = 1 });
+    source.expire(verification_timeout_ms);
+    try std.testing.expectEqual(1, source.pending.count());
+    source.expire(verification_timeout_ms + 1);
+    try std.testing.expectEqual(1, source.stats.blob_failed);
+    try std.testing.expectEqual(0, source.pending.count());
+    try std.testing.expectEqual(0, source.seen.count());
+    for (source.verifications) |verification| try std.testing.expect(verification == null);
+}
+
+test "ETH71 blob inventory quota cannot be bypassed by an earlier ordinary type claim" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var recorder: Recorder = .{};
+    var queue: BlobQueue = .{ .allocator = std.testing.allocator };
+    defer queue.deinit();
+    var source: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+    defer source.deinit();
+    source.sink.blobs = queue.sink();
+    const kinds = try a.alloc(u8, max_pending_blobs_per_peer + 1);
+    const sizes = try a.alloc(u32, kinds.len);
+    const hashes = try a.alloc(Hash, kinds.len);
+    @memset(kinds, 2);
+    @memset(sizes, 100);
+    for (hashes, 0..) |*item, i| std.mem.writeInt(u256, item, i, .big);
+    try source.announce(a, peer_a, try encode(a, .{ @as([]const u8, kinds), @as([]const u32, sizes), @as([]const Hash, hashes) }), 0);
+    @memset(kinds, 3);
+    @memset(sizes, 150000);
+    try source.announce(a, peer_b, try encode(a, .{ @as([]const u8, kinds), @as([]const u32, sizes), @as([]const Hash, hashes) }), 0);
+    var blob_count: usize = 0;
+    for (source.pending.values()) |entry| if (entry.blob) {
+        blob_count += 1;
+        try std.testing.expectEqual(peer_b.index, entry.blob_owner_index);
+    };
+    try std.testing.expectEqual(max_pending_blobs_per_peer, blob_count);
+    try std.testing.expectEqual(1, source.stats.blob_inventory_drops);
+    source.disconnect(peer_a);
+    try std.testing.expect(source.nextRequest(1, 1).?.blob);
 }

@@ -600,13 +600,14 @@ pub fn build(b: *std.Build) void {
         run_zkevm_tests.setEnvironmentVariable("ZISKEMU_GUEST", "1");
     }
 
+    const node_mod = b.addModule("node", .{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const main_exe = b.addExecutable(.{
         .name = "zevm",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = node_mod,
         .use_llvm = true,
     });
     linkDeps(main_exe.root_module, deps, .native);
