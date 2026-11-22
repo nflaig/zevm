@@ -70,6 +70,24 @@ pub const Sink = struct {
     /// Return false under backpressure. No borrowed field may survive this call.
     accept: *const fn (*anyopaque, Record) bool,
 };
+pub const Handoff = @import("public_handoff.zig");
+/// Adapt the validated peer sink to engine-independent fields. The Handoff.Sink
+/// owner must outlive Intake; no decoded transaction or frame borrow escapes.
+pub fn handoffSink(target: *Handoff.Sink) Sink {
+    return .{ .context = target, .accept = struct {
+        fn accept(ctx: *anyopaque, record: Record) bool {
+            const sink: *Handoff.Sink = @ptrCast(@alignCast(ctx));
+            return sink.accept(sink.context, .{
+                .hash = record.hash,
+                .bytes = record.bytes,
+                .peer = .{ .index = record.peer.index, .epoch = record.peer.epoch },
+                .announced_at_ms = record.announced_at_ms,
+                .received_at_ms = record.received_at_ms,
+                .frame_received_wall_ms = record.frame_received_wall_ms,
+            });
+        }
+    }.accept };
+}
 pub const Request = struct {
     id: u64,
     peer: Peer,
@@ -587,6 +605,45 @@ fn announceOne(a: std.mem.Allocator, bytes: []const u8, kind: u8) ![]const u8 {
 fn responseOne(a: std.mem.Allocator, id: u64, bytes: []const u8) ![]const u8 {
     const wrapped = if (bytes[0] >= 0xc0) bytes else try encode(a, bytes);
     return encode(a, .{ id, @as([]const rlp.RawValue, &.{.{ .value = wrapped }}) });
+}
+
+test "public intake primitive handoff owns bytes and preserves backpressure semantics" {
+    const Owner = struct {
+        bytes: [256]u8 = undefined,
+        count: usize = 0,
+        full: bool = true,
+        record: ?Handoff.Transaction = null,
+        fn accept(ctx: *anyopaque, record: Handoff.Transaction) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.full or record.bytes.len > self.bytes.len) return false;
+            @memcpy(self.bytes[0..record.bytes.len], record.bytes);
+            self.record = record;
+            self.record.?.bytes = self.bytes[0..record.bytes.len];
+            self.count += 1;
+            return true;
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    const a = arena.allocator();
+    var owner: Owner = .{};
+    var handoff: Handoff.Sink = .{ .context = &owner, .accept = Owner.accept };
+    var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = handoffSink(&handoff) };
+    defer intake.deinit();
+    const bytes = try fixture(a);
+    const tx_hash = hash(bytes);
+    const broadcast = try encode(a, @as([]const rlp.RawValue, &.{.{ .value = bytes }}));
+    try intake.broadcast(a, peer_a, broadcast, .{ .mono_ms = 100, .wall_ms = 200 });
+    try std.testing.expectEqual(0, intake.seen.count());
+    try std.testing.expectEqual(1, intake.stats.sink_full);
+    owner.full = false;
+    try intake.broadcast(a, peer_a, broadcast, .{ .mono_ms = 101, .wall_ms = 201 });
+    arena.deinit();
+    try std.testing.expectEqual(1, owner.count);
+    try std.testing.expectEqual(tx_hash, hash(owner.record.?.bytes));
+    try std.testing.expectEqual(101, owner.record.?.received_at_ms);
+    try std.testing.expectEqual(201, owner.record.?.frame_received_wall_ms.?);
+    try std.testing.expectEqual(peer_a.epoch, owner.record.?.peer.epoch);
+    try std.testing.expectEqual(1, intake.stats.accepted);
 }
 
 test "public intake authenticates an announced transaction and deduplicates both peer paths" {

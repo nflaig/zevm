@@ -34,6 +34,33 @@ hash does not authenticate an account. `readNode`/`readNodes` authenticate owner
 nibble path and expected hash for the finalizer; nodes are at most 1 KiB, paths
 at most 64 nibbles and batches at most 16 nodes.
 
+The traversal cache is explicitly disabled by default. Enable it on a lease
+with `try lease.enableNodeCache(allocator, .{})`; that allocator must outlive the
+lease. The default permits 4,096 path entries and 4 MiB of retained RLP. Hard
+limits are 16,384 entries and 16 MiB of RLP per lease. Metadata is separately
+bounded by the reserved hash-table capacity; `nodeCacheStats()` reports both
+the occupied entries and reserved entry capacity, plus retained RLP bytes.
+
+Entries authorize an exact `(owner, nibble path, expected hash)` within that
+lease. The account root comes from its header, storage roots from authenticated
+owner reads, and child edges only from decoded, hash-checked parent nodes.
+Authorized edges can read one preimage directly; an unknown path still walks
+from the authenticated root. A correct hash at an unreachable DB path grants
+no access. Embedded nodes do not become independent hash references. Returned
+RLP is always copied into caller scratch, including cache hits. Reorgs, writer
+commits and registry eviction cannot change an existing lease's authorizations.
+
+There is no eviction or cross-lease sharing. At either capacity bound, existing
+entries remain usable and uncached work uses the original path. Actual allocator
+errors propagate, while previously authenticated entries remain valid. Checks
+for cancellation precede hits and authorization publication. Use
+`.{ .max_bytes = 0 }` for authorization-only qualification: it skips repeated
+root walks but fetches and verifies each node's bytes again. Separate counters
+report hits, authorized reads, root-walk fallbacks, owner reads and capacity
+misses; they count attempted work, not just successful operations. These modes
+support matched measurements; enabling the cache alone is not evidence of a
+payload or bid improvement.
+
 `header` and `stamp` identify the leased state. `readAncestors` returns up to 256
 owned inline headers. Only ancestor lookup may open a fresh read transaction to
 use later immutable header backfill: it follows hashes from the leased parent

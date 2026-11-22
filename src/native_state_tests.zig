@@ -37,6 +37,10 @@ const Fixture = struct {
     }
 
     fn write(self: *Fixture, number: u64, balance: u256, previous: ?types.BlockHeader) !types.BlockHeader {
+        return self.writeStorage(number, balance, previous, &.{ types.keccakOfU256(0), types.keccakOfU256(1), types.keccakOfU256(2) }, &.{ balance, 17, 999 });
+    }
+
+    fn writeStorage(self: *Fixture, number: u64, balance: u256, previous: ?types.BlockHeader, keys: []const [32]u8, values: []const u256) !types.BlockHeader {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const alloc = arena.allocator();
@@ -47,9 +51,7 @@ const Fixture = struct {
         const key = types.keccakOfU160(address);
         var storage_nodes = try trie.NodeCollector.init(alloc, 256);
         var storage = StorageTrie.init(alloc).withCollector(&storage_nodes);
-        const keys = [_][32]u8{ types.keccakOfU256(0), types.keccakOfU256(1), types.keccakOfU256(2) };
-        const values = [_]u256{ balance, 17, 999 };
-        try storage.update(&keys, &values);
+        try storage.update(keys, values);
         const storage_root = try storage.rootHash();
         try eth.commitStorageTrieNodes(txn, key, &storage_nodes);
         for (keys, values) |slot, value| try eth.writeStorage(txn, key, slot, value);
@@ -472,4 +474,341 @@ test "native read only open fails for a missing table and does not recreate it" 
     try std.testing.expectError(error.MDBX_NOTFOUND, kv.Store.openReadOnly(a, path[0..len]));
     // Repeating the failed open also exercises cleanup after partial DBI opens.
     try std.testing.expectError(error.MDBX_NOTFOUND, kv.Store.openReadOnly(a, path[0..len]));
+}
+
+/// Keys deliberately form a root extension, a branch with hashed children,
+/// and a deeper extension containing an embedded branch and tiny inline leaves.
+fn cacheKeys() [3][32]u8 {
+    var keys: [3][32]u8 = @splat(@splat(0));
+    keys[0][0] = 0x12;
+    keys[0][31] = 0x10;
+    keys[1] = keys[0];
+    keys[1][31] = 0x11;
+    keys[2][0] = 0x13;
+    return keys;
+}
+
+fn nodeQueries(alloc: std.mem.Allocator, lease: *native.Lease, owner: ?u160) ![]native.NodeQuery {
+    const root = if (owner) |addr| (try lease.readAccount(alloc, addr)).storage_hash else (try lease.header()).state_root;
+    var queries: std.ArrayList(native.NodeQuery) = .empty;
+    try queries.append(alloc, .{ .owner = owner, .path = &.{}, .expected_hash = root });
+    var i: usize = 0;
+    while (i < queries.items.len) : (i += 1) {
+        const query = queries.items[i];
+        // Every enumerated edge is independently checked by the baseline root
+        // walk, so this helper cannot hide a wrong path emitted by the parser.
+        const encoded = try lease.readNode(alloc, owner, query.path, query.expected_hash);
+        const references = try trie.Trie.hashedChildReferences(alloc, encoded, query.path);
+        for (references.entries[0..references.count]) |child| {
+            if (queries.items.len >= 64) return error.TestFixtureNodeLimit;
+            try queries.append(alloc, .{ .owner = owner, .path = try alloc.dupe(u8, child.path[0..child.depth]), .expected_hash = child.hash });
+        }
+    }
+    return queries.items;
+}
+
+test "native cache authenticates branch extension and inline edges with owned output" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const keys = cacheKeys();
+    const header = try f.writeStorage(1, 42, null, &keys, &.{ 1, 2, 3 });
+    var eth = native.Eth.init(&f.store);
+    var views: native.Snapshots = .{ .io = io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var reader: native.Reader = .{ .eth = &eth, .snapshots = &views };
+    defer reader.deinit();
+    var control = try reader.acquire(parent(header));
+    defer control.deinit();
+    var cached = try reader.acquire(parent(header));
+    defer cached.deinit();
+    try std.testing.expect(!cached.nodeCacheStats().enabled);
+    try cached.enableNodeCache(a, .{});
+    try std.testing.expectError(error.NativeNodeCacheAlreadyEnabled, cached.enableNodeCache(a, .{}));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const queries = try nodeQueries(alloc, &control, address);
+    try std.testing.expectEqual(@as(usize, 4), queries.len);
+    _ = try cached.readAccount(alloc, address);
+    for (queries) |q| {
+        const expected = try control.readNode(alloc, q.owner, q.path, q.expected_hash);
+        try std.testing.expectEqualSlices(u8, expected, try cached.readNode(alloc, q.owner, q.path, q.expected_hash));
+    }
+    var stats = cached.nodeCacheStats();
+    try std.testing.expectEqual(queries.len, stats.authorized_reads);
+    try std.testing.expectEqual(@as(u64, 0), stats.fallback_reads);
+    try std.testing.expectEqual(@as(u64, 0), stats.owner_reads);
+    try std.testing.expect(stats.retained_bytes > 0);
+    var key_buf: [64]u8 = undefined;
+    const inline_path = trie.writeHexKey(&keys[0], &key_buf)[0..63];
+    try std.testing.expectError(error.TrieNodeNotHashReference, cached.readNode(alloc, address, inline_path, queries[0].expected_hash));
+    const copy = try cached.readNode(alloc, address, &.{}, queries[0].expected_hash);
+    const saved = try alloc.dupe(u8, copy);
+    @constCast(copy)[0] ^= 1;
+    try std.testing.expectEqualSlices(u8, saved, try cached.readNode(alloc, address, &.{}, queries[0].expected_hash));
+    stats = cached.nodeCacheStats();
+    try std.testing.expectEqual(@as(u64, 2), stats.hits);
+    cached.deinit();
+    try std.testing.expectEqual(queries[0].expected_hash, @import("evm/crypto/hash.zig").keccak256(saved));
+}
+
+test "native cache cannot authorize unreachable content wrong owners or wrong hashes" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const keys = cacheKeys();
+    const header = try f.writeStorage(1, 42, null, &keys, &.{ 1, 2, 3 });
+    var eth = native.Eth.init(&f.store);
+    var views: native.Snapshots = .{ .io = io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var reader: native.Reader = .{ .eth = &eth, .snapshots = &views };
+    defer reader.deinit();
+    var control = try reader.acquire(parent(header));
+    defer control.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const queries = try nodeQueries(alloc, &control, address);
+    const root_bytes = try control.readNode(alloc, address, &.{}, queries[0].expected_hash);
+    // Valid content exists in the DB at an unreachable path and another owner.
+    const tx = try f.store.transaction_rw();
+    try eth.putStorageTrieNode(tx, types.keccakOfU160(address), &.{15}, root_bytes);
+    try eth.putStorageTrieNode(tx, types.keccakOfU160(0xffff), &.{}, root_bytes);
+    try tx.commit();
+    try views.publish(a);
+    var cached = try reader.acquire(parent(header));
+    defer cached.deinit();
+    try cached.enableNodeCache(a, .{});
+    _ = try cached.readNode(alloc, address, &.{}, queries[0].expected_hash);
+    const entries = cached.nodeCacheStats().entries;
+    try std.testing.expectError(error.TrieNodePathUnavailable, cached.readNode(alloc, address, &.{15}, queries[0].expected_hash));
+    try std.testing.expectError(error.TrieNodeNotHashReference, cached.readNode(alloc, 0xffff, &.{}, queries[0].expected_hash));
+    try std.testing.expectError(error.TrieNodeHashMismatch, cached.readNode(alloc, address, queries[1].path, queries[0].expected_hash));
+    try std.testing.expectError(error.TrieNodeHashMismatch, cached.readNode(alloc, null, &.{}, queries[0].expected_hash));
+    try std.testing.expectEqual(entries, cached.nodeCacheStats().entries);
+    try std.testing.expectEqualSlices(u8, root_bytes, try cached.readNode(alloc, address, &.{}, queries[0].expected_hash));
+}
+
+test "native node cache is exact lease state across deletion reorg and snapshot eviction" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const keys = cacheKeys();
+    const header = try f.writeStorage(1, 42, null, &keys, &.{ 1, 2, 3 });
+    var eth = native.Eth.init(&f.store);
+    var views: native.Snapshots = .{ .io = io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var reader: native.Reader = .{ .eth = &eth, .snapshots = &views };
+    defer reader.deinit();
+    var old = try reader.acquire(parent(header));
+    defer old.deinit();
+    try old.enableNodeCache(a, .{});
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const old_root = (try old.readAccount(alloc, address)).storage_hash;
+    const before = try old.readNode(alloc, address, &.{}, old_root);
+    // Same-height sibling removes one inline leaf, collapsing the branch.
+    var latest = try f.writeStorage(1, 90, null, &.{ keys[0], keys[2] }, &.{ 1, 3 });
+    try views.publish(a);
+    var sibling = try reader.acquire(parent(latest));
+    defer sibling.deinit();
+    try sibling.enableNodeCache(a, .{});
+    const current_root = (try sibling.readAccount(alloc, address)).storage_hash;
+    try std.testing.expect(!std.meta.eql(current_root, old_root));
+    _ = try sibling.readNode(alloc, address, &.{}, current_root);
+    try std.testing.expectError(error.TrieNodeHashMismatch, sibling.readNode(alloc, address, &.{}, old_root));
+    for (0..native.Snapshots.capacity + 1) |i| {
+        latest = try f.write(2 + i, 100 + i, latest);
+        try views.publish(a);
+    }
+    try std.testing.expectError(error.StateViewUnavailable, reader.acquire(parent(header)));
+    try std.testing.expectEqualSlices(u8, before, try old.readNode(alloc, address, &.{}, old_root));
+    const child_queries = try nodeQueries(alloc, &old, address);
+    try std.testing.expectEqual(@as(usize, 4), child_queries.len);
+}
+
+test "native cache entry and byte limits preserve uncached fallbacks" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const header = try f.write(1, 42, null);
+    var eth = native.Eth.init(&f.store);
+    var views: native.Snapshots = .{ .io = io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var reader: native.Reader = .{ .eth = &eth, .snapshots = &views };
+    defer reader.deinit();
+    var control = try reader.acquire(parent(header));
+    defer control.deinit();
+    var limited = try reader.acquire(parent(header));
+    defer limited.deinit();
+    try std.testing.expectError(error.InvalidNativeNodeCacheLimit, limited.enableNodeCache(a, .{ .max_entries = 0 }));
+    try std.testing.expectError(error.InvalidNativeNodeCacheLimit, limited.enableNodeCache(a, .{ .max_entries = 16385 }));
+    try std.testing.expectError(error.InvalidNativeNodeCacheLimit, limited.enableNodeCache(a, .{ .max_bytes = (16 << 20) + 1 }));
+    try limited.enableNodeCache(a, .{ .max_entries = 2, .max_bytes = 0 });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const queries = try nodeQueries(alloc, &control, address);
+    for (0..2) |_| for (queries) |q| {
+        try std.testing.expectEqualSlices(u8, try control.readNode(alloc, q.owner, q.path, q.expected_hash), try limited.readNode(alloc, q.owner, q.path, q.expected_hash));
+    };
+    const stats = limited.nodeCacheStats();
+    try std.testing.expectEqual(@as(usize, 2), stats.entries);
+    try std.testing.expectEqual(@as(usize, 0), stats.retained_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.hits);
+    try std.testing.expect(stats.authorized_reads > 0 and stats.fallback_reads > 0 and stats.capacity_misses > 0);
+    // Authorization-only with room for all edges skips root walks without
+    // retaining any RLP. This is a separate benchmark variant from byte hits.
+    var authorized = try reader.acquire(parent(header));
+    defer authorized.deinit();
+    try authorized.enableNodeCache(a, .{ .max_bytes = 0 });
+    _ = try authorized.readAccount(alloc, address);
+    for (queries) |q| _ = try authorized.readNode(alloc, q.owner, q.path, q.expected_hash);
+    try std.testing.expectEqual(@as(u64, 0), authorized.nodeCacheStats().fallback_reads);
+    try std.testing.expectEqual(queries.len, authorized.nodeCacheStats().authorized_reads);
+    try std.testing.expectEqual(@as(usize, 0), authorized.nodeCacheStats().retained_bytes);
+}
+
+test "native authorized cache reads still reject missing and corrupt child preimages" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const keys = cacheKeys();
+    const header = try f.writeStorage(1, 42, null, &keys, &.{ 1, 2, 3 });
+    var eth = native.Eth.init(&f.store);
+    var views: native.Snapshots = .{ .io = io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var reader: native.Reader = .{ .eth = &eth, .snapshots = &views };
+    defer reader.deinit();
+    var intact = try reader.acquire(parent(header));
+    defer intact.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const queries = try nodeQueries(alloc, &intact, address);
+    const child = queries[1];
+    const root = queries[0];
+    const corrupt = try f.store.transaction_rw();
+    try eth.putStorageTrieNode(corrupt, types.keccakOfU160(address), child.path, &.{0xc0});
+    try corrupt.commit();
+    try views.publish(a);
+    var bad = try reader.acquire(parent(header));
+    defer bad.deinit();
+    try bad.enableNodeCache(a, .{});
+    _ = try bad.readNode(alloc, address, root.path, root.expected_hash);
+    const before = bad.nodeCacheStats();
+    try std.testing.expectError(error.StateRootMismatch, bad.readNode(alloc, address, child.path, child.expected_hash));
+    try std.testing.expectEqual(before.entries, bad.nodeCacheStats().entries);
+    try std.testing.expectEqual(before.retained_bytes, bad.nodeCacheStats().retained_bytes);
+    const missing = try f.store.transaction_rw();
+    try eth.deleteStorageTrieNode(missing, types.keccakOfU160(address), child.path);
+    try f.store.table(missing, .storage).drop(false);
+    try missing.commit();
+    try views.publish(a);
+    var absent = try reader.acquire(parent(header));
+    defer absent.deinit();
+    try absent.enableNodeCache(a, .{});
+    _ = try absent.readNode(alloc, address, root.path, root.expected_hash);
+    try std.testing.expectError(error.SubTrieNotAvailable, absent.readNode(alloc, address, child.path, child.expected_hash));
+    _ = try intact.readNode(alloc, address, child.path, child.expected_hash);
+}
+
+test "native node cache cancellation precedes hits and authorization publication" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const header = try f.write(1, 42, null);
+    var eth = native.Eth.init(&f.store);
+    var views: native.Snapshots = .{ .io = io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var reader: native.Reader = .{ .eth = &eth, .snapshots = &views };
+    defer reader.deinit();
+    var lease = try reader.acquire(parent(header));
+    defer lease.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // Inject cancellation at the real Io boundary, without scheduling races or
+    // changing any lock/database implementation used by the original Io.
+    const Cancel = struct {
+        var calls: usize = 0;
+        var fail_at: usize = 0;
+        fn check(_: ?*anyopaque) std.Io.Cancelable!void {
+            calls += 1;
+            if (calls == fail_at) return error.Canceled;
+        }
+    };
+    var vtable = io.vtable.*;
+    vtable.checkCancel = Cancel.check;
+    views.io = .{ .userdata = io.userdata, .vtable = &vtable };
+    defer views.io = io;
+    Cancel.calls = 0;
+    Cancel.fail_at = 2;
+    try std.testing.expectError(error.Canceled, lease.enableNodeCache(a, .{}));
+    try std.testing.expect(!lease.nodeCacheStats().enabled);
+    Cancel.fail_at = 0;
+    try lease.enableNodeCache(a, .{});
+    Cancel.calls = 0;
+    Cancel.fail_at = 2;
+    try std.testing.expectError(error.Canceled, lease.readNode(alloc, null, &.{}, header.state_root));
+    try std.testing.expectEqual(@as(usize, 1), lease.nodeCacheStats().entries);
+    try std.testing.expectEqual(@as(usize, 0), lease.nodeCacheStats().retained_bytes);
+    Cancel.fail_at = 0;
+    const bytes = try lease.readNode(alloc, null, &.{}, header.state_root);
+    const before = lease.nodeCacheStats();
+    Cancel.calls = 0;
+    Cancel.fail_at = 1;
+    try std.testing.expectError(error.Canceled, lease.readNode(alloc, null, &.{}, header.state_root));
+    try std.testing.expectEqual(before, lease.nodeCacheStats());
+    Cancel.fail_at = 0;
+    try std.testing.expectEqualSlices(u8, bytes, try lease.readNode(alloc, null, &.{}, header.state_root));
+}
+
+fn cacheAllocationRead(allocator: std.mem.Allocator, reader: *native.Reader, p: native.Parent) !void {
+    var lease = try reader.acquire(p);
+    defer lease.deinit();
+    try lease.enableNodeCache(allocator, .{ .max_entries = 32, .max_bytes = 4096 });
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const root = (try lease.readAccount(alloc, address)).storage_hash;
+    const first = try lease.readNode(alloc, address, &.{}, root);
+    try std.testing.expectEqualSlices(u8, first, try lease.readNode(alloc, address, &.{}, root));
+}
+
+test "native cache allocation failures release admission metadata and preimages" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const header = try f.write(1, 42, null);
+    var eth = native.Eth.init(&f.store);
+    var views: native.Snapshots = .{ .io = io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var reader: native.Reader = .{ .eth = &eth, .snapshots = &views };
+    defer reader.deinit();
+    const deterministic: std.mem.Allocator = .{ .ptr = a.ptr, .vtable = &.{
+        .alloc = a.vtable.alloc,
+        .resize = std.mem.Allocator.noResize,
+        .remap = std.mem.Allocator.noRemap,
+        .free = a.vtable.free,
+    } };
+    try std.testing.checkAllAllocationFailures(deterministic, cacheAllocationRead, .{ &reader, parent(header) });
+    try std.testing.expectEqual(@as(usize, 0), reader.active_leases);
+    try cacheAllocationRead(a, &reader, parent(header));
+    try std.testing.expectEqual(@as(usize, 0), reader.active_leases);
+}
+
+test "native cache edge decoder rejects malformed boundaries before authorization" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const terminal: [64]u8 = @splat(0);
+    const leaf = [_]u8{ 0xc2, 0x20, 0x01 };
+    try std.testing.expectEqual(@as(usize, 0), (try trie.Trie.hashedChildReferences(alloc, &leaf, &terminal)).count);
+    try std.testing.expectError(error.MalformedTrieNode, trie.Trie.hashedChildReferences(alloc, &leaf, &.{}));
+    try std.testing.expectError(error.MalformedTrieNode, trie.Trie.hashedChildReferences(alloc, &.{ 0xc2, 0x80, 0x80 }, &.{}));
+    try std.testing.expectError(error.MalformedTrieNode, trie.Trie.hashedChildReferences(alloc, &.{ 0xc2, 0x20, 0x01, 0x00 }, &terminal));
+    try std.testing.expectError(error.InvalidTrieNodePath, trie.Trie.hashedChildReferences(alloc, &leaf, &.{16}));
 }
