@@ -36,6 +36,35 @@ pub const Store = struct {
         return initBounded(allocator, path, 8 << 40, 16 << 30);
     }
 
+    /// Open an existing database without creating tables, starting a writer,
+    /// or changing geometry/sync policy. MDBX still maintains its reader lock
+    /// table; this is not a promise of zero filesystem writes. Use one Store per
+    /// path per process. A separate constructor process can publish the current
+    /// verified checkpoint into its own Snapshots and acquire that exact view;
+    /// it cannot recover arbitrary historical views by opening this database.
+    pub fn openReadOnly(allocator: std.mem.Allocator, path: []const u8) !Store {
+        const init_path = try allocator.dupeSentinel(u8, path, 0);
+        defer allocator.free(init_path);
+        const env = try lmdbx.Environment.init(init_path, .{
+            .max_dbs = table_count,
+            .read_only = true,
+            .no_read_ahead = true,
+            .no_sticky_threads = true,
+        });
+        errdefer env.deinit() catch {};
+        const txn = try env.transaction(.{ .mode = .ReadOnly });
+        errdefer txn.abort() catch {};
+        var dbis: [table_count]lmdbx.Database.DBI = undefined;
+        for (std.enums.values(Table)) |t| {
+            const db = try txn.database(@tagName(t), t.options());
+            dbis[@backingInt(t)] = db.dbi;
+        }
+        // Committing a RO transaction publishes its opened DBI handles; it
+        // performs no state write. Aborting would invalidate newly opened DBIs.
+        try txn.commit();
+        return .{ .env = env, .dbis = dbis };
+    }
+
     pub fn initBounded(allocator: std.mem.Allocator, path: []const u8, upper_size: isize, growth_step: isize) !Store {
         if (growth_step <= 0 or growth_step > upper_size) return error.InvalidDatabaseLimit;
         const init_path = try allocator.dupeSentinel(u8, path, 0);

@@ -233,6 +233,26 @@ pub fn build(b: *std.Build) void {
     const native_opts = b.addOptions();
     native_opts.addOption(State, "state", .empty);
     native_opts.addOption(Platform, "platform", .native);
+    // Independent state-reader module; consumers can retain a separately pinned
+    // execution engine. This needs only RLP and MDBX, not node/EVM libraries.
+    const native_state = b.addModule("native_state", .{
+        .root_source_file = b.path("src/native_state.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    native_state.addOptions("build_options", native_opts);
+    native_state.addImport("rlp", deps.rlp_mod);
+    native_state.addImport("lmdbx", mdbx_dep.module("lmdbx"));
+    const native_state_tests = b.addTest(.{
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/native_state_tests.zig"), .target = target, .optimize = optimize, .link_libc = true }),
+        .use_llvm = true,
+    });
+    native_state_tests.root_module.addOptions("build_options", native_opts);
+    native_state_tests.root_module.addImport("rlp", deps.rlp_mod);
+    native_state_tests.root_module.addImport("lmdbx", mdbx_dep.module("lmdbx"));
+    b.step("test-native-state", "Qualify native exact-parent state leases and direct reads")
+        .dependOn(&b.addRunArtifact(native_state_tests).step);
     unit_tests.root_module.addOptions("build_options", native_opts);
     linkDeps(unit_tests.root_module, deps, .native);
     unit_tests.root_module.addImport("cache", cache_dep.module("cache"));

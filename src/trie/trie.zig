@@ -260,20 +260,33 @@ pub const Trie = struct {
     /// must match the hash committed by the requested root. Missing nodes are
     /// errors, never evidence of absence. Memory belongs to the caller's arena.
     pub fn prove(self: *const Self, key: [32]u8) !Proof {
+        return self.readAuthenticated(key, true);
+    }
+
+    /// Read through authenticated hash references without collecting a proof
+    /// vector. Returned bytes belong to this trie's allocator, never the DB.
+    /// An unresolved/corrupt path is an error, not evidence of absence.
+    pub fn getAuthenticated(self: *const Self, key: [32]u8) !?[]const u8 {
+        return (try self.readAuthenticated(key, false)).value;
+    }
+
+    fn readAuthenticated(self: *const Self, key: [32]u8, comptime collect: bool) !Proof {
         var reader = self.*;
         var root = self.root;
         var node = &root;
         var key_buf: [64]u8 = undefined;
         const nibbles = writeHexKey(&key, &key_buf);
         var depth: usize = 0;
+        var resolved: usize = 0;
         var nodes = std.array_list.Managed([]const u8).init(self.allocator);
         while (true) {
             switch (node.*) {
                 .hashed => |hashed| {
-                    if (hashed.len != 32 or nodes.items.len >= 65) return error.MalformedTrieNode;
+                    if (hashed.len != 32 or resolved >= 65) return error.MalformedTrieNode;
                     const owned = try self.verifiedNode(hashed, nibbles[0..depth]);
-                    try nodes.append(owned);
+                    if (collect) try nodes.append(owned);
                     try reader.decodeNode(node, owned, null);
+                    resolved += 1;
                 },
                 .branch => |*branch| {
                     if (depth >= 64) return error.MalformedTrieNode;
