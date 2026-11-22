@@ -164,6 +164,9 @@ pub fn build(b: *std.Build) void {
     const snappy_dep = b.dependency("snappy", .{ .target = target, .optimize = optimize });
     const cache_dep = b.dependency("cache", .{ .target = target, .optimize = optimize });
     const mdbx_dep = b.dependency("lmdbx", .{ .target = target, .optimize = optimize });
+    // Keep mandatory consistency failures fatal even when the wrapper builds
+    // with MDBX_DEBUG=-1 to suppress routine logs.
+    mdbx_dep.module("lmdbx").addCMacro("MDBX_CHECKING", "0");
     const metrics_dep = b.dependency("metrics", .{ .target = target, .optimize = optimize });
 
     const mcl_lib = buildMcl(b, mcl_dep, target);

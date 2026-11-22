@@ -14,6 +14,28 @@ const a = std.testing.allocator;
 const io = std.testing.io;
 const address: u160 = 0x1234;
 
+fn requireMandatoryMdbxChecks(options: []const u8) !void {
+    var fields = std.mem.tokenizeScalar(u8, options, ' ');
+    while (fields.next()) |field| {
+        if (!std.mem.startsWith(u8, field, "CHECKING=")) continue;
+        const value = field["CHECKING=".len..];
+        if (try std.fmt.parseInt(i8, value, 10) < 0) return error.MdbxMandatoryChecksDisabled;
+        return;
+    }
+    return error.MdbxCheckingOptionMissing;
+}
+
+test "native linked MDBX retains mandatory failure checks" {
+    // Inspect the linked C object, not a Zig/header macro: DEBUG=-1 otherwise
+    // defaults CHECKING to -1 and silently suppresses fatal mutex failures.
+    const options = @import("lmdbx").c.mdbx_build.options;
+    try std.testing.expect(options != null);
+    try requireMandatoryMdbxChecks(std.mem.span(options));
+    try requireMandatoryMdbxChecks("DEBUG=-1 CHECKING=0 WORDBITS=64");
+    try std.testing.expectError(error.MdbxMandatoryChecksDisabled, requireMandatoryMdbxChecks("DEBUG=-1 CHECKING=-1 WORDBITS=64"));
+    try std.testing.expectError(error.MdbxCheckingOptionMissing, requireMandatoryMdbxChecks("DEBUG=-1 WORDBITS=64"));
+}
+
 /// Real bounded MDBX, with separately owned stable Store/Eth/Snapshots/Reader.
 /// Each test declares owners before leases, so reverse defers release leases
 /// before snapshots and the database. Writers replace flat/trie state in one

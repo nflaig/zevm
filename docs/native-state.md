@@ -81,6 +81,19 @@ process's registry and acquire its exact hash/root before the writer advances.
 This cannot retrieve historical views that the process never retained, and is
 not a replacement for a shared owner's lease service.
 
+Processes sharing an MDBX lock file must use the same PID namespace. In Docker,
+an isolated reader joins the writer with `--pid=container:<writer-id>` while its
+network can remain disabled. A successful reconstruction is insufficient if
+MDBX reports a lock error: stop the qualification, preserve diagnostics and
+recover the isolated environment before retrying. Do not delete or replace a
+lock file while an environment is open.
+
+The build explicitly sets `MDBX_CHECKING=0`, retaining mandatory consistency
+failure handling even though the dependency uses `MDBX_DEBUG=-1` to silence
+routine logs. Without the override, fatal unlock failures can be logged and
+execution can continue. The native suite checks the linked C library's actual
+build options. See [qualification](mdbx-checking-qualification-20261122.json).
+
 Run `zig build test-native-state -Doptimize=debug` and `-Doptimize=safe` with the
 pinned compiler. Tests use a real temporary MDBX with writer changes, sibling
 branches, retained leases, eviction, authenticated absence, corruption, bounded
