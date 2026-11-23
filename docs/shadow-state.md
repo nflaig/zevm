@@ -14,7 +14,22 @@ python3 test/shadow_crash_test.py --probe ./zig-out/bin/shadow-crash-probe
 ```
 
 Start in a fresh, dedicated directory with `--shadow-state`, independent peer
-ports and localhost HTTP. The shadow DB has a 16 GiB maximum with 256 MiB growth.
+ports and localhost HTTP. The shadow DB defaults to a 16 GiB maximum with 256 MiB
+growth. `--shadow-state-max-db-gib <1..128>` admits a larger or smaller explicit
+cap only with `--shadow-state`; it never grows automatically beyond that cap.
+An existing `mdbx.dat` larger than the requested cap is refused before opening
+MDBX. The configured cap and actual geometry are logged on startup. This bounds
+the MDBX data file, including trie/code tables and copy-on-write history; it does
+not bound process RAM, static header files or logs. A map-full transaction aborts
+without publishing a partial checkpoint. A real MDBX regression fills a small
+map, preserves its previous root and retained lease, rejects a smaller reopen,
+and verifies recovery after a larger explicit cap is admitted.
+Lowering a previously configured upper bound is allowed only while the existing
+file still fits. An older binary with a fixed 16 GiB cap must use a separate
+directory after a shadow database has grown beyond 16 GiB; never assume a binary
+rollback also rolls back database geometry. Standalone witness/native benchmarks
+open existing state read-only and do not change geometry; temporary fixture and
+crash-probe databases are not production state directories.
 Apply CPU, memory, PID and log limits to the process/container independently.
 Never mount an existing execution client's database into this process.
 
@@ -96,6 +111,14 @@ transaction. Readers clone retained read-only transactions so concurrent writes
 or retention eviction do not relabel old state. Code bytes and proof preimages
 are copied before releasing the read transaction. Each resolved proof node,
 including flat-state leaves, is hash-checked; missing data never means zero.
+
+Downloader writes and DBI initialization own their MDBX transaction until commit
+is attempted. MDBX consumes the handle on both successful and failed commits
+(except a wrong-thread rejection), so cleanup never aborts it a second time.
+An aborted-commit result is an error, and state publication remains strictly
+after a successful commit. Real MDBX regressions preserve the old authenticated
+checkpoint/lease across a broken commit and a later error after successful commit.
+Write/commit failures propagate out of the downloader; no tight retry is added.
 
 Restart resumes the state checkpoint rather than the header tip. A checkpoint
 whose header is unavailable or no longer matches is rejected. A directory from

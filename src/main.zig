@@ -53,6 +53,7 @@ pub const std_options: std.Options = .{
 };
 
 const Network = enum { glamsterdam_devnet8, mainnet, sepolia };
+const shadow_limits = @import("shadow_limits.zig");
 
 const params = clap.parseParamsComptime(
     \\-h, --help                Display this help and exit.
@@ -69,6 +70,7 @@ const params = clap.parseParamsComptime(
     \\    --metrics-addr <str>  Prometheus metrics HTTP listening address (default: 127.0.0.1).
     \\    --metrics-port <u16>  Prometheus metrics HTTP listening port (default: 6060).
     \\    --shadow-state        Enable exact-parent state witness qualification.
+    \\    --shadow-state-max-db-gib <str> Explicit shadow MDBX cap in GiB (1..128; default 16; requires --shadow-state).
     \\    --shadow-beacon-url <str> Follow a trusted local post-Gloas beacon node (requires --shadow-state).
     \\    --public-intake-observer Observe independent public transaction hashes/times (requires --shadow-state; never feeds construction).
     \\    --native-builder       Run an embedded shadow constructor (requires a combined binary and trusted beacon; never publishes bids).
@@ -96,6 +98,7 @@ const Options = struct {
     authrpc_jwtsecret: ?[]const u8,
     metrics_addr: std.Io.net.IpAddress,
     shadow_state: bool,
+    shadow_database_limit: isize,
     shadow_beacon_url: ?[]const u8,
     public_intake_observer: bool,
     native_builder: bool,
@@ -126,6 +129,7 @@ const Options = struct {
         const authrpc_port = res.args.@"authrpc-port" orelse 8551;
         const metrics_addr = res.args.@"metrics-addr" orelse "127.0.0.1";
         const metrics_port = res.args.@"metrics-port" orelse 6060;
+        const shadow_database_limit = try shadow_limits.parseDatabaseLimit(res.args.@"shadow-state" != 0, res.args.@"shadow-state-max-db-gib");
         if (res.args.@"shadow-beacon-url" != null and res.args.@"shadow-state" == 0)
             return error.ShadowStateRequired;
         if (res.args.@"public-intake-observer" != 0 and res.args.@"shadow-state" == 0)
@@ -150,6 +154,7 @@ const Options = struct {
             .builder_output_dir = res.args.@"native-builder-output-dir",
             .builder_every_slots = every_slots,
             .shadow_state = res.args.@"shadow-state" != 0,
+            .shadow_database_limit = shadow_database_limit,
             .shadow_beacon_url = res.args.@"shadow-beacon-url",
             .public_intake_observer = res.args.@"public-intake-observer" != 0,
             .config = switch (network) {
@@ -244,10 +249,14 @@ fn runNode(init: std.process.Init, opts: Options, comptime Builder: type) !void 
     defer fs.deinit(init.io, slabs.allocator()) catch |e| std.log.err("closing file storage failed: {}", .{e});
 
     var store = if (opts.shadow_state)
-        try kv.Store.initBounded(slabs.allocator(), mdbx_path, 16 << 30, 256 << 20)
+        try kv.Store.initBoundedChecked(init.io, slabs.allocator(), mdbx_path, opts.shadow_database_limit, shadow_limits.database_growth_bytes)
     else
         try kv.Store.init(slabs.allocator(), mdbx_path);
     defer store.deinit() catch |e| std.log.err("closing mdbx failed: {}", .{e});
+    if (opts.shadow_state) {
+        const geometry = (try store.env.info()).geo;
+        std.log.info("shadow database bound: configured {} bytes, current {} bytes, upper {} bytes", .{ opts.shadow_database_limit, geometry.current, geometry.upper });
+    }
     var eth_db = EthDb.init(&store);
 
     var bc = try Blockchain.init(init.io, slabs.allocator(), opts.config, &fs, &eth_db);

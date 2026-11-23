@@ -7,6 +7,49 @@ const lmdbx = @import("lmdbx");
 pub const Transaction = lmdbx.Transaction;
 pub const Cursor = lmdbx.Cursor;
 
+/// Owns one MDBX handle. Do not copy; borrow `txn` only before commit/deinit.
+/// Commit consumes a valid handle on success AND failure, except the documented
+/// wrong-thread rejection. A later fallible operation must never abort it again.
+pub const OwnedTransaction = struct {
+    txn: Transaction,
+    live: bool = true,
+
+    pub fn deinit(self: *OwnedTransaction) void {
+        if (self.live) {
+            self.live = false;
+            self.txn.abort() catch unreachable;
+        }
+    }
+
+    pub fn commit(self: *OwnedTransaction) !void {
+        std.debug.assert(self.live);
+        self.live = false;
+        const rc = lmdbx.c.mdbx_txn_commit(self.txn.ptr);
+        if (rc == lmdbx.c.MDBX_SUCCESS) return;
+        // The wrapper's generic throw accepts RESULT_TRUE, but for commit this
+        // means a previously broken transaction was aborted. Never publish it.
+        if (rc == lmdbx.c.MDBX_RESULT_TRUE) return error.DatabaseTransactionAborted;
+        if (rc == lmdbx.c.MDBX_THREAD_MISMATCH) self.live = true;
+        inline for (@typeInfo(lmdbx.Error).error_set.error_names.?) |name| {
+            if (@hasDecl(lmdbx.c, name)) {
+                if (rc == @field(lmdbx.c, name)) return @field(lmdbx.Error, name);
+            }
+        }
+        return switch (rc) {
+            lmdbx.c.MDBX_EINVAL => error.INVAL,
+            lmdbx.c.MDBX_EACCESS => error.ACCESS,
+            lmdbx.c.MDBX_ENOMEM => error.NOMEM,
+            lmdbx.c.MDBX_EROFS => error.ROFS,
+            lmdbx.c.MDBX_ENOSYS => error.NOSYS,
+            lmdbx.c.MDBX_EIO => error.IO,
+            lmdbx.c.MDBX_EPERM => error.PERM,
+            lmdbx.c.MDBX_EINTR => error.INTR,
+            lmdbx.c.MDBX_EDEADLK => error.DEADLK,
+            else => error.MDBX_UNKNOWN_ERROR,
+        };
+    }
+};
+
 pub const Table = enum {
     accounts,
     storage,
@@ -52,8 +95,9 @@ pub const Store = struct {
             .no_sticky_threads = true,
         });
         errdefer env.deinit() catch {};
-        const txn = try env.transaction(.{ .mode = .ReadOnly });
-        errdefer txn.abort() catch {};
+        var owned: OwnedTransaction = .{ .txn = try env.transaction(.{ .mode = .ReadOnly }) };
+        defer owned.deinit();
+        const txn = owned.txn;
         var dbis: [table_count]lmdbx.Database.DBI = undefined;
         for (std.enums.values(Table)) |t| {
             const db = try txn.database(@tagName(t), t.options());
@@ -61,7 +105,7 @@ pub const Store = struct {
         }
         // Committing a RO transaction publishes its opened DBI handles; it
         // performs no state write. Aborting would invalidate newly opened DBIs.
-        try txn.commit();
+        try owned.commit();
         return .{ .env = env, .dbis = dbis };
     }
 
@@ -92,8 +136,9 @@ pub const Store = struct {
 
         var dbis: [table_count]lmdbx.Database.DBI = undefined;
 
-        const txn = try env.transaction(.{ .mode = .ReadWrite });
-        errdefer txn.abort() catch {};
+        var owned: OwnedTransaction = .{ .txn = try env.transaction(.{ .mode = .ReadWrite }) };
+        defer owned.deinit();
+        const txn = owned.txn;
 
         for (std.enums.values(Table)) |t| {
             var opts = t.options();
@@ -102,9 +147,31 @@ pub const Store = struct {
             dbis[@backingInt(t)] = db.dbi;
         }
 
-        try txn.commit();
+        try owned.commit();
 
         return .{ .env = env, .dbis = dbis };
+    }
+
+    /// Shadow admission checks the existing allocation before MDBX can change
+    /// geometry. One writer owns this directory; concurrent opens/geometry
+    /// changes by another owner are outside the Store contract.
+    pub fn initBoundedChecked(io: std.Io, allocator: std.mem.Allocator, path: []const u8, upper_size: isize, growth_step: isize) !Store {
+        if (growth_step <= 0 or growth_step > upper_size) return error.InvalidDatabaseLimit;
+        const dir = try std.Io.Dir.cwd().openDir(io, path, .{});
+        defer dir.close(io);
+        const existing: ?std.Io.File.Stat = dir.statFile(io, "mdbx.dat", .{}) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (existing) |stat| {
+            if (stat.size > @as(u64, @intCast(upper_size))) return error.ShadowDatabaseAlreadyLarger;
+        }
+        var store = try initBounded(allocator, path, upper_size, growth_step);
+        errdefer store.deinit() catch {};
+        const geometry = (try store.env.info()).geo;
+        if (geometry.current > @as(u64, @intCast(upper_size)) or geometry.upper > @as(u64, @intCast(upper_size)))
+            return error.ShadowDatabaseLimitNotApplied;
+        return store;
     }
 
     pub fn deinit(self: *Store) !void {

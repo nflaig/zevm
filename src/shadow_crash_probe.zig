@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
     const path = args.next() orelse return error.MissingDirectory;
     if (args.next() != null) return error.InvalidArguments;
     const a = init.arena.allocator();
-    var store = try kv.Store.initBounded(a, path, 64 << 20, 1 << 20);
+    var store = try kv.Store.initBoundedChecked(init.io, a, path, 64 << 20, 1 << 20);
     defer store.deinit() catch {};
     var eth = Eth.init(&store);
     const key = types.keccakOfU160(0x1111);
@@ -55,9 +55,9 @@ pub fn main(init: std.process.Init) !void {
     const initial = std.mem.eql(u8, mode, "init");
     const before = std.mem.eql(u8, mode, "before-commit");
     if (!initial and !before and !std.mem.eql(u8, mode, "after-commit")) return error.InvalidArguments;
-    const txn = try store.transaction_rw();
-    var committed = false;
-    defer if (!committed) txn.abort() catch {};
+    var owned: kv.OwnedTransaction = .{ .txn = try store.transaction_rw() };
+    defer owned.deinit();
+    const txn = owned.txn;
     const previous = try snapshots.readCheckpoint(&store, txn, a);
     if ((initial and previous != null) or (!initial and (previous == null or previous.?.number != 1))) return error.UnexpectedCheckpoint;
     inline for (.{ .accounts, .account_trie }) |table| try store.table(txn, table).drop(false);
@@ -77,8 +77,7 @@ pub fn main(init: std.process.Init) !void {
     try snapshots.writeCheckpoint(&store, txn, a, header);
     if (previous) |p| try branches.select(&store, txn, a, p, &.{header}) else try branches.initialize(&store, txn, a, header);
     if (before) try pause(init.io, mode);
-    try txn.commit();
-    committed = true;
+    try owned.commit();
     if (!initial) try pause(init.io, mode);
     try emit(init.io, .{ .initialized = true });
 }

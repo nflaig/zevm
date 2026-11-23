@@ -651,9 +651,9 @@ pub const Downloader = struct {
     /// head. Only a persisted fixed consensus anchor authorizes restarting an
     /// incomplete bootstrap. Partial flat tables never become readable views.
     pub fn enableShadow(self: *Self, snapshots: *@import("../db/snapshot.zig").Snapshots, restart_bootstrap: bool) !void {
-        const txn = try self.eth_db.kv_store.transaction_rw();
-        var committed = false;
-        defer if (!committed) txn.abort() catch unreachable;
+        var owned: kv.OwnedTransaction = .{ .txn = try self.eth_db.kv_store.transaction_rw() };
+        defer owned.deinit();
+        const txn = owned.txn;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const checkpoint = try snapshots_db.readCheckpoint(self.eth_db.kv_store, txn, arena.allocator());
@@ -665,8 +665,7 @@ pub const Downloader = struct {
             const saved = try self.bc.readHeader(header.number) orelse return error.StateCheckpointHeaderUnavailable;
             if (!std.meta.eql(saved.hash(), header.hash())) return error.StateCheckpointBranchMismatch;
             try branches.initialize(self.eth_db.kv_store, txn, arena.allocator(), header);
-            try txn.commit();
-            committed = true;
+            try owned.commit();
             self.bc.shadow_branches.store(true, .release);
             self.state = .{ .pivot = header, .phase = .catchup };
             try snapshots.publish(self.allocator);
@@ -677,8 +676,7 @@ pub const Downloader = struct {
             const anchor = try self.readConsensusAnchor(txn, arena.allocator()) orelse return error.IncompleteStateCheckpoint;
             const header = try @import("../db/bootstrap.zig").restart(self.eth_db.kv_store, txn, arena.allocator(), anchor.execution_hash);
             if (header.slot_number.? > anchor.slot) return error.BootstrapBranchMismatch;
-            try txn.commit();
-            committed = true;
+            try owned.commit();
             self.pending_bootstrap = header;
             log.info("shadow restarting incomplete bootstrap at fixed anchor {} hash {x}; no state view published", .{ header.number, header.hash() });
         } else if ((try self.bc.head()).number != 0) return error.IncompleteStateCheckpoint;
@@ -793,13 +791,14 @@ pub const Downloader = struct {
             defer arena.deinit();
             const allocator = arena.allocator();
             const store = self.eth_db.kv_store;
-            const txn = try store.transaction_rw();
-            errdefer txn.abort() catch unreachable;
+            var owned: kv.OwnedTransaction = .{ .txn = try store.transaction_rw() };
+            defer owned.deinit();
+            const txn = owned.txn;
             var encoded = std.array_list.Managed(u8).init(allocator);
             try rlp.serialize(consensus.Anchor, allocator, anchor, &encoded);
             try store.table(txn, .state_meta).set("consensus-anchor-v1", encoded.items, .Create);
             try branches.initialize(store, txn, allocator, header);
-            try txn.commit();
+            try owned.commit();
             self.consensus_anchor = anchor;
             try self.startBootstrap(header);
             log.info("shadow anchored bootstrap: beacon slot {}, execution {} hash {x}", .{ anchor.slot, header.number, expected });
@@ -905,10 +904,11 @@ pub const Downloader = struct {
         }
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const txn = try self.eth_db.kv_store.transaction_rw();
-        errdefer txn.abort() catch unreachable;
+        var owned: kv.OwnedTransaction = .{ .txn = try self.eth_db.kv_store.transaction_rw() };
+        defer owned.deinit();
+        const txn = owned.txn;
         try branches.rememberAncestors(self.eth_db.kv_store, txn, arena.allocator(), request.origin.hash, headers);
-        try txn.commit();
+        try owned.commit();
         self.free_eth_requests.push(req);
         self.ancestor_probe = null;
         log.debug("shadow cached {} hash-linked ancestors", .{headers.len});
@@ -916,15 +916,14 @@ pub const Downloader = struct {
 
     fn publishHashedState(self: *Self, header: types.BlockHeader) !void {
         const snapshots = self.shadow_snapshots orelse return;
-        const txn = try self.eth_db.kv_store.transaction_rw();
-        var committed = false;
-        errdefer if (!committed) txn.abort() catch unreachable;
+        var owned: kv.OwnedTransaction = .{ .txn = try self.eth_db.kv_store.transaction_rw() };
+        defer owned.deinit();
+        const txn = owned.txn;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         try snapshots_db.writeCheckpoint(self.eth_db.kv_store, txn, arena.allocator(), header);
         try branches.initialize(self.eth_db.kv_store, txn, arena.allocator(), header);
-        try txn.commit();
-        committed = true;
+        try owned.commit();
         self.bc.shadow_branches.store(true, .release);
         try snapshots.publish(self.allocator);
         self.sync_target_mutex.lockUncancelable(self.io);
@@ -1349,9 +1348,9 @@ pub const Downloader = struct {
         defer arena.deinit();
         const allocator = arena.allocator();
         const store = self.eth_db.kv_store;
-        const txn = try store.transaction_rw();
-        var committed = false;
-        defer if (!committed) txn.abort() catch unreachable;
+        var owned: kv.OwnedTransaction = .{ .txn = try store.transaction_rw() };
+        defer owned.deinit();
+        const txn = owned.txn;
         const selected = try branches.state(store, txn) orelse return error.StateNotReady;
         var checkpoint = try snapshots_db.readCheckpoint(store, txn, allocator) orelse return error.StateNotReady;
         // Limit selected-header lead so all catch-up parents stay in the bounded
@@ -1377,8 +1376,7 @@ pub const Downloader = struct {
         // Rewind, selected headers and verified checkpoint commit together.
         if (checkpoint.number > ancestor.number) checkpoint = try undo.rewind(self.eth_db, txn, allocator, ancestor.hash());
         try branches.select(store, txn, allocator, ancestor, headers);
-        try txn.commit();
-        committed = true;
+        try owned.commit();
         const rewound = selected.head.number - ancestor.number;
         if (rewound > 0) {
             log.info("shadow reorg recovered: old head {}, ancestor {}, selected {}, depth {}", .{ selected.head.number, ancestor.number, end, rewound });
@@ -1619,8 +1617,9 @@ pub const Downloader = struct {
             };
             if (from == null and !std.meta.eql(root, expected_root)) return error.RootMismatch;
             if (nodes.len > 0) {
-                const txn = try self.eth_db.kv_store.transaction_rw();
-                errdefer txn.abort() catch unreachable;
+                var owned: kv.OwnedTransaction = .{ .txn = try self.eth_db.kv_store.transaction_rw() };
+                defer owned.deinit();
+                const txn = owned.txn;
                 if (owner) |account| {
                     try self.eth_db.deleteStorageTrieFrom(txn, account, nodes[0].path);
                     try self.eth_db.appendStorageTrie(txn, account, nodes, false);
@@ -1628,7 +1627,7 @@ pub const Downloader = struct {
                     try self.eth_db.deleteAccountTrieFrom(txn, nodes[0].path);
                     try self.eth_db.appendAccountTrie(txn, nodes);
                 }
-                try txn.commit();
+                try owned.commit();
             }
 
             for (storage_jobs.items) |job| self.task_group.async(self.io, hashTrieTask, .{ self, job[0], job[1] });
@@ -1799,10 +1798,9 @@ pub const Downloader = struct {
 
     fn persistAccounts(self: *Self, accounts: VerifiedAccounts, response: *const snap.AccountRange) !void {
         const txn_start = std.Io.Timestamp.now(self.io, .awake);
-        const txn = try self.eth_db.kv_store.transaction_rw();
-        errdefer _ = txn.abort() catch |e| {
-            log.err("failed to abort txn {}", .{e});
-        };
+        var owned: kv.OwnedTransaction = .{ .txn = try self.eth_db.kv_store.transaction_rw() };
+        defer owned.deinit();
+        const txn = owned.txn;
 
         const write_op: lmdbx.Database.SetFlag = if (std.meta.eql(accounts.origin, accounts.limit)) .Upsert else .Append;
         const table = self.eth_db.kv_store.table(txn, .accounts);
@@ -1814,7 +1812,7 @@ pub const Downloader = struct {
             try self.eth_db.deleteAccount(txn, accounts.origin);
         }
 
-        try self.commitTxn(txn, "accounts", txn_start);
+        try self.commitTxn(&owned, "accounts", txn_start);
     }
 
     fn advanceStorageDownload(self: *Self) !void {
@@ -1961,16 +1959,15 @@ pub const Downloader = struct {
 
     fn persistStorage(self: *Self, storage: VerifiedStorage) !void {
         const txn_start = std.Io.Timestamp.now(self.io, .awake);
-        const txn = try self.eth_db.kv_store.transaction_rw();
-        errdefer _ = txn.abort() catch |e| {
-            log.err("failed to abort txn {}", .{e});
-        };
+        var owned: kv.OwnedTransaction = .{ .txn = try self.eth_db.kv_store.transaction_rw() };
+        defer owned.deinit();
+        const txn = owned.txn;
         for (storage.account_hashes, storage.keys, storage.values, storage.nodes) |account_hash, keys, values, nodes| {
             try self.eth_db.appendStorage(txn, account_hash, keys, values, !storage.chunk);
             if (nodes.len > 0)
                 try self.eth_db.appendStorageTrie(txn, account_hash, nodes, true);
         }
-        try self.commitTxn(txn, "storage", txn_start);
+        try self.commitTxn(&owned, "storage", txn_start);
     }
 
     fn requestSlots(self: *Self, new_req: *Request(snap.Message), req: *const Request(snap.Message), account: usize, start: u256, end: u256) !void {
@@ -2050,17 +2047,16 @@ pub const Downloader = struct {
 
     fn persistCodes(self: *Self, hashes: []const [32]u8, codes: []const []const u8) !void {
         const txn_start = std.Io.Timestamp.now(self.io, .awake);
-        const txn = try self.eth_db.kv_store.transaction_rw();
-        errdefer _ = txn.abort() catch |e| {
-            log.err("failed to abort txn {}", .{e});
-        };
+        var owned: kv.OwnedTransaction = .{ .txn = try self.eth_db.kv_store.transaction_rw() };
+        defer owned.deinit();
+        const txn = owned.txn;
         const table = self.eth_db.kv_store.table(txn, .codes);
         for (hashes, codes) |hash, code| {
             table.set(&hash, code, .Create) catch |e| {
                 if (e != lmdbx.Error.MDBX_KEYEXIST) return e;
             };
         }
-        try self.commitTxn(txn, "codes", txn_start);
+        try self.commitTxn(&owned, "codes", txn_start);
     }
 
     fn advanceStateHeal(self: *Self) !void {
@@ -2149,9 +2145,9 @@ pub const Downloader = struct {
 
     fn applyBal(self: *Self, bal: types.BlockAccessLists) !void {
         const txn_start = std.Io.Timestamp.now(self.io, .awake);
-        const txn = try self.eth_db.kv_store.transaction_rw();
-        var committed = false;
-        errdefer if (!committed) txn.abort() catch unreachable;
+        var owned: kv.OwnedTransaction = .{ .txn = try self.eth_db.kv_store.transaction_rw() };
+        defer owned.deinit();
+        const txn = owned.txn;
 
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
@@ -2232,8 +2228,7 @@ pub const Downloader = struct {
             self.state_heal.?.next_pivot,
         );
 
-        try self.commitTxn(txn, "bal", txn_start);
-        committed = true;
+        try self.commitTxn(&owned, "bal", txn_start);
         if (publish_shadow) try self.shadow_snapshots.?.publish(self.allocator);
     }
 
@@ -2326,9 +2321,9 @@ pub const Downloader = struct {
         return true;
     }
 
-    fn commitTxn(self: *Self, txn: kv.Transaction, op: []const u8, started_at: std.Io.Timestamp) !void {
+    fn commitTxn(self: *Self, owned: *kv.OwnedTransaction, op: []const u8, started_at: std.Io.Timestamp) !void {
         const commit_start = std.Io.Timestamp.now(self.io, .awake);
-        try txn.commit();
+        try owned.commit();
         self.metrics.db_commit_seconds.observe(.{ .op = op }, secondsSince(self.io, commit_start)) catch {};
         self.metrics.db_txn_seconds.observe(.{ .op = op }, secondsSince(self.io, started_at)) catch {};
     }

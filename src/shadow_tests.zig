@@ -3,6 +3,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const kv = @import("db/kv.zig");
+const lmdbx = @import("lmdbx");
 const Eth = @import("db/eth.zig").Eth;
 const snapshots = @import("db/snapshot.zig");
 const Shadow = @import("rpc/shadow.zig").Shadow;
@@ -18,6 +19,7 @@ const bootstrap = @import("db/bootstrap.zig");
 
 test {
     _ = @import("node/consensus.zig");
+    _ = @import("shadow_limits.zig");
 }
 
 const queries = [_]Shadow.Query{
@@ -100,12 +102,16 @@ const Fixture = struct {
     store: kv.Store,
 
     fn init() !Fixture {
+        return initWithLimit(64 << 20);
+    }
+
+    fn initWithLimit(upper_size: isize) !Fixture {
         var dir = std.testing.tmpDir(.{});
         errdefer dir.cleanup();
         try dir.dir.createDir(std.testing.io, "db", .default_dir);
         var path: [1024]u8 = undefined;
         const size = try dir.dir.realPathFile(std.testing.io, "db", &path);
-        return .{ .dir = dir, .store = try kv.Store.initBounded(a, path[0..size], 64 << 20, 1 << 20) };
+        return .{ .dir = dir, .store = try kv.Store.initBoundedChecked(std.testing.io, a, path[0..size], upper_size, 1 << 20) };
     }
 
     fn deinit(self: *Fixture) void {
@@ -180,6 +186,170 @@ const Fixture = struct {
 
 fn parent(header: types.BlockHeader) Shadow.Parent {
     return .{ .blockHash = .{ .bytes = header.hash() }, .stateRoot = .{ .bytes = header.state_root } };
+}
+
+test "shadow database cap aborts full writes preserves leases and reopens only at an admitted limit" {
+    var f = try Fixture.initWithLimit(4 << 20);
+    var store_open = true;
+    defer {
+        if (store_open) f.store.deinit() catch unreachable;
+        f.dir.cleanup();
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const base = try f.write(1, 42, true);
+    const value = try alloc.alloc(u8, 64 << 10);
+    @memset(value, 0xab);
+    {
+        var eth = Eth.init(&f.store);
+        var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
+        defer views.deinit();
+        try views.publish(a);
+        const lease = try views.acquire(base.hash(), base.state_root);
+        defer lease.deinit();
+        var owned: kv.OwnedTransaction = .{ .txn = try f.store.transaction_rw() };
+        defer owned.deinit();
+        const txn = owned.txn;
+        const table = f.store.table(txn, .state_meta);
+        try table.set("must-rollback-on-map-full", "uncommitted", .Upsert);
+        var failed = false;
+        for (0..128) |i| {
+            var key: [32]u8 = undefined;
+            const encoded = try std.fmt.bufPrint(&key, "cap-fill-{}", .{i});
+            table.set(encoded, value, .Upsert) catch |err| {
+                try std.testing.expectEqual(error.MDBX_MAP_FULL, err);
+                failed = true;
+                break;
+            };
+        }
+        try std.testing.expect(failed);
+        owned.deinit();
+        try std.testing.expect((try f.store.env.info()).geo.current <= 4 << 20);
+        const latest = try f.store.transaction_ro();
+        defer latest.abort() catch unreachable;
+        try std.testing.expectEqual(null, try f.store.table(latest, .state_meta).get("must-rollback-on-map-full"));
+        try std.testing.expectEqual(null, try f.store.table(latest, .state_meta).get("cap-fill-0"));
+        try std.testing.expectEqual(base.hash(), (try snapshots.readCheckpoint(&f.store, latest, alloc)).?.hash());
+        try std.testing.expectEqual(base.hash(), lease.header.hash());
+        const address_hash = types.keccakOfU160(std.mem.readInt(u160, &queries[0].address.bytes, .big));
+        try std.testing.expectEqual(@as(u256, 42), (try eth.readAccount(lease.txn, address_hash)).?.balance);
+        var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+        defer api.deinit();
+        try std.testing.expectEqual(@as(u256, 42), (try api.read(alloc, parent(base), &queries)).accounts[0].balance.number);
+    }
+    var path_buf: [1024]u8 = undefined;
+    const path_len = try f.dir.dir.realPathFile(std.testing.io, "db", &path_buf);
+    const path = path_buf[0..path_len];
+    try f.store.deinit();
+    store_open = false;
+    const before = try f.dir.dir.statFile(std.testing.io, "db/mdbx.dat", .{});
+    try std.testing.expect(before.size > 1 << 20);
+    try std.testing.expectError(error.ShadowDatabaseAlreadyLarger, kv.Store.initBoundedChecked(std.testing.io, a, path, 1 << 20, 1 << 20));
+    try std.testing.expectEqual(before.size, (try f.dir.dir.statFile(std.testing.io, "db/mdbx.dat", .{})).size);
+    f.store = try kv.Store.initBoundedChecked(std.testing.io, a, path, 8 << 20, 1 << 20);
+    store_open = true;
+    try std.testing.expectEqual(@as(u64, 8 << 20), (try f.store.env.info()).geo.upper);
+    var resumed_owner: kv.OwnedTransaction = .{ .txn = try f.store.transaction_rw() };
+    defer resumed_owner.deinit();
+    const resumed = resumed_owner.txn;
+    try std.testing.expectEqual(base.hash(), (try snapshots.readCheckpoint(&f.store, resumed, alloc)).?.hash());
+    for (0..80) |i| {
+        var key: [32]u8 = undefined;
+        const encoded = try std.fmt.bufPrint(&key, "admitted-fill-{}", .{i});
+        try f.store.table(resumed, .state_meta).set(encoded, value, .Upsert);
+    }
+    try resumed_owner.commit();
+    try std.testing.expect((try f.store.env.info()).geo.current > 4 << 20);
+    var eth = Eth.init(&f.store);
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    defer api.deinit();
+    try std.testing.expectEqual(@as(u256, 42), (try api.read(alloc, parent(base), &queries)).accounts[0].balance.number);
+}
+
+test "shadow checked open supports startup directory creation and lowers an unused upper bound" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    var path_buf: [1024]u8 = undefined;
+    const root_len = try dir.dir.realPath(std.testing.io, &path_buf);
+    const path = try std.fmt.allocPrint(a, "{s}/fresh/mdbx", .{path_buf[0..root_len]});
+    defer a.free(path);
+    try std.testing.expectError(error.FileNotFound, kv.Store.initBoundedChecked(std.testing.io, a, path, 8 << 20, 1 << 20));
+    // The live runNode creates datadir and mdbx through this exact directory API
+    // before opening the store. A missing file in the newly created dir is valid.
+    var db_dir = try dir.dir.createDirPathOpen(std.testing.io, "fresh/mdbx", .{});
+    db_dir.close(std.testing.io);
+    {
+        var store = try kv.Store.initBoundedChecked(std.testing.io, a, path, 8 << 20, 1 << 20);
+        defer store.deinit() catch unreachable;
+        var owned: kv.OwnedTransaction = .{ .txn = try store.transaction_rw() };
+        defer owned.deinit();
+        try store.table(owned.txn, .state_meta).set("cap-reopen-marker", "preserved", .Upsert);
+        try owned.commit();
+        try std.testing.expect((try store.env.info()).geo.current <= 4 << 20);
+        try std.testing.expectEqual(@as(u64, 8 << 20), (try store.env.info()).geo.upper);
+    }
+    var lowered = try kv.Store.initBoundedChecked(std.testing.io, a, path, 4 << 20, 1 << 20);
+    defer lowered.deinit() catch unreachable;
+    try std.testing.expectEqual(@as(u64, 4 << 20), (try lowered.env.info()).geo.upper);
+    const txn = try lowered.transaction_ro();
+    defer txn.abort() catch unreachable;
+    try std.testing.expectEqualStrings("preserved", (try lowered.table(txn, .state_meta).get("cap-reopen-marker")).?);
+}
+
+test "shadow commit ownership consumes failed commit without publishing and survives later errors" {
+    var f = try Fixture.initWithLimit(4 << 20);
+    defer f.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const base = try f.write(1, 42, true);
+    var child = base;
+    child.number += 1;
+    child.parent_hash = base.hash();
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    const lease = try views.acquire(base.hash(), base.state_root);
+    defer lease.deinit();
+    const Writer = struct {
+        fn brokenCommit(store: *kv.Store, retained: *snapshots.Snapshots, header: types.BlockHeader) !void {
+            var owned: kv.OwnedTransaction = .{ .txn = try store.transaction_rw() };
+            defer owned.deinit();
+            try store.table(owned.txn, .state_meta).set("failed-commit-marker", "must-not-publish", .Upsert);
+            try snapshots.writeCheckpoint(store, owned.txn, a, header);
+            try std.testing.expectEqual(lmdbx.c.MDBX_SUCCESS, lmdbx.c.mdbx_txn_break(owned.txn.ptr));
+            // Real MDBX consumes the broken handle while rejecting its commit.
+            // Cleanup must not abort it again, and publication must not run.
+            try owned.commit();
+            try retained.publish(a);
+        }
+
+        fn errorAfterCommit(store: *kv.Store) !void {
+            var owned: kv.OwnedTransaction = .{ .txn = try store.transaction_rw() };
+            defer owned.deinit();
+            try store.table(owned.txn, .state_meta).set("successful-commit-marker", "preserved", .Upsert);
+            try owned.commit();
+            return error.LaterOperationFailed;
+        }
+    };
+    try std.testing.expectError(error.DatabaseTransactionAborted, Writer.brokenCommit(&f.store, &views, child));
+    try std.testing.expectEqual(@as(usize, 1), views.status().count);
+    try std.testing.expectEqual(null, views.status().find(child.hash()));
+    try std.testing.expectEqual(base.hash(), lease.header.hash());
+    try std.testing.expectError(error.LaterOperationFailed, Writer.errorAfterCommit(&f.store));
+    const txn = try f.store.transaction_ro();
+    defer txn.abort() catch unreachable;
+    try std.testing.expectEqual(base.hash(), (try snapshots.readCheckpoint(&f.store, txn, alloc)).?.hash());
+    try std.testing.expectEqual(null, try f.store.table(txn, .state_meta).get("failed-commit-marker"));
+    try std.testing.expectEqualStrings("preserved", (try f.store.table(txn, .state_meta).get("successful-commit-marker")).?);
+    var eth = Eth.init(&f.store);
+    var api: Shadow = .{ .snapshots = &views, .eth = &eth };
+    defer api.deinit();
+    try std.testing.expectEqual(@as(u256, 42), (try api.read(alloc, parent(base), &queries)).accounts[0].balance.number);
 }
 
 test "shadow exact trie nodes authenticate path hash owner and retained version" {
