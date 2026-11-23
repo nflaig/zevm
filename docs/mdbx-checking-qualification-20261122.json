@@ -1,0 +1,73 @@
+{
+  "date": "2026-11-22",
+  "scope": "Mandatory MDBX failure handling; diagnostic shared-lock lifecycle controls. No production rollout.",
+  "mandatoryChecking": 0,
+  "reason": "lmdbx-zig default DEBUG=-1 also defaults CHECKING=-1, suppressing fatal mutex/consistency failures. Explicit module macro retains mandatory failure handling.",
+  "nativeRegression": "Inspect linked mdbx_build.options; reject CHECKING=-1 and missing options.",
+  "debug": {
+    "testsPassed": 247,
+    "native": 54,
+    "shadow": 82,
+    "standard": 111,
+    "log": {
+      "path": "mdbx-checking-debug-qualified.log",
+      "sha256": "9909dc7e467b9a33b9fc3d75ba8939b4b3d2a23248a0f0e96557328fe75d7aeb"
+    }
+  },
+  "safe": {
+    "testsPassed": 247,
+    "native": 54,
+    "shadow": 82,
+    "standard": 111,
+    "log": {
+      "path": "mdbx-checking-safe-qualified.log",
+      "sha256": "86accde5eda1bca9b0f0628880ae62f846d7c7bf14d2c97c32c7ecf96c007156"
+    }
+  },
+  "sources": {
+    "build.zig": "2799f79ab36d788de5c680f4454b92feb39f0ff0d9f96d9c4aaba92037a2d489",
+    "src/native_state_tests.zig": "41a4246090219363c1ef17024f1bffb3e873fb5fbccb2296679085b0fb67d3d9"
+  },
+  "freshLifecycle": {
+    "writerCommits": 15661,
+    "clonedSnapshots": 44070,
+    "publications": 84522,
+    "readerProcesses": 3,
+    "environmentCloseReopens": 36,
+    "allExitZero": true,
+    "allStderrEmpty": true,
+    "results": {
+      "path": "mdbx-lifecycle-repro/results.json",
+      "sha256": "8a0ce356c9cbcc4a4f853e8208a02d5755ca646666371783ea9b6673a5594991"
+    },
+    "source": {
+      "path": "mdbx-lifecycle-repro/lifecycle.c",
+      "sha256": "39f6fc4b077c686fae6efe346cbcfe9292981137907531dce02cb703ebcbd3ae"
+    },
+    "driver": {
+      "path": "mdbx-lifecycle-repro/run.py",
+      "sha256": "ab72d23299440102a7d5897eac1e00ac60f81c4df9ca59ac269144d72b3f4f43"
+    }
+  },
+  "pidNamespaceReproduction": {
+    "sameNamespaceExitCodes": [
+      0,
+      0
+    ],
+    "separateNamespaces": "Writer failed with exact glibc futex fatal string; reader EOWNERDEAD.",
+    "results": {
+      "path": "pidns-futex-repro/results.json",
+      "sha256": "1baab0a40382304a6773f7f0df5a663d7769822b41225aaf4ebb2c3809e157bf"
+    }
+  },
+  "liveFailureAudit": {
+    "path": "native-mdbx-lock-provenance-review.md",
+    "sha256": "15e19cf7c4b5f30b03dd9503b27342826ec24a441da365fb19b2532a0fea67d3"
+  },
+  "limitations": [
+    "Fresh C fixture exercises pinned MDBX with matching relevant flags, not the complete builder or peer sync loop",
+    "Exact remote futex syscall not captured; first writer EPERM coincides with original cross-namespace abort",
+    "Earlier live shared-PID runs inherited damaged lock state and are canonical-output agreement only, not passing synchronization qualification",
+    "Both data and lock file preserved during isolated writer recovery; production builders unchanged"
+  ]
+}

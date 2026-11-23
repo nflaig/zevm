@@ -4,3 +4,4 @@ zig-pkg
 datadir
 monitoring
 fixtures
+__pycache__/

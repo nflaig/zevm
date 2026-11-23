@@ -1,0 +1,59 @@
+{
+  "scope": "Opt-in lease-local path-authorized native node cache; local correctness evidence only, no deployment or performance claim",
+  "sourceHashes": {
+    "src/native_state.zig": "eabd709a67914ed4936b420d414f23953c0e5a8f523f47a50a8c2707b5630c06",
+    "src/native_state_tests.zig": "3a593289341da3619bc2912b6c10dd4b7740cb201aa22d6608f16009760dcbeb",
+    "src/trie/trie.zig": "447bd11382a1f7cc3b53656a35b48cadc748be0ba7c4c8de9b528464f7baceed",
+    "docs/native-state.md": "4ac490d1ad7c74d41bd2f33aaae32bb1311554d0bd84dac636662ec2d6efdcbf"
+  },
+  "defaultEnabled": false,
+  "limits": {
+    "defaultEntries": 4096,
+    "maximumEntries": 16384,
+    "defaultRlpBytes": 4194304,
+    "maximumRlpBytes": 16777216,
+    "metadata": "reserved bounded hash-table capacity exposed separately"
+  },
+  "modes": [
+    "disabled",
+    "authorization only (max_bytes=0)",
+    "authorization and RLP"
+  ],
+  "regressions": [
+    "branch and extension edges with inline descendants",
+    "wrong owner/path/hash and unreachable valid backing bytes",
+    "same-height deletion/reorg and registry eviction",
+    "entry and byte caps with baseline fallback",
+    "corrupt or missing authorized child preimages",
+    "cancellation before hits and authorization publication",
+    "allocation-failure sweep and lease/cursor/cache cleanup",
+    "malformed RLP and boundary rejection"
+  ],
+  "tests": {
+    "debug": {
+      "native": 53,
+      "shadow": 82,
+      "standard": 111,
+      "total": 246,
+      "log": "native-node-cache-debug-qualified.log"
+    },
+    "safe": {
+      "native": 53,
+      "shadow": 82,
+      "standard": 111,
+      "total": 246,
+      "log": "native-node-cache-safe-qualified.log"
+    }
+  },
+  "commands": [
+    "zig build test-native-state test-shadow-state test -Doptimize=debug -j2 --summary all",
+    "zig build test-native-state test-shadow-state test -Doptimize=safe -j2 --summary all"
+  ],
+  "toolchain": "Zig 0.17.0, repository .zigversion",
+  "notes": [
+    "Eight new cache tests use real temporary MDBX; helper edge paths are separately revalidated through uncached root walks.",
+    "A missing-node fixture initially stored an empty preimage rather than deleting its DB entry; corrected to deleteStorageTrieNode.",
+    "Caller command read budgets remain unchanged; cache hits still execute the same charged native source callback."
+  ],
+  "independentReview": "Branch qualification agent found no concrete blocker in path authority, storage-root admission invariant, byte ownership, or partial failure semantics; separate from actual Opus review."
+}

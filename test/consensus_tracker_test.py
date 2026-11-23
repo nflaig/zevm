@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Exercise the native tracker against a loopback beacon fixture, without EL RPC."""
+import argparse
+import http.server
+import json
+import subprocess
+import threading
+import time
+
+ROOT, PARENT, FULL, NEXT = ("0x" + byte * 32 for byte in ("11", "22", "33", "44"))
+
+
+class Beacon(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, mode):
+        super().__init__(("127.0.0.1", 0), Handler)
+        self.mode = mode
+        self.phase = "empty_pending" if mode == "warm" else "full"
+        self.headers = self.streams = self.lookups = 0
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def respond(self, obj):
+        encoded = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        try:
+            self.wfile.write(encoded)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # expected when the native two-second deadline cancels a request
+
+    def event(self, name="head_v2", payload=None):
+        encoded = json.dumps(payload or {}, indent=2)
+        data = "\n".join(f"data: {line}" for line in encoded.splitlines())
+        self.wfile.write(f"event: {name}\n{data}\n\n".encode())
+        self.wfile.flush()
+
+    def do_GET(self):
+        s = self.server
+        if self.path == "/eth/v1/beacon/headers/finalized":
+            s.headers += 1
+            if s.mode == "timeout" and s.headers == 1:
+                time.sleep(2.3)
+            return self.respond({"execution_optimistic": False, "finalized": s.mode != "unfinalized",
+                                 "data": {"root": ROOT, "canonical": True,
+                                          "header": {"message": {"slot": "100"}}}})
+        if self.path == f"/eth/v2/beacon/blocks/{ROOT}":
+            return self.respond({"version": "gloas", "execution_optimistic": False, "finalized": True,
+                                 "data": {"message": {"slot": "100", "body": {"signed_execution_payload_bid": {
+                                     "message": {"parent_block_hash": PARENT, "block_hash": FULL}}}}}})
+        if self.path == "/eth/v2/debug/fork_choice":
+            s.lookups += 1
+            phase = s.phase
+            status = "empty" if phase.startswith("empty") else "full"
+            full_hash = NEXT if phase == "next" else FULL
+            nodes = [{"block_root": ROOT, "slot": "101", "payload_status": p, "validity": "valid",
+                      "execution_block_hash": h, "extra_data": {"execution_optimistic": phase == "optimistic" or
+                                                                 (phase == "empty_pending" and p == "full")}}
+                     for p, h in (("empty", PARENT), ("full", full_hash))]
+            return self.respond({"data": {"extra_data": {"head": {"block_root": ROOT, "payload_status": status}},
+                                          "fork_choice_nodes": nodes}})
+        if self.path.startswith("/eth/v1/events?"):
+            s.streams += 1
+            connection = s.streams
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            try:
+                time.sleep(.8)
+                attrs = {"version": "gloas", "data": {"parent_block_root": ROOT, "parent_block_hash": PARENT}}
+                payload = {"slot": "101", "block_root": ROOT, "block_hash": FULL, "execution_optimistic": False}
+                if s.mode == "warm":
+                    # The verified payload arrives while canonical selection is
+                    # still EMPTY. Waiting for a FULL head event would time out.
+                    s.phase = "empty"
+                    self.event("execution_payload", payload)
+                    time.sleep(.3)
+                    self.event("payload_attributes", attrs)
+                    # An authorized EMPTY branch must not displace warm FULL
+                    # state. Keep observing until a genuinely new preferred
+                    # target proves the branch event was handled in between.
+                    time.sleep(.3)
+                    s.phase = "next"
+                    self.event()
+                    time.sleep(2)
+                if s.mode == "events":
+                    if connection == 1:
+                        s.phase = "empty"
+                        self.event("payload_attributes", attrs)
+                        time.sleep(.3)
+                        self.event("payload_attributes", attrs)  # duplicate must not duplicate the target
+                        time.sleep(.3)
+                        s.phase = "optimistic"
+                        self.event("execution_payload", payload)
+                        time.sleep(.3)
+                        return  # exercise reconnect before the next valid FULL head
+                    s.phase = "next"
+                    self.event()
+                time.sleep(.5)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        self.send_error(404)
+
+
+def trial(probe, mode, count, deadline):
+    server = Beacon(mode)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    started = time.monotonic()
+    try:
+        try:
+            run = subprocess.run([probe, f"http://127.0.0.1:{server.server_port}", str(count), str(deadline)],
+                                 text=True, capture_output=True, timeout=deadline + 5)
+        except subprocess.TimeoutExpired as exc:
+            raise AssertionError({"mode": mode, "headers": server.headers, "streams": server.streams,
+                                  "lookups": server.lookups, "stdout": exc.stdout, "stderr": exc.stderr}) from exc
+        elapsed = time.monotonic() - started
+        rows = [json.loads(line) for line in run.stdout.splitlines()]
+        if mode == "unfinalized":
+            assert run.returncode != 0 and "ObservationTimeout" in run.stderr, run.stderr
+            assert not rows and server.lookups == 0
+        else:
+            assert run.returncode == 0, run.stderr
+            assert len(rows) == count
+            assert all(row["executionAnchor"] == PARENT and row["beaconAnchor"] == ROOT for row in rows)
+            if mode == "events":
+                assert [row["executionHead"] for row in rows] == [FULL, NEXT], rows
+                assert server.streams >= 2 and server.lookups >= 4
+                assert "UnverifiedConsensusHead" in run.stderr
+            if mode == "warm":
+                assert [row["executionHead"] for row in rows] == [PARENT, FULL, NEXT], rows
+                assert elapsed < 3, elapsed
+                assert server.phase == "next"
+                assert server.lookups >= 4  # initial, warm FULL, EMPTY attrs, new preferred head
+            if mode == "timeout":
+                assert server.headers >= 2 and elapsed >= 3 and "ConsensusTimeout" in run.stderr
+        return {"scenario": mode, "passed": True, "seconds": elapsed,
+                "updates": rows, "headerRequests": server.headers, "streamConnections": server.streams,
+                "headLookups": server.lookups, "stderr": run.stderr}
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--probe", required=True)
+    args = parser.parse_args()
+    for mode, count, deadline in (("warm", 3, 5), ("events", 2, 10), ("timeout", 1, 9), ("unfinalized", 1, 3)):
+        print(json.dumps(trial(args.probe, mode, count, deadline)), flush=True)
+
+
+if __name__ == "__main__":
+    main()

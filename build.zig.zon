@@ -88,9 +88,8 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "evm",
-        // For example...
-        //"LICENSE",
-        //"README.md",
+        "src",
+        "LICENSE-APACHE",
+        "LICENSE-MIT",
     },
 }

@@ -164,6 +164,9 @@ pub fn build(b: *std.Build) void {
     const snappy_dep = b.dependency("snappy", .{ .target = target, .optimize = optimize });
     const cache_dep = b.dependency("cache", .{ .target = target, .optimize = optimize });
     const mdbx_dep = b.dependency("lmdbx", .{ .target = target, .optimize = optimize });
+    // Keep mandatory consistency failures fatal even when the wrapper builds
+    // with MDBX_DEBUG=-1 to suppress routine logs.
+    mdbx_dep.module("lmdbx").addCMacro("MDBX_CHECKING", "0");
     const metrics_dep = b.dependency("metrics", .{ .target = target, .optimize = optimize });
 
     const mcl_lib = buildMcl(b, mcl_dep, target);
@@ -233,6 +236,26 @@ pub fn build(b: *std.Build) void {
     const native_opts = b.addOptions();
     native_opts.addOption(State, "state", .empty);
     native_opts.addOption(Platform, "platform", .native);
+    // Independent state-reader module; consumers can retain a separately pinned
+    // execution engine. This needs only RLP and MDBX, not node/EVM libraries.
+    const native_state = b.addModule("native_state", .{
+        .root_source_file = b.path("src/native_state.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    native_state.addOptions("build_options", native_opts);
+    native_state.addImport("rlp", deps.rlp_mod);
+    native_state.addImport("lmdbx", mdbx_dep.module("lmdbx"));
+    const native_state_tests = b.addTest(.{
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/native_state_tests.zig"), .target = target, .optimize = optimize, .link_libc = true }),
+        .use_llvm = true,
+    });
+    native_state_tests.root_module.addOptions("build_options", native_opts);
+    native_state_tests.root_module.addImport("rlp", deps.rlp_mod);
+    native_state_tests.root_module.addImport("lmdbx", mdbx_dep.module("lmdbx"));
+    b.step("test-native-state", "Qualify native exact-parent state leases and direct reads")
+        .dependOn(&b.addRunArtifact(native_state_tests).step);
     unit_tests.root_module.addOptions("build_options", native_opts);
     linkDeps(unit_tests.root_module, deps, .native);
     unit_tests.root_module.addImport("cache", cache_dep.module("cache"));
@@ -240,6 +263,61 @@ pub fn build(b: *std.Build) void {
     unit_tests.root_module.addImport("lmdbx", mdbx_dep.module("lmdbx"));
     unit_tests.root_module.addImport("metrics", metrics_dep.module("metrics"));
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+
+    const shadow_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/shadow_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .use_llvm = true,
+    });
+    shadow_tests.root_module.link_libcpp = true;
+    shadow_tests.root_module.addOptions("build_options", native_opts);
+    linkDeps(shadow_tests.root_module, deps, .native);
+    shadow_tests.root_module.addImport("lmdbx", mdbx_dep.module("lmdbx"));
+    b.step("test-shadow-state", "Qualify exact-parent shadow state snapshots and authenticated reads")
+        .dependOn(&b.addRunArtifact(shadow_tests).step);
+
+    const crash_probe = b.addExecutable(.{
+        .name = "shadow-crash-probe",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/shadow_crash_probe.zig"), .target = target, .optimize = optimize }),
+        .use_llvm = true,
+    });
+    crash_probe.root_module.link_libcpp = true;
+    crash_probe.root_module.addOptions("build_options", native_opts);
+    linkDeps(crash_probe.root_module, deps, .native);
+    crash_probe.root_module.addImport("lmdbx", mdbx_dep.module("lmdbx"));
+    b.step("shadow-crash-probe", "Build the isolated state-commit SIGKILL qualification target")
+        .dependOn(&b.addInstallArtifact(crash_probe, .{}).step);
+
+    const witness_bench = b.addExecutable(.{
+        .name = "shadow-witness-bench",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/shadow_witness_bench.zig"), .target = target, .optimize = optimize }),
+        .use_llvm = true,
+    });
+    witness_bench.root_module.link_libcpp = true;
+    witness_bench.root_module.addOptions("build_options", native_opts);
+    linkDeps(witness_bench.root_module, deps, .native);
+    witness_bench.root_module.addImport("lmdbx", mdbx_dep.module("lmdbx"));
+    b.step("shadow-witness-bench", "Build the local authenticated shadow witness benchmark")
+        .dependOn(&b.addInstallArtifact(witness_bench, .{}).step);
+    const check_witness_bench = b.addRunArtifact(witness_bench);
+    check_witness_bench.addArgs(&.{ "--iterations", "2", "--warmup", "0" });
+    b.step("test-shadow-witness-bench", "Check witness benchmark proof authentication and exact mode equality")
+        .dependOn(&check_witness_bench.step);
+
+    const consensus_probe = b.addExecutable(.{
+        .name = "consensus-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/consensus_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .use_llvm = true,
+    });
+    b.step("consensus-probe", "Build the read-only native beacon tracker qualification tool")
+        .dependOn(&b.addInstallArtifact(consensus_probe, .{}).step);
 
     // Example user
     const example_step = b.step("example", "Run the example program");
@@ -522,13 +600,14 @@ pub fn build(b: *std.Build) void {
         run_zkevm_tests.setEnvironmentVariable("ZISKEMU_GUEST", "1");
     }
 
+    const node_mod = b.addModule("node", .{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const main_exe = b.addExecutable(.{
         .name = "zevm",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = node_mod,
         .use_llvm = true,
     });
     linkDeps(main_exe.root_module, deps, .native);

@@ -1,0 +1,428 @@
+{
+  "schemaVersion": 1,
+  "scope": "Five-minute read-only pilot of bounded independent public intake in the isolated Plataberget shadow node; no production provider or constructor feed change.",
+  "sourceCommit": "14d4102513cfa09c1483d862325f42a7edd99f63",
+  "binarySha256": "b1da75165868c3c857257999666c20add265103e862ba4aa6612ffa32e0fb0b6",
+  "window": {
+    "startedAt": "2026-11-21T19:32:58.317781+00:00",
+    "finishedAt": "2026-11-21T19:37:59.685348+00:00",
+    "stateSampleDurationSeconds": 300.2718354072422
+  },
+  "runtime": {
+    "container": "plataberget-zevm-shadow",
+    "startedAt": "2026-11-21T19:30:26.519467733Z",
+    "containerUnchanged": true,
+    "runningAtEnd": true,
+    "restartsBefore": 0,
+    "restartsAfter": 0,
+    "oomKilled": false,
+    "runtimeMutatedByPilot": false,
+    "cpuLimit": 1.0,
+    "memoryLimitBytes": 4294967296,
+    "resourceSamples": 9,
+    "observedCpuPercent": {
+      "samples": 9,
+      "min": 3.37,
+      "p50": 16.71,
+      "p95": 100.43,
+      "p99": 100.43,
+      "max": 100.43
+    },
+    "observedMemoryPercent": {
+      "samples": 9,
+      "min": 7.96,
+      "p50": 18.57,
+      "p95": 20.19,
+      "p99": 20.19,
+      "max": 20.19
+    },
+    "lastMemoryUsage": "827MiB / 4GiB",
+    "errorLogLines": 0,
+    "warningLogLines": 0
+  },
+  "sourceIsolation": {
+    "publicIntakeObserverEnabled": true,
+    "shadowStateRequiredAndEnabled": true,
+    "gethTransactionRpcOrSubscriptionConfigured": false,
+    "gethIpcMounted": false,
+    "constructorDelivery": false,
+    "transactionPayloadLogging": false,
+    "evidence": "Runtime command and mounts contain only the local shadow data/binary, peer ports and CL beacon URL. Qualified source wires the native callback exclusively to the hash/time Observer. The monitor, separately, queries Geth on 8645 only as an exact-head oracle."
+  },
+  "publicTransactions": {
+    "loggedRecords": 4826,
+    "distinctHashes": 3610,
+    "repeatedHashRecords": 1216,
+    "maxRecordsInAcceptedWallSecond": 263,
+    "maxObservedTransactionBytes": 2221,
+    "hashLogSkipsLatest": 0,
+    "limits": "Accepted records are not complete mempool coverage; deduplication has a 30-second TTL/capacity policy, so repeated hashes over this window are possible."
+  },
+  "timingMs": {
+    "announcementToFrameDispatch": {
+      "samples": 4826,
+      "min": 0,
+      "p50": 248.0,
+      "p95": 1357,
+      "p99": 1908,
+      "max": 1908
+    },
+    "frameDispatchToValidatedAcceptance": {
+      "samples": 4826,
+      "min": 0,
+      "p50": 4.0,
+      "p95": 10,
+      "p99": 26,
+      "max": 26
+    },
+    "zeroAnnouncementToFrameRecords": 1065,
+    "definition": "Announcement-to-frame uses the process monotonic clock; direct broadcasts assign announcement time equal to receipt. Frame-to-accept uses the same wall clock at frame dispatch and after validation, at millisecond precision. Neither is first-byte arrival, comparison against Geth, transaction-to-bid latency or proposer arrival."
+  },
+  "intakeCounters": {
+    "startupFirstFullMinuteReport": {
+      "at": "2026-11-21T19:31:27.857007583Z",
+      "accepted": 1367,
+      "decoded": 1367,
+      "announced": 40885,
+      "requested": 1316,
+      "duplicate": 3251,
+      "deferred_blobs": 156,
+      "unsupported": 0,
+      "invalid": 0,
+      "oversized": 0,
+      "stale": 0,
+      "outstanding": 0,
+      "pending": 0,
+      "capacity_drops": 36446,
+      "sink_full": 0,
+      "timeouts": 0,
+      "frame_rate_drops": 0,
+      "signature_rate_drops": 0,
+      "peer_pending_drops": 36446,
+      "backoff_skips": 0,
+      "frame_refused_requests": 0,
+      "signature_discarded_decoded": 0,
+      "signature_unprocessed_items": 0
+    },
+    "pilotReports": [
+      {
+        "at": "2026-11-21T19:33:27.908310096Z",
+        "accepted": 2511,
+        "decoded": 2511,
+        "announced": 65775,
+        "requested": 2367,
+        "duplicate": 8827,
+        "deferred_blobs": 452,
+        "unsupported": 0,
+        "invalid": 0,
+        "oversized": 0,
+        "stale": 0,
+        "outstanding": 2,
+        "pending": 1,
+        "capacity_drops": 55078,
+        "sink_full": 0,
+        "timeouts": 0,
+        "frame_rate_drops": 0,
+        "signature_rate_drops": 0,
+        "peer_pending_drops": 55078,
+        "backoff_skips": 0,
+        "frame_refused_requests": 0,
+        "signature_discarded_decoded": 0,
+        "signature_unprocessed_items": 0
+      },
+      {
+        "at": "2026-11-21T19:34:27.939488784Z",
+        "accepted": 4101,
+        "decoded": 4101,
+        "announced": 120547,
+        "requested": 3896,
+        "duplicate": 17961,
+        "deferred_blobs": 833,
+        "unsupported": 0,
+        "invalid": 0,
+        "oversized": 0,
+        "stale": 0,
+        "outstanding": 0,
+        "pending": 0,
+        "capacity_drops": 99550,
+        "sink_full": 0,
+        "timeouts": 0,
+        "frame_rate_drops": 0,
+        "signature_rate_drops": 0,
+        "peer_pending_drops": 99550,
+        "backoff_skips": 0,
+        "frame_refused_requests": 0,
+        "signature_discarded_decoded": 0,
+        "signature_unprocessed_items": 0
+      },
+      {
+        "at": "2026-11-21T19:35:27.973764390Z",
+        "accepted": 4823,
+        "decoded": 4823,
+        "announced": 153422,
+        "requested": 4672,
+        "duplicate": 27749,
+        "deferred_blobs": 1347,
+        "unsupported": 0,
+        "invalid": 0,
+        "oversized": 0,
+        "stale": 0,
+        "outstanding": 3,
+        "pending": 385,
+        "capacity_drops": 122315,
+        "sink_full": 0,
+        "timeouts": 0,
+        "frame_rate_drops": 0,
+        "signature_rate_drops": 0,
+        "peer_pending_drops": 122315,
+        "backoff_skips": 0,
+        "frame_refused_requests": 0,
+        "signature_discarded_decoded": 0,
+        "signature_unprocessed_items": 0
+      },
+      {
+        "at": "2026-11-21T19:36:27.995375781Z",
+        "accepted": 6117,
+        "decoded": 6188,
+        "announced": 181993,
+        "requested": 6037,
+        "duplicate": 39300,
+        "deferred_blobs": 1907,
+        "unsupported": 0,
+        "invalid": 0,
+        "oversized": 0,
+        "stale": 0,
+        "outstanding": 0,
+        "pending": 0,
+        "capacity_drops": 139154,
+        "sink_full": 0,
+        "timeouts": 0,
+        "frame_rate_drops": 0,
+        "signature_rate_drops": 4,
+        "peer_pending_drops": 139154,
+        "backoff_skips": 0,
+        "frame_refused_requests": 0,
+        "signature_discarded_decoded": 71,
+        "signature_unprocessed_items": 185
+      },
+      {
+        "at": "2026-11-21T19:37:28.028932790Z",
+        "accepted": 6473,
+        "decoded": 6544,
+        "announced": 193324,
+        "requested": 6348,
+        "duplicate": 51176,
+        "deferred_blobs": 2487,
+        "unsupported": 0,
+        "invalid": 0,
+        "oversized": 0,
+        "stale": 0,
+        "outstanding": 0,
+        "pending": 0,
+        "capacity_drops": 139154,
+        "sink_full": 0,
+        "timeouts": 0,
+        "frame_rate_drops": 0,
+        "signature_rate_drops": 4,
+        "peer_pending_drops": 139154,
+        "backoff_skips": 0,
+        "frame_refused_requests": 0,
+        "signature_discarded_decoded": 71,
+        "signature_unprocessed_items": 185
+      }
+    ],
+    "pilotCounterInterval": {
+      "from": "2026-11-21T19:33:27.908310096Z",
+      "to": "2026-11-21T19:37:28.028932790Z",
+      "seconds": 240.12062215805054,
+      "delta": {
+        "accepted": 3962,
+        "decoded": 4033,
+        "announced": 127549,
+        "requested": 3981,
+        "duplicate": 42349,
+        "deferred_blobs": 2035,
+        "unsupported": 0,
+        "invalid": 0,
+        "oversized": 0,
+        "stale": 0,
+        "capacity_drops": 84076,
+        "sink_full": 0,
+        "timeouts": 0,
+        "frame_rate_drops": 0,
+        "signature_rate_drops": 4,
+        "peer_pending_drops": 84076,
+        "backoff_skips": 0,
+        "frame_refused_requests": 0,
+        "signature_discarded_decoded": 71,
+        "signature_unprocessed_items": 185
+      }
+    },
+    "observedPendingMaximum": 385,
+    "observedOutstandingMaximum": 3,
+    "hardLimits": {
+      "pendingHashes": 2048,
+      "perPeerPendingHashes": 256,
+      "outstandingRequests": 16,
+      "globalFramesPerSecond": 512,
+      "globalDecodeSignatureAttemptsPerSecond": 256,
+      "observerLogsPerSecond": 512
+    },
+    "interpretation": "Inventory admission drops occurred in the first startup minute and recurred during this pilot. They count refused announcement items, potentially repeated across peers/messages, not distinct transactions or a measured missing-fee percentage. No cap was tuned. Deferred blobs are also announcement counts, not unique missing blobs.",
+    "postWindowConfirmation": {
+      "reports": [
+        {
+          "at": "2026-11-21T19:40:28.207200500Z",
+          "type": "intake",
+          "accepted": 7592,
+          "decoded": 7663,
+          "announced": 219415,
+          "requested": 7383,
+          "duplicate": 70355,
+          "deferred_blobs": 3161,
+          "unsupported": 0,
+          "invalid": 0,
+          "oversized": 0,
+          "stale": 0,
+          "outstanding": 0,
+          "pending": 0,
+          "capacity_drops": 146755,
+          "sink_full": 0,
+          "timeouts": 0,
+          "frame_rate_drops": 0,
+          "signature_rate_drops": 4,
+          "peer_pending_drops": 146755,
+          "backoff_skips": 0,
+          "frame_refused_requests": 0,
+          "signature_discarded_decoded": 71,
+          "signature_unprocessed_items": 185
+        },
+        {
+          "at": "2026-11-21T19:40:31.752230083Z",
+          "type": "observer",
+          "logged": 7600,
+          "skipped": 0,
+          "max_per_second": 512
+        }
+      ],
+      "sameContainerAndNoRestart": true,
+      "limits": "Read after the five-minute cohort. Confirms monotonic zero error counters without treating later accepted/drop counts as pilot events."
+    }
+  },
+  "peers": {
+    "samples": 38,
+    "connectionRange": [
+      9,
+      43
+    ],
+    "ethRange": [
+      9,
+      43
+    ]
+  },
+  "stateHeadAvailability": {
+    "observerOn": {
+      "durationSeconds": 300.2718354072422,
+      "samples": 600,
+      "errors": 0,
+      "exactHeadAvailableSamples": 573,
+      "lagHistogram": {
+        "0": 570,
+        "1": 25,
+        "-1": 5
+      },
+      "seenHeads": 25,
+      "headsBecameAvailable": 25,
+      "observedReadinessDelayMs": {
+        "median": 502.9470156878233,
+        "max": 1503.3531533554196
+      },
+      "limits": "sampled readiness relative to observer's first EL observation, not peer transaction arrival; existing retained heads can have negative delay"
+    },
+    "previousObserverOff": {
+      "durationSeconds": 300.2725373329595,
+      "samples": 600,
+      "errors": 0,
+      "exactHeadAvailableSamples": 578,
+      "lagHistogram": {
+        "0": 578,
+        "1": 22
+      },
+      "seenHeads": 23,
+      "headsBecameAvailable": 23,
+      "observedReadinessDelayMs": {
+        "median": 502.7526430785656,
+        "max": 1003.269650042057
+      },
+      "limits": "sampled readiness relative to observer's first EL observation, not peer transaction arrival; existing retained heads can have negative delay"
+    },
+    "comparison": "Short sequential windows, not a controlled performance experiment: observer-on 25 heads vs observer-off 23 heads. Both used the same 0.5-second read-only monitor. Negative lag means the first retained shadow view was ahead of the oracle; exact availability checks the oracle block hash and its state root."
+  },
+  "conclusion": {
+    "boundedReceiveOnlyPilot": "passed: real public peer intake and no observed restart, OOM, runtime error or state-root mismatch",
+    "productionFeedQualified": false,
+    "remainingGates": [
+      "Measure unique and fee-weighted coverage/timing against the existing production feed, including inventory catch-up and repeated admission pressure.",
+      "Implement and qualify native constructor delivery, replacement/nonce scheduling and reorg handling.",
+      "Acquire and verify blob sidecars before any blob is treated as ready input.",
+      "Run longer soak and adversarial peer qualification before replacing Geth transaction intake."
+    ]
+  },
+  "evidence": {
+    "localDirectory": "evidence/intake-agent-pilot-v11-5m",
+    "files": {
+      "runtime.log": {
+        "bytes": 2024050,
+        "sha256": "678f452993a3290abe4354fcc8bf0c1588c1f6242f02979d952bde0b7ca30004"
+      },
+      "accepted-hashes.jsonl": {
+        "bytes": 1308412,
+        "sha256": "53fb0d5512e57fd8e26a7407507b49a6478540a1236c464747846105a3ced260"
+      },
+      "before.json": {
+        "bytes": 1329,
+        "sha256": "5d00dd928142cb979d30547ad0c3ec77ee559d5048fee29831108b8e77764c30"
+      },
+      "after.json": {
+        "bytes": 1329,
+        "sha256": "5d00dd928142cb979d30547ad0c3ec77ee559d5048fee29831108b8e77764c30"
+      },
+      "completed.json": {
+        "bytes": 281,
+        "sha256": "ac6692d572d56ded5cd8e11204fb5b917292a24ded419105e83523d2d05a944e"
+      },
+      "pilot.json": {
+        "bytes": 517,
+        "sha256": "df0f696d7f9f55a25737e684337e3be219dd5b4b5d7da03d6907eb368aa06f7d"
+      },
+      "resource-samples.jsonl": {
+        "bytes": 3182,
+        "sha256": "a0cf62a51d6e1ce94639753a98511cb5e993c380cff8a37cae5818adee02b453"
+      },
+      "state-heads/samples.jsonl": {
+        "bytes": 114632,
+        "sha256": "661abb9d5068ef5109a284fe6a0580cb3d8b76151a50979d4d80dac2dd277dda"
+      },
+      "state-heads/summary.json": {
+        "bytes": 481,
+        "sha256": "34423f2969f68e1ca131ab8ba60718f8c8d280ba51593f51677f28f57bac4491"
+      },
+      "docker-stats-before.jsonl": {
+        "bytes": 215,
+        "sha256": "77882231f077d3f3e3c2f21bfee74cdae6abceccae50a196c0e19ee2335cd9a4"
+      },
+      "docker-stats-after.jsonl": {
+        "bytes": 215,
+        "sha256": "1e209bebfd77dd933b0640c0276f818d0fa86fd2a8576b1318e02cabe6fed92c"
+      },
+      "post-window-counters.json": {
+        "bytes": 823,
+        "sha256": "af703064234a1decf5a56d4adcf0b5fd1dcba62a6993887f5c37c16af96a5f58"
+      },
+      "metrics-end.prom": {
+        "bytes": 24334,
+        "sha256": "beae12fa7b77eb6a838fc7f52346bb473ae1b3f4039967b9e9b0ff623099f94a"
+      }
+    }
+  }
+}

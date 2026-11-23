@@ -1,0 +1,36 @@
+{
+  "binary": "public-intake-final-r4-safe/bin/zevm (isolated qualification artifact)",
+  "binary_sha256": "b1da75165868c3c857257999666c20add265103e862ba4aa6612ffa32e0fb0b6",
+  "source": {
+    "src/node/public_intake.zig": "42cf1d4414c4eb99ca110d73f81e75798a952e73703dad505c74081e90b62441",
+    "src/node/public_intake_peer.zig": "d1e0dcc5ea1d4c8617b1736e1528822074f4116f0fa8fcd98b57f27c7bfab8d7",
+    "src/node/downloader.zig": "003f66a6288d6e55d7996ab7dbc6f283b8d5da6eeed58757637d95de9491751e",
+    "src/devp2p/eth.zig": "e8c4f7a64e7db074e7d3f148adf26fa0712b1e09f86664f8d453a3b870759aaf",
+    "src/main.zig": "1387c36ac06c5d2b53131c62ab2006ee5f782e2861ee7040598ee071c2a2750c",
+    "src/unit_tests.zig": "984266320228fc284884f01a892379d4a2b042f07aa51fd5c27d519bc7df82d4",
+    "docs/public-intake.md": "3f5920f21dd3473dcd891aa93b414688ede81a395d93a9cf48b49e857996f6e8",
+    "docs/shadow-state.md": "9cfbb5a29152830dba83182d3b3271008b54dc9e76caf0fe2fca922802fd40bc"
+  },
+  "tests": {
+    "debug": {
+      "exit": 0,
+      "general": 106,
+      "shadow": 77,
+      "total": 183
+    },
+    "safe": {
+      "exit": 0,
+      "general": 106,
+      "shadow": 77,
+      "total": 183
+    }
+  },
+  "target": "x86_64-linux-gnu.2.35",
+  "cpu": "baseline+cx16",
+  "cli_help_exit": 0,
+  "cli_shadow_guard_exit": 1,
+  "format_check_exit": 0,
+  "diff_check_exit": 0,
+  "review_status": "Initial Opus5.5 xhigh and final-delta reviews completed; root reviewed source/lifetimes and bounded admission-drop correction. Broad follow-up returned API error and is not approval. Eligible for isolated receive-only pilot only.",
+  "scope": "No production constructor/public-feed switch, no blob readiness or constructor delivery. Header-only canary preceded intake activation."
+}

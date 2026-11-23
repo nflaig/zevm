@@ -57,11 +57,22 @@ pub const HttpServer = struct {
     }
 
     fn serve(self: *Self, stream: std.Io.net.Stream) !void {
-        const allocator = self.arena.allocator();
         var in_buf: [io_buf_len]u8 = undefined;
         var out_buf: [io_buf_len]u8 = undefined;
         var reader = stream.reader(self.io, &in_buf);
         var writer = stream.writer(self.io, &out_buf);
+        self.exchange(&reader, &writer) catch |e| {
+            // Generic Reader/Writer erase the underlying cancellation error.
+            // Io cancellation is delivered once: swallowing it here could
+            // send run() back into accept and prevent shutdown from joining.
+            if (reader.err) |cause| if (cause == error.Canceled) return error.Canceled;
+            if (writer.err) |cause| if (cause == error.Canceled) return error.Canceled;
+            return e;
+        };
+    }
+
+    fn exchange(self: *Self, reader: *std.Io.net.Stream.Reader, writer: *std.Io.net.Stream.Writer) !void {
+        const allocator = self.arena.allocator();
         var http = std.http.Server.init(&reader.interface, &writer.interface);
 
         var request = try http.receiveHead();
@@ -88,8 +99,9 @@ pub const HttpServer = struct {
             else => return e,
         };
 
-        const response = self.rpc.handle(self.io, allocator, body) catch {
-            return request.respond("", .{ .status = .internal_server_error, .keep_alive = false });
+        const response = self.rpc.handle(self.io, allocator, body) catch |e| switch (e) {
+            error.Canceled => return error.Canceled,
+            else => return request.respond("", .{ .status = .internal_server_error, .keep_alive = false }),
         };
 
         try request.respond(response.raw, .{
@@ -108,4 +120,52 @@ fn bearerToken(request: *const std.http.Server.Request) ?[]const u8 {
         return std.mem.trim(u8, header.value[prefix.len..], " ");
     }
     return null;
+}
+
+test "HTTP propagates handler cancellation through connection cleanup" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const API = struct {
+        fn cancelled(_: *@This(), _: std.Io, _: std.mem.Allocator) error{Canceled}!void {
+            return error.Canceled;
+        }
+    };
+    var api: API = .{};
+    var rpc: jsonrpc.Server = .{};
+    defer rpc.deinit(a);
+    try rpc.register(a, "cancelled", &api, API.cancelled);
+    var server = try HttpServer.init(io, a, &rpc, try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0));
+    defer server.deinit();
+    var serving = io.concurrent(HttpServer.serveOne, .{&server}) catch return error.SkipZigTest;
+    defer serving.cancel(io) catch {};
+    const client = try server.listener.socket.address.connect(io, .{
+        .mode = .stream,
+        .protocol = .tcp,
+    });
+    defer client.close(io);
+    var buffer: [1024]u8 = undefined;
+    var writer = client.writer(io, &buffer);
+    const body =
+        \\{"jsonrpc":"2.0","method":"cancelled","params":[],"id":1}
+    ;
+    try writer.interface.print("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body });
+    try writer.interface.flush();
+    try std.testing.expectError(error.Canceled, serving.await(io));
+}
+
+test "HTTP incomplete request cancellation retains its socket cause" {
+    const io = std.testing.io;
+    var rpc: jsonrpc.Server = .{};
+    defer rpc.deinit(std.testing.allocator);
+    var server = try HttpServer.init(io, std.testing.allocator, &rpc, try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0));
+    defer server.deinit();
+    const client = try server.listener.socket.address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    defer client.close(io);
+    const accepted = try server.listener.accept(io);
+    defer accepted.close(io);
+    // No bytes are sent. Cancel is consumed by the first socket read whether
+    // requested before or after serve starts; no sleep/timing race is needed.
+    var serving = io.concurrent(HttpServer.serve, .{ &server, accepted }) catch return error.SkipZigTest;
+    defer serving.cancel(io) catch {};
+    try std.testing.expectError(error.Canceled, serving.cancel(io));
 }

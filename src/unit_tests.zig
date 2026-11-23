@@ -7,6 +7,7 @@ comptime {
     _ = @import("types.zig");
     _ = @import("evm/evm.zig");
     _ = @import("forks.zig");
+    _ = @import("shadow_limits.zig");
     _ = @import("free_list.zig");
     _ = @import("trie/trie.zig");
     _ = @import("trie/range_proof.zig");
@@ -18,8 +19,12 @@ comptime {
     _ = @import("devp2p/rlpx.zig");
     _ = @import("db/file.zig");
     _ = @import("db/eth.zig");
+    _ = @import("db/snapshot.zig");
+    _ = @import("rpc/shadow.zig");
     _ = @import("node/blockchain.zig");
     _ = @import("node/downloader.zig");
+    _ = @import("node/public_intake.zig");
+    _ = @import("node/public_intake_peer.zig");
     _ = @import("node/engine.zig");
     _ = @import("rpc/jsonrpc.zig");
     _ = @import("rpc/http.zig");

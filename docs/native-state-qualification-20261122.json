@@ -1,0 +1,57 @@
+{
+  "scope": "Native exact-parent reader correctness only; no deployment or performance claim",
+  "sourceHashes": {
+    "src/native_state.zig": "aa2dd75b58baa41d60d77670128977ca0f3fd7955bd8855c258338b54187e8d0",
+    "src/native_state_tests.zig": "f3b389accbbedb9d6971ba00b97754a9e0ea301e069d09bf45a5d7e021c513c9",
+    "src/trie/trie.zig": "412c192fb98f66e650de2e0ecaf08a945cac8d3097e304339aac7b176b254ac4",
+    "src/db/kv.zig": "64bbd01e65c15a6caae57430f0d937d43cc6d04b7dc704f59c6a16c95df24f33",
+    "build.zig": "45df377134b761b325d59a84adc6a5a7e93c9d6e056dde0c53cae038cfde321c",
+    "build.zig.zon": "7dacba913298bd3beb0e5fdde7979f5cce8efeaf06adb3b7d5c2a2ba4dcfd382",
+    "docs/native-state.md": "8bfef944b8f539f05887f5f6a703e4c00f00611a03093c25c63b3e9316f4fd13"
+  },
+  "toolchain": "Zig 0.17.0 (repository pinned compiler)",
+  "toolchainVersion": "0.17.0",
+  "tests": {
+    "debug": {
+      "native": 45,
+      "shadow": 82,
+      "log": "native-state-debug-final.log"
+    },
+    "safe": {
+      "native": 45,
+      "shadow": 82,
+      "shadowRunCached": true,
+      "log": "native-state-safe-final.log"
+    },
+    "standard_debug": {
+      "count": 110,
+      "steps": 17,
+      "runCached": false,
+      "log": "zevm-standard-debug-final.log"
+    },
+    "standard_safe": {
+      "count": 110,
+      "steps": 17,
+      "runCached": false,
+      "log": "zevm-standard-safe-final.log"
+    }
+  },
+  "commands": [
+    "zig build test-native-state test-shadow-state -Doptimize=debug -j2 --summary all",
+    "zig build test-native-state test-shadow-state -Doptimize=safe -j2 --summary all",
+    "zig build test -Doptimize=debug -j2 --summary all",
+    "zig build test -Doptimize=safe -j2 --summary all"
+  ],
+  "focusedRegressions": 12,
+  "limits": [
+    "An active lease is move-only, single-worker and relies on stable Reader/Eth/Snapshots/Store lifetimes.",
+    "Native synchronous MDBX operations check cancellation at method/batch boundaries, not within an individual database call.",
+    "Read-only separate-process live-writer qualification belongs to the constructor harness; library tests validate readonly reopen and same-environment writer MVCC changes.",
+    "The reader admits 32 leases; the owner must additionally bound lease lifetime and caller scratch memory."
+  ],
+  "baseCommit": "dfcaf08814390319bdf9c7f434a9fc975d6352f8",
+  "review": {
+    "independentAgent": "Bridge owner reviewed native reader; no blocker found. Reader owner separately reviewed bridge and test harness; timeout finding fixed before live use.",
+    "opus55": "Attempted xhigh review, but CLI returned 401 expired OAuth. No new Opus approval."
+  }
+}
