@@ -132,6 +132,18 @@ pub fn initialize(store: *kv.Store, txn: kv.Transaction, a: std.mem.Allocator, b
     try writeState(store, txn, a, .{ .base = base, .head = base });
 }
 
+/// Drop only an incomplete bootstrap's selected-number window after its exact
+/// authorized tip is adopted. A verified state checkpoint may never use this.
+pub fn rebaseUnverified(store: *kv.Store, txn: kv.Transaction, a: std.mem.Allocator, expected: [32]u8) !types.BlockHeader {
+    if (try @import("snapshot.zig").readCheckpoint(store, txn, a) != null) return error.StateAlreadyVerified;
+    const selected = try state(store, txn) orelse return error.IncompleteStateCheckpoint;
+    if (!std.meta.eql(selected.head.hash(), expected)) return error.BootstrapBranchMismatch;
+    try store.table(txn, .branch_numbers).drop(false);
+    try writeHeader(store, txn, a, selected.head);
+    try writeState(store, txn, a, .{ .base = selected.head, .head = selected.head });
+    return selected.head;
+}
+
 /// Caller also rewinds state if needed, in this same RW transaction. Validate the
 /// entire extension before changing its selected-number mapping or head marker.
 pub fn select(store: *kv.Store, txn: kv.Transaction, a: std.mem.Allocator, ancestor: types.BlockHeader, headers: []const types.BlockHeader) !void {

@@ -35,6 +35,18 @@ pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     var store = try kv.Store.initBoundedChecked(init.io, a, path, 64 << 20, 1 << 20);
     defer store.deinit() catch {};
+    if (std.mem.eql(u8, mode, "wrong-thread-commit")) {
+        var owned: kv.OwnedTransaction = .{ .txn = try store.transaction_rw() };
+        defer owned.deinit();
+        const OtherThread = struct {
+            fn run(transaction: *kv.OwnedTransaction) !void {
+                try transaction.commit();
+            }
+        };
+        var task = try init.io.concurrent(OtherThread.run, .{&owned});
+        try task.await(init.io);
+        return error.WrongThreadCommitUnexpectedlySucceeded;
+    }
     var eth = Eth.init(&store);
     const key = types.keccakOfU160(0x1111);
     if (std.mem.eql(u8, mode, "inspect")) {

@@ -14,6 +14,7 @@ const prom = @import("metrics");
 const branches = @import("../db/branches.zig");
 const undo = @import("../db/undo.zig");
 const snapshots_db = @import("../db/snapshot.zig");
+const bootstrap_db = @import("../db/bootstrap.zig");
 const consensus = @import("consensus.zig");
 const PublicIntake = @import("public_intake_peer.zig").Driver;
 
@@ -33,6 +34,8 @@ const max_snap_flush_seconds = 0.5;
 const expected_code_count = 20_000_000;
 const hash_window_size = 32 << 10;
 const hash_window_nodes = 2 * hash_window_size + 128;
+const bootstrap_drain_timeout_seconds = 30;
+const state_unavailable_backoff_ms = 10_000;
 
 const log = std.log.scoped(.downloader);
 
@@ -49,6 +52,7 @@ pub const Downloader = struct {
     consensus_updates: ?*std.Io.Queue(consensus.Update) = null,
     consensus_update: ?consensus.Update = null,
     consensus_anchor: ?consensus.Anchor = null,
+    bootstrap_target: ?consensus.Anchor = null,
     consensus_probe: ?[32]u8 = null,
     consensus_reported: ?[32]u8 = null,
     ancestor_probe: ?[32]u8 = null,
@@ -56,6 +60,11 @@ pub const Downloader = struct {
     header_generation: u64 = 0,
 
     peer_ranges: []?PeerRange,
+    unavailable_state: [rlpx.Server.max_peers]?struct {
+        peer: rlpx.Server.PeerId,
+        root: [32]u8,
+        until_ms: i64,
+    } = @splat(null),
 
     eth_arena: std.heap.ArenaAllocator,
     eth_provider: *eth.Provider,
@@ -106,6 +115,7 @@ pub const Downloader = struct {
         target_pivot: types.BlockHeader,
         start_number: u64,
         started_at: std.Io.Timestamp,
+        drain_started_at: ?std.Io.Timestamp = null,
 
         bal_requested: bool = false,
         bal_applied: bool = false,
@@ -358,9 +368,13 @@ pub const Downloader = struct {
     fn handleValidated(self: *Self, validated: ValidatedResponse) !void {
         if (validated.outcome) |_| {} else |err| switch (validated.resp) {
             inline else => |resp, proto| {
-                log.debug("dropping peer {} for an invalid {s}: {}", .{ resp.req.peer.peer_index, validated.resp.msgName(), err });
-                const provider = if (proto == .eth) self.eth_provider else self.snap_provider;
-                provider.disconnect(resp.req.peer, err);
+                if (proto == .snap and (err == error.EmptyAccountRange or err == error.EmptyStorageRanges)) {
+                    self.markUnavailableState(resp.req);
+                } else {
+                    log.debug("dropping peer {} for an invalid {s}: {}", .{ resp.req.peer.peer_index, validated.resp.msgName(), err });
+                    const provider = if (proto == .eth) self.eth_provider else self.snap_provider;
+                    provider.disconnect(resp.req.peer, err);
+                }
             },
         }
 
@@ -397,6 +411,20 @@ pub const Downloader = struct {
                     try self.advanceStateHeal();
             },
         }
+    }
+
+    fn markUnavailableState(self: *Self, req: *const Request(snap.Message)) void {
+        const root = switch (req.msg) {
+            .get_account_range => |request| request.root,
+            .get_storage_ranges => |request| request.root_hash,
+            else => return,
+        };
+        self.unavailable_state[req.peer.peer_index] = .{
+            .peer = req.peer,
+            .root = root,
+            .until_ms = @as(i64, @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds())) +| state_unavailable_backoff_ms,
+        };
+        log.debug("peer {} cannot serve state {x}; retaining connection with root-scoped backoff", .{ req.peer.peer_index, root });
     }
 
     fn queueSnapFlush(self: *Self, validated: ValidatedResponse) !void {
@@ -648,7 +676,7 @@ pub const Downloader = struct {
     }
 
     /// Shadow mode resumes the committed state checkpoint, never the header
-    /// head. Only a persisted fixed consensus anchor authorizes restarting an
+    /// head. Only a persisted finalized consensus anchor authorizes restarting an
     /// incomplete bootstrap. Partial flat tables never become readable views.
     pub fn enableShadow(self: *Self, snapshots: *@import("../db/snapshot.zig").Snapshots, restart_bootstrap: bool) !void {
         var owned: kv.OwnedTransaction = .{ .txn = try self.eth_db.kv_store.transaction_rw() };
@@ -674,11 +702,11 @@ pub const Downloader = struct {
         } else if (try branches.state(self.eth_db.kv_store, txn) != null) {
             if (!restart_bootstrap) return error.IncompleteStateCheckpoint;
             const anchor = try self.readConsensusAnchor(txn, arena.allocator()) orelse return error.IncompleteStateCheckpoint;
-            const header = try @import("../db/bootstrap.zig").restart(self.eth_db.kv_store, txn, arena.allocator(), anchor.execution_hash);
+            const header = try bootstrap_db.restart(self.eth_db.kv_store, txn, arena.allocator(), anchor.execution_hash);
             if (header.slot_number.? > anchor.slot) return error.BootstrapBranchMismatch;
             try owned.commit();
             self.pending_bootstrap = header;
-            log.info("shadow restarting incomplete bootstrap at fixed anchor {} hash {x}; no state view published", .{ header.number, header.hash() });
+            log.info("shadow restarting incomplete bootstrap at authorized anchor {} hash {x}; no state view published", .{ header.number, header.hash() });
         } else if ((try self.bc.head()).number != 0) return error.IncompleteStateCheckpoint;
         self.shadow_snapshots = snapshots;
     }
@@ -724,9 +752,16 @@ pub const Downloader = struct {
     fn desiredConsensusHash(self: *Self) ?[32]u8 {
         const update = self.consensus_update orelse return null;
         if (self.consensus_anchor == null) return update.anchor.execution_hash;
-        // Complete the fixed finalized anchor before chasing live heads. Moving
-        // an incomplete snapshot to an unverified peer-selected pivot is unsafe.
-        if (self.shadow_snapshots.?.status().count == 0) return null;
+        if (self.shadow_snapshots.?.status().count == 0) {
+            // Freeze an admitted transition until its old-root work drains and
+            // every intervening authenticated BAL has been applied. Live FULL
+            // and EMPTY hints never select an incomplete bootstrap pivot.
+            if (self.header != null or self.state_heal != null) return self.syncTarget().hash;
+            const state = self.state orelse return null;
+            if (state.phase != .accounts and state.phase != .storage) return null;
+            if (update.anchor.slot <= self.consensus_anchor.?.slot) return null;
+            return update.anchor.execution_hash;
+        }
         return update.head.hash;
     }
 
@@ -803,6 +838,15 @@ pub const Downloader = struct {
             try self.startBootstrap(header);
             log.info("shadow anchored bootstrap: beacon slot {}, execution {} hash {x}", .{ anchor.slot, header.number, expected });
         } else {
+            if (self.shadow_snapshots.?.status().count == 0) {
+                const anchor = self.consensus_update.?.anchor;
+                if (!std.meta.eql(anchor.execution_hash, expected) or header.slot_number.? > anchor.slot)
+                    return error.BootstrapBranchMismatch;
+                const pivot = self.state.?.pivot;
+                if (header.number <= pivot.number or header.number - pivot.number > branches.extension_limit)
+                    return error.BootstrapAnchorGapTooLarge;
+                self.bootstrap_target = anchor;
+            }
             try self.selectConsensusTarget(header);
         }
     }
@@ -1118,11 +1162,17 @@ pub const Downloader = struct {
     }
 
     fn pickSnapPeer(self: *Self, msg: snap.Message) !rlpx.Server.PeerId {
-        return self.snap_provider.pickFastestPeer(std.meta.activeTag(msg), PeerFilter(snap.Message).init(
+        var filter = PeerFilter(snap.Message).init(
             self,
             &self.inflight_snap_requests,
             self.state.?.pivot.number,
-        ));
+        );
+        filter.state_root = switch (msg) {
+            .get_account_range => |request| request.root,
+            .get_storage_ranges => |request| request.root_hash,
+            else => null,
+        };
+        return self.snap_provider.pickFastestPeer(std.meta.activeTag(msg), filter);
     }
 
     fn sendSnapRequest(self: *Self, req: *Request(snap.Message)) !void {
@@ -1344,6 +1394,7 @@ pub const Downloader = struct {
         // An in-flight BAL is bound to the selected branch. Finish it before
         // changing the writer's branch; read leases are independent MDBX views.
         if (self.state_heal != null) return;
+        if (self.shadow_snapshots.?.status().count == 0) return self.selectBootstrapBranch(target);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
@@ -1387,6 +1438,37 @@ pub const Downloader = struct {
             try self.clearDownloadedHeaders();
             self.header = null;
         }
+    }
+
+    fn selectBootstrapBranch(self: *Self, target: SyncTarget) !void {
+        const anchor = self.bootstrap_target orelse return error.BootstrapBranchMismatch;
+        if (self.state.?.phase != .accounts and self.state.?.phase != .storage)
+            return error.BootstrapBranchMismatch;
+        const current = self.state.?.pivot;
+        if (!std.meta.eql(target.hash, anchor.execution_hash) or target.number <= current.number or
+            target.number - current.number > branches.extension_limit) return error.BootstrapAnchorGapTooLarge;
+        const old = try self.readDownladedHeader(current.number) orelse return error.MissingDownloadedHeader;
+        if (!std.meta.eql(old.hash(), current.hash())) return error.BootstrapBranchMismatch;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const headers = try self.readDownladedHeaders(a, current.number + 1, target.number - current.number);
+        const next = headers[headers.len - 1];
+        if (next.slot_number == null or next.slot_number.? > anchor.slot) return error.BootstrapBranchMismatch;
+        var owned: kv.OwnedTransaction = .{ .txn = try self.eth_db.kv_store.transaction_rw() };
+        defer owned.deinit();
+        try bootstrap_db.advance(self.eth_db.kv_store, owned.txn, a, current.hash(), anchor.execution_hash, headers);
+        var encoded = std.array_list.Managed(u8).init(a);
+        try rlp.serialize(consensus.Anchor, a, anchor, &encoded);
+        try self.eth_db.kv_store.table(owned.txn, .state_meta).set("consensus-anchor-v1", encoded.items, .Upsert);
+        try owned.commit();
+        self.consensus_anchor = anchor;
+        self.bootstrap_target = null;
+        try self.clearDownloadedHeaders();
+        self.header = null;
+        if (!try self.startStateHeal(current, next)) return error.MissingDownloadedHeader;
+        self.state.?.pivot = next;
+        log.info("shadow bootstrap advancing finalized anchor {} -> {}; partial state remains unavailable", .{ current.number, next.number });
     }
 
     fn persistDownloadedHeaderChain(
@@ -1483,7 +1565,7 @@ pub const Downloader = struct {
     }
 
     fn updatePivot(self: *Self) !void {
-        if (self.consensus_updates != null) return; // fixed finalized bootstrap anchor
+        if (self.consensus_updates != null) return; // finalized advances use selectBootstrapBranch
         switch ((self.state orelse return).phase) {
             .accounts, .storage => {},
             .codes, .hashing, .catchup => return,
@@ -1526,6 +1608,7 @@ pub const Downloader = struct {
                 .next_pivot = next_pivot,
                 .start_number = cur_pivot.number,
                 .started_at = std.Io.Clock.now(.real, self.io),
+                .drain_started_at = std.Io.Clock.now(.awake, self.io),
             };
             log.info("state heal: started, pivot {} -> {} ({} blocks)", .{
                 cur_pivot.number,
@@ -1573,6 +1656,10 @@ pub const Downloader = struct {
             self.pending_snap_requests.empty() and self.validating_snap_requests.empty() and
             self.stashed_snap_requests.len == 0 and self.snap_flush_queue.empty())
         {
+            // A selected finalized tip may still be downloading its header
+            // ancestry. Do not launch code/account hashing of the old pivot
+            // while that admitted transition is waiting to heal the flat state.
+            if (self.bootstrap_target != null) return;
             log.info("{t} download done", .{state.phase});
             switch (state.phase) {
                 .accounts => state.phase = .storage,
@@ -2074,6 +2161,14 @@ pub const Downloader = struct {
                         state_heal.target_pivot.number - state_heal.start_number,
                         state_heal.started_at.durationTo(std.Io.Clock.now(.real, self.io)).toSeconds(),
                     });
+                    if (self.bootstrapIncomplete()) {
+                        var arena = std.heap.ArenaAllocator.init(self.allocator);
+                        defer arena.deinit();
+                        var owned: kv.OwnedTransaction = .{ .txn = try self.eth_db.kv_store.transaction_rw() };
+                        defer owned.deinit();
+                        try bootstrap_db.completeAdvance(self.eth_db.kv_store, owned.txn, arena.allocator(), self.state.?.pivot.hash());
+                        try owned.commit();
+                    }
                     state_heal.stale_storage_roots.deinit(self.allocator);
                     self.state_heal = null;
                     try self.popSnapRequests();
@@ -2087,12 +2182,23 @@ pub const Downloader = struct {
         }
 
         if (state_heal.bal_requested == false) {
-            if (!self.validating_snap_requests.empty() or !self.snap_flush_queue.empty()) return;
+            if (!self.validating_snap_requests.empty() or !self.snap_flush_queue.empty()) {
+                if (self.bootstrapIncomplete()) if (state_heal.drain_started_at) |started| {
+                    if (started.durationTo(std.Io.Clock.now(.awake, self.io)).toSeconds() >= bootstrap_drain_timeout_seconds)
+                        return error.BootstrapDrainUnavailable;
+                };
+                return;
+            }
             self.stashSnapRequests();
             const bal_req = self.free_eth_requests.pop() orelse return;
             try self.requestRemainingBals(bal_req);
             state_heal.bal_requested = true;
         }
+    }
+
+    fn bootstrapIncomplete(self: *const Self) bool {
+        const snapshots = self.shadow_snapshots orelse return false;
+        return self.consensus_anchor != null and snapshots.status().count == 0;
     }
 
     // the next block must build on the one just applied, otherwise the header chain reorged under us
@@ -2860,6 +2966,323 @@ test "shadow cancellation preserves in-validation ownership and BAL requests" {
     try std.testing.expect(downloader.free_eth_requests.empty());
 }
 
+test "incomplete bootstrap advances only a finalized linked root and publishes after full hashing" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.createDir(io, "db", .default_dir);
+    var path: [1024]u8 = undefined;
+    const length = try dir.dir.realPathFile(io, "db", &path);
+    var store = try kv.Store.initBounded(a, path[0..length], 64 << 20, 1 << 20);
+    defer store.deinit() catch unreachable;
+    var files = try @import("../db/file.zig").Storage.init(io, a, path[0..length]);
+    defer files.deinit(io, a) catch unreachable;
+    var db = EthDb.init(&store);
+    var bc: Blockchain = .{ .cfg = @import("blockchain.zig").glamsterdam_devnet8_config, .io = io, .allocator = alloc, .eth_db = &db, .file_storage = &files, .shadow_branches = .init(true) };
+    const address: u160 = 1;
+    const key = types.keccakOfU160(address);
+    var account = types.EmptyAccount;
+    account.balance = 10;
+    var account_trie = @import("../trie/account_trie.zig").AccountTrie.init(alloc);
+    try account_trie.updateUnsorted(&.{key}, &.{account});
+    var parent = bc.cfg.genesis_header;
+    parent.number = 10;
+    parent.slot_number = 20;
+    parent.block_access_list_hash = @splat(1);
+    parent.state_root = try account_trie.rootHash();
+    {
+        var owned: kv.OwnedTransaction = .{ .txn = try store.transaction_rw() };
+        defer owned.deinit();
+        try db.writeAccount(alloc, owned.txn, key, account);
+        try branches.initialize(&store, owned.txn, alloc, parent);
+        try owned.commit();
+    }
+    account.balance = 20;
+    var child_trie = @import("../trie/account_trie.zig").AccountTrie.init(alloc);
+    try child_trie.updateUnsorted(&.{key}, &.{account});
+    var changes = [_]types.BalanceChange{.{ .index = 1, .balance = 20 }};
+    var bal = [_]types.AccountChanges{.{ .addr = address, .storage_changes = &.{}, .storage_reads = &.{}, .balance_changes = &changes, .nonce_changes = &.{}, .code_changes = &.{} }};
+    var encoded = std.array_list.Managed(u8).init(alloc);
+    try rlp.serialize(types.BlockAccessLists, alloc, &bal, &encoded);
+    var child = parent;
+    child.number += 1;
+    child.slot_number = 21;
+    child.parent_hash = parent.hash();
+    child.state_root = try child_trie.rootHash();
+    std.crypto.hash.sha3.Keccak256.hash(encoded.items, &child.block_access_list_hash.?, .{});
+    var views: snapshots_db.Snapshots = .{ .io = io, .store = &store };
+    defer views.deinit();
+    var eth_provider = try eth.Provider.init(alloc);
+    var snap_provider = try snap.Provider.init(alloc);
+    var d = try Downloader.init(io, alloc, &bc, &db, &eth_provider, &snap_provider);
+    defer d.task_group.cancel(io);
+    d.shadow_snapshots = &views;
+    d.consensus_anchor = .{ .beacon_root = @splat(1), .execution_hash = parent.hash(), .slot = 20 };
+    d.consensus_update = .{
+        .anchor = .{ .beacon_root = @splat(2), .execution_hash = child.hash(), .slot = 52 },
+        .head = .{ .hash = @splat(0xee), .slot = 100 },
+        .observed_at_ms = 0,
+    };
+    d.state = .{ .pivot = parent, .account_fetch_head = std.math.maxInt(u256) };
+    // An empty state response is ordinary unavailability. Keep the live peer
+    // and pending range, with no write or immediate repeated request. There is
+    // deliberately no socket/server: disconnect or send would fail this test.
+    const peer: rlpx.Server.PeerId = .{ .peer_index = 0, .peer_epoch = 1 };
+    snap_provider.peers[0].info.store(.{ .epoch = 1, .offset = 32 }, .release);
+    d.peer_ranges[0] = .{ .id = peer, .range = .{ .earliest_block = 0, .latest_block = child.number, .latest_block_hash = child.hash() } };
+    const snap_req = d.free_snap_requests.pop().?;
+    snap_req.* = .{ .id = 1, .peer = peer, .sent_at = .now(io, .real), .deadline = .now(io, .real), .msg = .{
+        .get_account_range = .{ .root = parent.state_root, .origin = @splat(0), .limit = @splat(0xff) },
+    } };
+    d.validating_snap_requests.push(snap_req);
+    try d.handleValidated(.{
+        .arena = .init(alloc),
+        .resp = .{ .snap = .{ .req = snap_req, .msg = .{
+            .msg = .{ .account_range = .{ .id = 1, .accounts = &.{}, .proof = &.{} } },
+            .read = .{ .peer = peer, .id = 1, .payload = try alloc.alloc(u8, 0) },
+        } } },
+        .outcome = error.EmptyAccountRange,
+    });
+    try std.testing.expectEqual(32, snap_provider.peers[0].info.load(.acquire).offset);
+    try std.testing.expectEqual(snap_req, d.pending_snap_requests.pop().?);
+    try std.testing.expect(d.snap_flush_queue.empty() and d.validating_snap_requests.empty());
+    d.free_snap_requests.push(snap_req);
+    snap_provider.peers[0].info.store(.{ .epoch = 0, .offset = 0 }, .release);
+    // An unrelated live execution head must never select bootstrap work.
+    try std.testing.expectEqual(child.hash(), d.desiredConsensusHash().?);
+    const lookup = d.free_eth_requests.pop().?;
+    lookup.header_purpose = .consensus;
+    lookup.msg = .{ .get_block_headers = .{ .range = .{ .origin = .{ .hash = child.hash() }, .amount = 1 } } };
+    var child_headers = [_]types.BlockHeader{child};
+    var child_hashes = [_][32]u8{child.hash()};
+    try d.handleConsensusHeader(lookup, .{ .headers = .{ .headers = &child_headers, .hashes = &child_hashes } });
+    // Finishing the old-root storage scan while its new header range is in
+    // flight must not start asynchronous hashing against the soon-to-move root.
+    d.state.?.phase = .storage;
+    d.state.?.storage_fetch_head = @splat(0xff);
+    try d.advanceStateDownload();
+    try std.testing.expectEqual(.storage, d.state.?.phase);
+    try std.testing.expectEqual(null, d.task_group.token.load(.acquire));
+    d.state.?.phase = .accounts;
+    const range = d.pending_eth_requests.pop().?;
+    var chain = [_]types.BlockHeader{ parent, child };
+    var hashes = [_][32]u8{ parent.hash(), child.hash() };
+    try d.handleHeaders(range, .{ .headers = .{ .headers = &chain, .hashes = &hashes } });
+    try std.testing.expectEqual(child.hash(), d.state.?.pivot.hash());
+    try std.testing.expectEqual(child.hash(), d.consensus_anchor.?.execution_hash);
+    try std.testing.expectEqual(0, views.status().count);
+    try std.testing.expectError(error.StateViewUnavailable, views.acquire(child.hash(), child.state_root));
+
+    // Preserve the old-root queue barrier and fail within a fixed interval;
+    // never flush later ranges around an unavailable predecessor.
+    const validating = d.free_snap_requests.pop().?;
+    d.validating_snap_requests.push(validating);
+    d.state_heal.?.drain_started_at = .fromNanoseconds(0);
+    try std.testing.expectError(error.BootstrapDrainUnavailable, d.advanceStateHeal());
+    try std.testing.expect(!d.state_heal.?.bal_requested);
+    try std.testing.expectEqual(validating, d.validating_snap_requests.pop().?);
+    d.free_snap_requests.push(validating);
+    d.state_heal.?.drain_started_at = .now(io, .awake);
+    try d.advanceStateHeal();
+    const request = d.pending_eth_requests.pop().?;
+    var wrong = [_]VerifiedBal{.{ .hash = @splat(0xff), .parsed = &bal }};
+    try d.handleBals(request, .{ .bals = &wrong });
+    {
+        const txn = try store.transaction_ro();
+        defer txn.abort() catch unreachable;
+        try std.testing.expectEqual(10, (try db.readAccount(txn, key)).?.balance);
+    }
+    try std.testing.expectEqual(request, d.pending_eth_requests.pop().?);
+    wrong[0].hash = child.block_access_list_hash.?;
+    try d.handleBals(request, .{ .bals = &wrong });
+    try std.testing.expectEqual(null, d.state_heal);
+    try std.testing.expectEqual(0, views.status().count);
+    {
+        const txn = try store.transaction_ro();
+        defer txn.abort() catch unreachable;
+        try std.testing.expectEqual(20, (try db.readAccount(txn, key)).?.balance);
+        try std.testing.expectEqual(child.hash(), (try branches.state(&store, txn)).?.base.hash());
+        try std.testing.expectEqual(null, try snapshots_db.readCheckpoint(&store, txn, alloc));
+    }
+    try std.testing.expectError(error.RootMismatch, d.hashTrie(null, @splat(0x77)));
+    try std.testing.expectEqual(0, views.status().count);
+    try d.hashTrie(null, child.state_root);
+    try d.publishHashedState(child);
+    const lease = try views.acquire(child.hash(), child.state_root);
+    defer lease.deinit();
+    try std.testing.expectEqual(child.hash(), lease.header.hash());
+}
+
+test "unavailable SNAP state backs off only one connection and exact requested root" {
+    const io = std.testing.io;
+    var d: Downloader = undefined;
+    d.io = io;
+    d.unavailable_state = @splat(null);
+    var inflight: List(Request(snap.Message)) = .{};
+    var filter = PeerFilter(snap.Message).init(&d, &inflight, null);
+    filter.state_root = @splat(1);
+    var req: Request(snap.Message) = .{
+        .id = 1,
+        .sent_at = .now(io, .real),
+        .deadline = .now(io, .real),
+        .peer = .{ .peer_index = 0, .peer_epoch = 10 },
+        .msg = .{ .get_account_range = .{ .root = @splat(1), .origin = @splat(0), .limit = @splat(0xff) } },
+    };
+    d.markUnavailableState(&req);
+    try std.testing.expect(!filter.validPeer(req.peer));
+    try std.testing.expect(filter.validPeer(.{ .peer_index = 0, .peer_epoch = 11 }));
+    try std.testing.expect(filter.validPeer(.{ .peer_index = 1, .peer_epoch = 10 }));
+    filter.state_root = @splat(2);
+    try std.testing.expect(filter.validPeer(req.peer));
+    filter.state_root = @splat(1);
+    d.unavailable_state[0].?.until_ms = 0;
+    try std.testing.expect(filter.validPeer(req.peer));
+}
+
+test "bootstrap healing refreshes changed incomplete storage account before retargeting pending ranges" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.createDir(io, "db", .default_dir);
+    var path: [1024]u8 = undefined;
+    const length = try dir.dir.realPathFile(io, "db", &path);
+    var store = try kv.Store.initBounded(a, path[0..length], 64 << 20, 1 << 20);
+    defer store.deinit() catch unreachable;
+    var files = try @import("../db/file.zig").Storage.init(io, a, path[0..length]);
+    defer files.deinit(io, a) catch unreachable;
+    var db = EthDb.init(&store);
+    var bc: Blockchain = .{ .cfg = @import("blockchain.zig").glamsterdam_devnet8_config, .io = io, .allocator = alloc, .eth_db = &db, .file_storage = &files, .shadow_branches = .init(true) };
+    const address: u160 = 1;
+    const key = types.keccakOfU160(address);
+    var slots = [_]u256{ 1, 2 };
+    var slot_hashes = [_][32]u8{ types.keccakOfU256(1), types.keccakOfU256(2) };
+    if (std.mem.order(u8, &slot_hashes[0], &slot_hashes[1]) == .gt) {
+        std.mem.swap(u256, &slots[0], &slots[1]);
+        std.mem.swap([32]u8, &slot_hashes[0], &slot_hashes[1]);
+    }
+    var old_storage = @import("../trie/storage_trie.zig").StorageTrie.init(alloc);
+    try old_storage.update(&slot_hashes, &.{ 7, 11 });
+    var account = types.EmptyAccount;
+    account.balance = 10;
+    account.storage_hash = try old_storage.rootHash();
+    var old_accounts = @import("../trie/account_trie.zig").AccountTrie.init(alloc);
+    try old_accounts.updateUnsorted(&.{key}, &.{account});
+    var parent_header = bc.cfg.genesis_header;
+    parent_header.number = 10;
+    parent_header.slot_number = 20;
+    parent_header.block_access_list_hash = @splat(1);
+    parent_header.state_root = try old_accounts.rootHash();
+    {
+        var owned: kv.OwnedTransaction = .{ .txn = try store.transaction_rw() };
+        defer owned.deinit();
+        try db.writeAccount(alloc, owned.txn, key, account);
+        // Only the first storage chunk has arrived; the second is outstanding.
+        try db.writeStorage(owned.txn, key, slot_hashes[0], 7);
+        try branches.initialize(&store, owned.txn, alloc, parent_header);
+        try owned.commit();
+    }
+    var new_storage = @import("../trie/storage_trie.zig").StorageTrie.init(alloc);
+    try new_storage.update(&slot_hashes, &.{ 17, 21 });
+    var updated = account;
+    updated.balance = 20;
+    updated.nonce = 1;
+    updated.storage_hash = try new_storage.rootHash();
+    var new_accounts = @import("../trie/account_trie.zig").AccountTrie.init(alloc);
+    try new_accounts.updateUnsorted(&.{key}, &.{updated});
+    var child = parent_header;
+    child.number += 1;
+    child.slot_number = 21;
+    child.parent_hash = parent_header.hash();
+    child.state_root = try new_accounts.rootHash();
+    var changes = [_]types.StorageChange{ .{ .index = 1, .value = 17 }, .{ .index = 1, .value = 21 } };
+    var storage_changes = [_]types.SlotChanges{ .{ .key = slots[0], .changes = changes[0..1] }, .{ .key = slots[1], .changes = changes[1..2] } };
+    var balances = [_]types.BalanceChange{.{ .index = 1, .balance = 20 }};
+    var nonces = [_]types.NonceChange{.{ .index = 1, .nonce = 1 }};
+    var bal = [_]types.AccountChanges{.{ .addr = address, .storage_changes = &storage_changes, .storage_reads = &.{}, .balance_changes = &balances, .nonce_changes = &nonces, .code_changes = &.{} }};
+    var encoded = std.array_list.Managed(u8).init(alloc);
+    try rlp.serialize(types.BlockAccessLists, alloc, &bal, &encoded);
+    std.crypto.hash.sha3.Keccak256.hash(encoded.items, &child.block_access_list_hash.?, .{});
+    {
+        var owned: kv.OwnedTransaction = .{ .txn = try store.transaction_rw() };
+        defer owned.deinit();
+        try bootstrap_db.advance(&store, owned.txn, alloc, parent_header.hash(), child.hash(), &.{child});
+        try owned.commit();
+    }
+    var views: snapshots_db.Snapshots = .{ .io = io, .store = &store };
+    defer views.deinit();
+    var eth_provider = try eth.Provider.init(alloc);
+    var snap_provider = try snap.Provider.init(alloc);
+    var d = try Downloader.init(io, alloc, &bc, &db, &eth_provider, &snap_provider);
+    defer d.task_group.cancel(io);
+    d.shadow_snapshots = &views;
+    d.consensus_anchor = .{ .beacon_root = @splat(1), .execution_hash = child.hash(), .slot = 52 };
+    d.state = .{ .pivot = child, .phase = .storage, .storage_fetch_head = @splat(0xff) };
+    var pending_accounts = [_][32]u8{key};
+    var pending_roots = [_][32]u8{account.storage_hash};
+    d.stashed_snap_requests.len = 1;
+    d.stashed_snap_requests[0] = .{
+        .id = 10,
+        .peer = invalid_peer,
+        .sent_at = .now(io, .real),
+        .deadline = .now(io, .real),
+        .storage_roots = &pending_roots,
+        .msg = .{ .get_storage_ranges = .{ .root_hash = parent_header.state_root, .account_hashes = &pending_accounts, .starting_hash = slot_hashes[1] } },
+    };
+    try std.testing.expect(try d.startStateHeal(parent_header, child));
+    d.state_heal.?.bal_requested = true;
+    var verified = [_]VerifiedBal{.{ .hash = child.block_access_list_hash.?, .parsed = &bal }};
+    try d.handleBals(d.free_eth_requests.pop().?, .{ .bals = &verified });
+    const refresh = d.pending_snap_requests.pop().?;
+    try std.testing.expectEqual(key, refresh.msg.get_account_range.origin);
+    try std.testing.expectEqual(key, refresh.msg.get_account_range.limit);
+    try std.testing.expectEqual(child.state_root, refresh.msg.get_account_range.root);
+    {
+        const txn = try store.transaction_ro();
+        defer txn.abort() catch unreachable;
+        try std.testing.expectEqual(account.storage_hash, (try db.readAccount(txn, key)).?.storage_hash);
+        var keys: [2][32]u8 = undefined;
+        var values: [2]u256 = undefined;
+        try std.testing.expectEqual(1, try db.readStorageRange(txn, key, @splat(0), &keys, &values));
+        try std.testing.expectEqual(17, values[0]);
+    }
+    var slim = std.array_list.Managed(u8).init(alloc);
+    try rlp.serialize(snap.SlimAccount, alloc, .{ .nonce = 1, .balance = 20, .root = &updated.storage_hash, .code_hash = &.{} }, &slim);
+    const accounts = try alloc.alloc(@typeInfo(@FieldType(snap.AccountRange, "accounts")).pointer.child, 1);
+    accounts[0] = .{ .hash = key, .account = .{ .value = slim.items } };
+    var response: snap.AccountRange = .{ .id = 1, .accounts = accounts, .proof = &.{} };
+    var bad_request = refresh.msg.get_account_range;
+    bad_request.root = parent_header.state_root;
+    if (d.verifyAccounts(alloc, bad_request, &response)) |_| return error.TestExpectedError else |_| {}
+    const outcome = try d.verifyAccounts(alloc, refresh.msg.get_account_range, &response);
+    d.validating_snap_requests.push(refresh);
+    try d.handleValidated(.{
+        .arena = .init(alloc),
+        .resp = .{ .snap = .{ .req = refresh, .msg = .{
+            .msg = .{ .account_range = response },
+            .read = .{ .peer = invalid_peer, .id = 1, .payload = try alloc.alloc(u8, 0) },
+        } } },
+        .outcome = outcome,
+    });
+    try std.testing.expectEqual(null, d.state_heal);
+    try std.testing.expectEqual(0, views.status().count);
+    const retargeted = d.pending_snap_requests.pop().?;
+    try std.testing.expectEqual(child.state_root, retargeted.msg.get_storage_ranges.root_hash);
+    try std.testing.expectEqual(updated.storage_hash, retargeted.storage_roots[0]);
+    try std.testing.expectEqual(slot_hashes[1], retargeted.msg.get_storage_ranges.starting_hash);
+    const txn = try store.transaction_ro();
+    defer txn.abort() catch unreachable;
+    try std.testing.expectEqual(updated, (try db.readAccount(txn, key)).?);
+    try std.testing.expectEqual(null, try snapshots_db.readCheckpoint(&store, txn, alloc));
+}
+
 pub const SyncTarget = struct {
     paused: bool = false,
 
@@ -3004,6 +3427,7 @@ fn PeerFilter(comptime Message: type) type {
     return struct {
         downloader: *Downloader,
         min_height: ?u64,
+        state_root: ?[32]u8 = null,
         inflight: [rlpx.Server.max_peers]struct { epoch: usize = 0, count: usize = 0 } = @splat(.{}),
 
         fn init(downloader: *Downloader, inflight: *List(Request(Message)), min_height: ?u64) @This() {
@@ -3020,6 +3444,10 @@ fn PeerFilter(comptime Message: type) type {
         }
 
         pub fn validPeer(self: *const @This(), peer_id: rlpx.Server.PeerId) bool {
+            if (self.state_root) |root| if (self.downloader.unavailable_state[peer_id.peer_index]) |unavailable| {
+                if (std.meta.eql(unavailable.peer, peer_id) and std.meta.eql(unavailable.root, root) and
+                    std.Io.Clock.awake.now(self.downloader.io).toMilliseconds() < unavailable.until_ms) return false;
+            };
             if (self.min_height) |min_height| {
                 const peer_range = self.downloader.peer_ranges[peer_id.peer_index] orelse return false;
                 if (peer_range.id.peer_epoch != peer_id.peer_epoch or min_height > peer_range.range.latest_block) return false;

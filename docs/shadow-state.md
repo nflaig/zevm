@@ -154,6 +154,26 @@ No state is advertised before account, storage and code verification completes.
 The anchor is persisted in the same transaction as the branch base. A peer-only
 database cannot silently become a consensus-anchored one: use a fresh directory.
 
+During the account/storage scan, five-second reconciliation refreshes that
+finalized anchor. This matters on networks whose state download exceeds the
+SNAP peers' recent-state retention: a fixed root can become unavailable. The
+downloader accepts only a hash-linked finalized extension of at most 128 blocks,
+stashes outstanding ranges after the old-root validation/write queue drains,
+and applies each header's hash-checked BAL to the fetched portion. Accounts with
+incomplete changed storage are refreshed with proofs against the new root before
+outstanding ranges are retargeted. Live FULL/EMPTY hints do not move an incomplete
+bootstrap. Code download and final hashing keep their existing root/code checks.
+
+The selected old base, new tip, finalized consensus anchor and an authorized-tip
+marker are committed together before healing; no verified-state marker is
+written. After healing, the selected base and head are rebased to the new anchor.
+Empty account/storage SNAP responses are treated as state unavailability, with
+a ten-second backoff for that connection and requested root. Invalid proofs still
+disconnect the peer. The old-root queue must drain within 30 seconds; otherwise
+the downloader fails with `BootstrapDrainUnavailable`, preserving ordering and
+keeping state unavailable. This is bounded failure, not automatic recovery of an
+arbitrarily expired partial download.
+
 After bootstrap, `head_v2`, `head`, `execution_payload` and `payload_attributes`
 SSE events trigger a read of Lodestar's `/eth/v2/debug/fork_choice`. Execution
 payload notifications warm their exact FULL hash immediately, before the beacon's
@@ -184,7 +204,10 @@ arrival latency or a proposer deadline measurement.
 An interrupted bootstrap with a persisted trusted consensus anchor restarts
 automatically in the same directory when `--shadow-beacon-url` is supplied.
 It clears only unverified account/storage/code/trie tables, in one transaction,
-and repeats the full scan of that same fixed anchor. Ordered append ingestion
+and repeats the full scan of the persisted authorized anchor. If interrupted
+between selecting a new finalized tip and completing its heal, the saved tip,
+anchor and authorization marker must agree; reset rebases to that tip atomically.
+Ordered append ingestion
 cannot safely resume into partially populated tables. No state view is published
 until full root hashing and code download finish. A verified checkpoint is never
 cleared; missing/mismatched anchor metadata still fails closed. The database tests
@@ -202,8 +225,13 @@ were during process startup; no partial state was published. Evidence lives in
 qualification workspace. This tests one interruption point, not power loss or
 exhausted history recovery.
 
-Current limits: the finalized bootstrap pivot stays fixed until complete; peers
-must still serve its state after an interruption. Recovery is bounded by retained
+Current limits: finalized progress must remain within the 128-block extension
+bound and peers must serve each old root while its write queue drains. A larger
+gap fails with `BootstrapAnchorGapTooLarge` and requires a fresh bootstrap;
+there is no automatic state reset loop or unbounded history walk. After a long
+interruption, the persisted anchor may already be unservable. The account/storage
+phase can advance finalized roots; code download and final hashing do not.
+Recovery after the first verified checkpoint is bounded by retained
 undo history; only eight recent views are retained and one writer processes
 targets at a time, so arbitrary FULL/EMPTY/ancestor coverage is not guaranteed.
 It depends on Lodestar's debug V2 API, not

@@ -97,6 +97,79 @@ test "shadow bootstrap reset rejects a progressed branch without a checkpoint" {
     try std.testing.expectError(error.BootstrapBranchMismatch, bootstrap.restart(&fixture.store, txn, a, child.hash()));
 }
 
+test "finalized bootstrap advance is bounded linked atomic and restart uses only authorized tip" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const base_header = try prepareIncompleteBootstrap(&fixture);
+    var child = base_header;
+    child.number += 1;
+    child.slot_number = base_header.slot_number.? + 1;
+    child.parent_hash = base_header.hash();
+    child.state_root = @splat(0x55);
+    const key = types.keccakOfU160(std.mem.readInt(u160, &queries[0].address.bytes, .big));
+    {
+        var owned: kv.OwnedTransaction = .{ .txn = try fixture.store.transaction_rw() };
+        defer owned.deinit();
+        var sibling = child;
+        sibling.parent_hash = @splat(0x99);
+        try std.testing.expectError(error.BranchParentMismatch, bootstrap.advance(&fixture.store, owned.txn, a, base_header.hash(), sibling.hash(), &.{sibling}));
+        try std.testing.expectEqual(base_header.hash(), (try branches.state(&fixture.store, owned.txn)).?.head.hash());
+        try std.testing.expectError(error.BootstrapBranchMismatch, bootstrap.advance(&fixture.store, owned.txn, a, base_header.hash(), @splat(0x88), &.{child}));
+        const excessive: [129]types.BlockHeader = @splat(child);
+        try std.testing.expectError(error.BootstrapAnchorGapTooLarge, bootstrap.advance(&fixture.store, owned.txn, a, base_header.hash(), child.hash(), &excessive));
+        try bootstrap.advance(&fixture.store, owned.txn, a, base_header.hash(), child.hash(), &.{child});
+        // Abort an admitted advance: both tip authorization and selected head
+        // roll back; partial state is unchanged.
+    }
+    {
+        var owned: kv.OwnedTransaction = .{ .txn = try fixture.store.transaction_rw() };
+        defer owned.deinit();
+        try std.testing.expectEqual(base_header.hash(), (try branches.state(&fixture.store, owned.txn)).?.head.hash());
+        try bootstrap.advance(&fixture.store, owned.txn, a, base_header.hash(), child.hash(), &.{child});
+        try owned.commit();
+    }
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &fixture.store };
+    defer views.deinit();
+    try std.testing.expectError(error.StateNotReady, views.publish(a));
+    const old = try fixture.store.transaction_ro();
+    defer old.abort() catch unreachable;
+    try std.testing.expect((try fixture.store.table(old, .accounts).get(&key)) != null);
+    {
+        var owned: kv.OwnedTransaction = .{ .txn = try fixture.store.transaction_rw() };
+        defer owned.deinit();
+        try std.testing.expectError(error.BootstrapBranchMismatch, bootstrap.restart(&fixture.store, owned.txn, a, base_header.hash()));
+        try std.testing.expectEqual(child.hash(), (try bootstrap.restart(&fixture.store, owned.txn, a, child.hash())).hash());
+        try std.testing.expectEqual(child.hash(), (try branches.state(&fixture.store, owned.txn)).?.base.hash());
+        try std.testing.expect((try fixture.store.table(owned.txn, .accounts).get(&key)) == null);
+        try std.testing.expectEqual(null, try snapshots.readCheckpoint(&fixture.store, owned.txn, a));
+        try owned.commit();
+    }
+    try std.testing.expect((try fixture.store.table(old, .accounts).get(&key)) != null);
+    try std.testing.expectError(error.StateViewUnavailable, views.acquire(child.hash(), child.state_root));
+}
+
+test "completed bootstrap healing rebases only unverified authorized state and keeps partial data" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const base_header = try prepareIncompleteBootstrap(&fixture);
+    var child = base_header;
+    child.number += 1;
+    child.parent_hash = base_header.hash();
+    var owned: kv.OwnedTransaction = .{ .txn = try fixture.store.transaction_rw() };
+    defer owned.deinit();
+    try bootstrap.advance(&fixture.store, owned.txn, a, base_header.hash(), child.hash(), &.{child});
+    try std.testing.expectError(error.BootstrapBranchMismatch, bootstrap.completeAdvance(&fixture.store, owned.txn, a, @splat(0x55)));
+    try bootstrap.completeAdvance(&fixture.store, owned.txn, a, child.hash());
+    const selected = (try branches.state(&fixture.store, owned.txn)).?;
+    try std.testing.expectEqual(child.hash(), selected.base.hash());
+    try std.testing.expectEqual(child.hash(), selected.head.hash());
+    try std.testing.expectEqual(null, try snapshots.readCheckpoint(&fixture.store, owned.txn, a));
+    const key = types.keccakOfU160(std.mem.readInt(u160, &queries[0].address.bytes, .big));
+    try std.testing.expect((try fixture.store.table(owned.txn, .accounts).get(&key)) != null);
+    try snapshots.writeCheckpoint(&fixture.store, owned.txn, a, child);
+    try std.testing.expectError(error.StateAlreadyVerified, branches.rebaseUnverified(&fixture.store, owned.txn, a, child.hash()));
+}
+
 const Fixture = struct {
     dir: std.testing.TmpDir,
     store: kv.Store,

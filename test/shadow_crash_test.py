@@ -2,6 +2,7 @@
 import argparse
 import json
 from pathlib import Path
+import resource
 import select
 import signal
 import subprocess
@@ -36,12 +37,29 @@ def trial(probe, phase, expected):
         return {"phase": phase, "signal": "SIGKILL", "passed": True, "reopened": result}
 
 
+def thread_ownership_trial(probe):
+    def disable_core_dump():
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+    with tempfile.TemporaryDirectory(prefix="zevm-state-thread-") as directory:
+        process = subprocess.run(
+            [probe, "wrong-thread-commit", directory], capture_output=True,
+            text=True, timeout=20, preexec_fn=disable_core_dump,
+        )
+        expected = "MDBX owned transaction commit on a non-owning thread"
+        assert process.returncode == -signal.SIGABRT and expected in process.stderr, (
+            process.returncode, process.stderr,
+        )
+        return {"phase": "wrong-thread-commit", "signal": "SIGABRT", "passed": True}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--probe", required=True)
     args = parser.parse_args()
     for phase, expected in (("before-commit", 1), ("after-commit", 2)):
         print(json.dumps(trial(str(Path(args.probe).resolve()), phase, expected)), flush=True)
+    print(json.dumps(thread_ownership_trial(str(Path(args.probe).resolve()))), flush=True)
 
 
 if __name__ == "__main__":

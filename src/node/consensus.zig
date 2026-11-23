@@ -197,6 +197,7 @@ pub const Tracker = struct {
     client: std.http.Client,
     anchor: ?Anchor = null,
     latest_hash: ?[32]u8 = null,
+    published_anchor: ?Anchor = null,
     publish_mutex: std.Io.Mutex = .init,
     attributes_sink: ?AttributesSink = null,
 
@@ -244,14 +245,35 @@ pub const Tracker = struct {
         };
     }
 
-    fn bootstrap(self: *Tracker) !void {
+    fn refreshAnchor(self: *Tracker) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
         const checkpoint = try finalizedHeader(a, try self.timedGet(a, "/eth/v1/beacon/headers/finalized"));
         const path = try std.fmt.allocPrint(a, "/eth/v2/beacon/blocks/0x{s}", .{std.fmt.bytesToHex(checkpoint.root, .lower)});
-        self.anchor = try finalizedParent(a, try self.timedGet(a, path), checkpoint.root, checkpoint.slot);
-        log.info("trusted post-Gloas anchor: slot {} beacon {x} execution {x}", .{ checkpoint.slot, checkpoint.root, self.anchor.?.execution_hash });
+        const anchor = try finalizedParent(a, try self.timedGet(a, path), checkpoint.root, checkpoint.slot);
+        // Network I/O does not hold the event publication lock. A delayed
+        // refresh cannot overwrite a newer finalized anchor or race publication.
+        if (try self.installAnchor(anchor))
+            log.info("trusted post-Gloas anchor: slot {} beacon {x} execution {x}", .{ anchor.slot, anchor.beacon_root, anchor.execution_hash });
+    }
+
+    fn installAnchor(self: *Tracker, anchor: Anchor) !bool {
+        try self.publish_mutex.lock(self.io);
+        defer self.publish_mutex.unlock(self.io);
+        return self.acceptAnchor(anchor);
+    }
+
+    fn acceptAnchor(self: *Tracker, anchor: Anchor) !bool {
+        if (self.anchor) |previous| {
+            if (anchor.slot < previous.slot) return false;
+            if (anchor.slot == previous.slot) {
+                if (!std.meta.eql(anchor, previous)) return error.ConflictingConsensusAnchor;
+                return false;
+            }
+        }
+        self.anchor = anchor;
+        return true;
     }
 
     fn publishHead(self: *Tracker, kind: EventKind, data: []const u8) !void {
@@ -284,9 +306,11 @@ pub const Tracker = struct {
                 .received_mono_ms = observed_mono_ms,
             })) log.warn("native attribute mailbox full", .{});
         };
-        if (self.latest_hash) |previous| if (std.meta.eql(previous, head.hash)) return;
+        if (self.latest_hash) |previous| if (std.meta.eql(previous, head.hash) and
+            self.published_anchor != null and std.meta.eql(self.published_anchor.?, self.anchor.?)) return;
         try self.updates.putOne(self.io, .{ .anchor = self.anchor.?, .head = head, .observed_at_ms = observed_at_ms });
         self.latest_hash = head.hash;
+        self.published_anchor = self.anchor;
     }
 
     fn invalidate(self: *Tracker) void {
@@ -356,6 +380,10 @@ pub const Tracker = struct {
 
     fn reconcileLoop(self: *Tracker) !void {
         while (true) {
+            self.refreshAnchor() catch |e| {
+                if (e == error.Canceled) return e;
+                log.warn("finalized anchor reconciliation: {t}", .{e});
+            };
             self.publishHead(.head, "") catch |e| {
                 if (e == error.Canceled) return e;
                 log.warn("head reconciliation: {t}", .{e});
@@ -366,7 +394,7 @@ pub const Tracker = struct {
 
     pub fn run(self: *Tracker) !void {
         while (self.anchor == null) {
-            self.bootstrap() catch |e| {
+            self.refreshAnchor() catch |e| {
                 if (e == error.Canceled) return e;
                 log.warn("waiting for a verified consensus anchor: {t}", .{e});
                 try std.Io.sleep(self.io, .fromSeconds(1), .awake);
@@ -388,6 +416,58 @@ pub const Tracker = struct {
 const test_root = "0x" ++ std.fmt.bytesToHex(@as([32]u8, @splat(0x11)), .lower);
 const test_parent = "0x" ++ std.fmt.bytesToHex(@as([32]u8, @splat(0x22)), .lower);
 const test_payload = "0x" ++ std.fmt.bytesToHex(@as([32]u8, @splat(0x33)), .lower);
+
+test "delayed finalized refresh cannot regress authority and anchor change bypasses head dedup" {
+    var buffer: [4]Update = undefined;
+    var queue: std.Io.Queue(Update) = .init(&buffer);
+    var tracker = try Tracker.init(std.testing.io, std.testing.allocator, "http://localhost:9596", &queue);
+    defer tracker.deinit();
+    const old: Anchor = .{ .slot = 100, .beacon_root = @splat(1), .execution_hash = @splat(2) };
+    const newer: Anchor = .{ .slot = 132, .beacon_root = @splat(3), .execution_hash = @splat(4) };
+    const head: Head = .{ .slot = 200, .hash = @splat(5) };
+    try std.testing.expect(try tracker.acceptAnchor(old));
+    try tracker.publishVerified(.head, "", null, head, 1, 1);
+    try std.testing.expectEqual(old, (try queue.getOne(std.testing.io)).anchor);
+    try std.testing.expect(try tracker.acceptAnchor(newer));
+    // Model a slower refresh completing after the newer response. The same
+    // publication lock covers acceptAnchor and publishVerified in production.
+    try std.testing.expect(!try tracker.acceptAnchor(old));
+    try std.testing.expect(!try tracker.acceptAnchor(newer));
+    var conflicting = newer;
+    conflicting.execution_hash = @splat(9);
+    try std.testing.expectError(error.ConflictingConsensusAnchor, tracker.acceptAnchor(conflicting));
+    try std.testing.expectEqual(newer, tracker.anchor.?);
+    try tracker.publishVerified(.head, "", null, head, 2, 2);
+    try std.testing.expectEqual(newer, (try queue.getOne(std.testing.io)).anchor);
+    try tracker.publishVerified(.head, "", null, head, 3, 3);
+    try std.testing.expectEqual(0, try queue.get(std.testing.io, &buffer, 0));
+}
+
+test "concurrent finalized refresh serializes delayed older authority" {
+    const io = std.testing.io;
+    var buffer: [2]Update = undefined;
+    var queue: std.Io.Queue(Update) = .init(&buffer);
+    var tracker = try Tracker.init(io, std.testing.allocator, "http://localhost:9596", &queue);
+    defer tracker.deinit();
+    const old: Anchor = .{ .slot = 100, .beacon_root = @splat(1), .execution_hash = @splat(2) };
+    const newer: Anchor = .{ .slot = 132, .beacon_root = @splat(3), .execution_hash = @splat(4) };
+    // Hold the actual publication mutex while the late response's task starts.
+    try tracker.publish_mutex.lock(io);
+    var locked = true;
+    defer if (locked) tracker.publish_mutex.unlock(io);
+    const Delayed = struct {
+        fn run(owner: *Tracker, anchor: Anchor) !bool {
+            return owner.installAnchor(anchor);
+        }
+    };
+    var response = io.concurrent(Delayed.run, .{ &tracker, old }) catch return error.SkipZigTest;
+    defer _ = response.cancel(io) catch {};
+    try std.testing.expect(try tracker.acceptAnchor(newer));
+    tracker.publish_mutex.unlock(io);
+    locked = false;
+    try std.testing.expect(!try response.await(io));
+    try std.testing.expectEqual(newer, tracker.anchor.?);
+}
 
 test "consensus bootstrap requires finalized canonical execution-verified Gloas data" {
     const a = std.testing.allocator;
