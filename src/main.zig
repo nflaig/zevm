@@ -70,7 +70,7 @@ const params = clap.parseParamsComptime(
     \\    --metrics-addr <str>  Prometheus metrics HTTP listening address (default: 127.0.0.1).
     \\    --metrics-port <u16>  Prometheus metrics HTTP listening port (default: 6060).
     \\    --shadow-state        Enable exact-parent state witness qualification.
-    \\    --shadow-state-max-db-gib <str> Explicit shadow MDBX cap in GiB (1..128; default 16; requires --shadow-state).
+    \\    --shadow-state-max-db-gib <str> Explicit shadow MDBX cap in GiB (1..256; default 16; requires --shadow-state).
     \\    --shadow-beacon-url <str> Follow a trusted local post-Gloas beacon node (requires --shadow-state).
     \\    --public-intake-observer Observe independent public transaction hashes/times (requires --shadow-state; never feeds construction).
     \\    --native-builder       Run an embedded shadow constructor (requires a combined binary and trusted beacon; never publishes bids).

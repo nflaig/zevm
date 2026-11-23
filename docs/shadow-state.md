@@ -15,7 +15,7 @@ python3 test/shadow_crash_test.py --probe ./zig-out/bin/shadow-crash-probe
 
 Start in a fresh, dedicated directory with `--shadow-state`, independent peer
 ports and localhost HTTP. The shadow DB defaults to a 16 GiB maximum with 256 MiB
-growth. `--shadow-state-max-db-gib <1..128>` admits a larger or smaller explicit
+growth. `--shadow-state-max-db-gib <1..256>` admits a larger or smaller explicit
 cap only with `--shadow-state`; it never grows automatically beyond that cap.
 An existing `mdbx.dat` larger than the requested cap is refused before opening
 MDBX. The configured cap and actual geometry are logged on startup. This bounds
@@ -30,6 +30,10 @@ directory after a shadow database has grown beyond 16 GiB; never assume a binary
 rollback also rolls back database geometry. Standalone witness/native benchmarks
 open existing state read-only and do not change geometry; temporary fixture and
 crash-probe databases are not production state directories.
+Increasing the cap does not verify or resume a partial bootstrap: an unverified
+bootstrap still clears its partial state on restart and must authenticate the
+complete root before any checkpoint becomes available. The larger cap only
+admits additional MDBX file growth; reserve disk space separately before using it.
 Apply CPU, memory, PID and log limits to the process/container independently.
 Never mount an existing execution client's database into this process.
 
