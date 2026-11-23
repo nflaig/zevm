@@ -1231,11 +1231,40 @@ pub const Downloader = struct {
                 .get_account_range => |*account_range_req| account_range_req.root = pivot_root,
                 .get_storage_ranges => |*storage_ranges_req| {
                     storage_ranges_req.root_hash = pivot_root;
-                    // healing may have changed the storage roots of the stashed accounts
-                    for (storage_ranges_req.account_hashes, req.storage_roots) |account_hash, *root| {
+                    // These were previously downloaded accounts. BAL healing
+                    // and any required new-root account proofs have completed
+                    // before resuming: absence/empty storage is authenticated,
+                    // unlike an empty network response for a nonempty root.
+                    // SNAP servers may omit empty storage lists entirely, so
+                    // keeping one here can stall or misalign the whole batch.
+                    const accounts = storage_ranges_req.account_hashes;
+                    const roots = req.storage_roots;
+                    var kept: usize = 0;
+                    var first_kept: usize = 0;
+                    var last_kept: usize = 0;
+                    for (accounts, 0..) |account_hash, index| {
                         const account = try self.eth_db.readAccount(txn, account_hash);
-                        root.* = if (account) |acc| acc.storage_hash else types.empty_root_hash;
+                        const root = if (account) |acc| acc.storage_hash else types.empty_root_hash;
+                        if (std.meta.eql(root, types.empty_root_hash)) continue;
+                        if (kept == 0) first_kept = index;
+                        last_kept = index;
+                        accounts[kept] = account_hash;
+                        roots[kept] = root;
+                        kept += 1;
                     }
+                    if (kept == 0) {
+                        self.allocator.free(@as([][32]u8, accounts.ptr[0..batch_storage_code_req_size]));
+                        self.allocator.free(@as([][32]u8, roots.ptr[0..batch_storage_code_req_size]));
+                        self.progress.storage_keyspace +|= req.keyspace[1] - req.keyspace[0];
+                        self.free_snap_requests.push(req);
+                        continue;
+                    }
+                    // Origin/limit belong to the original edge accounts, not
+                    // whichever accounts become the edges after compaction.
+                    if (first_kept != 0) storage_ranges_req.starting_hash = @splat(0);
+                    if (last_kept != accounts.len - 1) storage_ranges_req.limit_hash = @splat(0xff);
+                    storage_ranges_req.account_hashes = accounts[0..kept];
+                    req.storage_roots = roots[0..kept];
                 },
                 else => {},
             }
@@ -3281,6 +3310,138 @@ test "bootstrap healing refreshes changed incomplete storage account before reta
     defer txn.abort() catch unreachable;
     try std.testing.expectEqual(updated, (try db.readAccount(txn, key)).?);
     try std.testing.expectEqual(null, try snapshots_db.readCheckpoint(&store, txn, alloc));
+}
+
+test "healed storage resumes only authenticated nonempty accounts and preserves survivor bounds" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.createDir(io, "db", .default_dir);
+    var path: [1024]u8 = undefined;
+    const length = try dir.dir.realPathFile(io, "db", &path);
+    var store = try kv.Store.initBounded(a, path[0..length], 64 << 20, 1 << 20);
+    defer store.deinit() catch unreachable;
+    var files = try @import("../db/file.zig").Storage.init(io, a, path[0..length]);
+    defer files.deinit(io, a) catch unreachable;
+    var db = EthDb.init(&store);
+    var bc: Blockchain = .{ .cfg = @import("blockchain.zig").glamsterdam_devnet8_config, .io = io, .allocator = alloc, .eth_db = &db, .file_storage = &files };
+    const keys = [_][32]u8{ @splat(0x11), @splat(0x22), @splat(0x33), @splat(0x44), @splat(0x55) };
+    var storage_trie = @import("../trie/storage_trie.zig").StorageTrie.init(alloc);
+    try storage_trie.update(&.{types.keccakOfU256(1)}, &.{7});
+    const storage_root = try storage_trie.rootHash();
+    var empty_account = types.EmptyAccount;
+    empty_account.balance = 10;
+    var nonempty_account = empty_account;
+    nonempty_account.storage_hash = storage_root;
+    // A complete account-range proof authenticates two empty roots, two
+    // nonempty roots and absence of the middle account. No peer response may
+    // make an unknown storage root look empty merely by returning no slots.
+    const present_keys = [_][32]u8{ keys[0], keys[1], keys[3], keys[4] };
+    const present_accounts = [_]types.Account{ empty_account, nonempty_account, nonempty_account, empty_account };
+    var account_trie = @import("../trie/account_trie.zig").AccountTrie.init(alloc);
+    try account_trie.updateUnsorted(&present_keys, &.{ empty_account, nonempty_account, nonempty_account, empty_account });
+    var header = bc.cfg.genesis_header;
+    header.state_root = try account_trie.rootHash();
+    {
+        var owned: kv.OwnedTransaction = .{ .txn = try store.transaction_rw() };
+        defer owned.deinit();
+        try branches.initialize(&store, owned.txn, alloc, header);
+        try owned.commit();
+    }
+    bc.shadow_branches.store(true, .release);
+    var eth_provider = try eth.Provider.init(alloc);
+    var snap_provider = try snap.Provider.init(alloc);
+    var d = try Downloader.init(io, alloc, &bc, &db, &eth_provider, &snap_provider);
+    defer d.task_group.cancel(io);
+    d.state = .{ .pivot = header, .phase = .storage };
+    const accounts = try alloc.alloc(@typeInfo(@FieldType(snap.AccountRange, "accounts")).pointer.child, present_keys.len);
+    for (present_keys, present_accounts, accounts) |key, account, *encoded_account| {
+        var slim = std.array_list.Managed(u8).init(alloc);
+        try rlp.serialize(snap.SlimAccount, alloc, .{
+            .nonce = 0,
+            .balance = 10,
+            .root = if (std.meta.eql(account.storage_hash, types.empty_root_hash)) &.{} else &account.storage_hash,
+            .code_hash = &.{},
+        }, &slim);
+        encoded_account.* = .{ .hash = key, .account = .{ .value = slim.items } };
+    }
+    var response: snap.AccountRange = .{ .id = 1, .accounts = accounts, .proof = &.{} };
+    const authenticated = try d.verifyAccounts(alloc, .{ .root = header.state_root, .origin = @splat(0), .limit = @splat(0xff) }, &response);
+    try d.persistAccounts(authenticated.accounts, &response);
+    const query = try store.transaction_ro();
+    defer query.abort() catch unreachable;
+    try std.testing.expectEqual(null, try db.readAccount(query, keys[2]));
+
+    // Use the testing allocator for the request-owned buffers, so dropped
+    // requests must really free both allocations and surviving ones remain live.
+    d.allocator = a;
+    // Bounded limits in production belong to single-account requestSlots;
+    // multi-account non-max limits here additionally distinguish each edge.
+    const cases = [_]struct { indices: []const usize, survivors: []const usize, trim_start: bool, trim_limit: bool }{
+        .{ .indices = &.{ 0, 1, 2, 3, 4 }, .survivors = &.{ 1, 3 }, .trim_start = true, .trim_limit = true },
+        .{ .indices = &.{ 1, 2, 3 }, .survivors = &.{ 1, 3 }, .trim_start = false, .trim_limit = false },
+        .{ .indices = &.{ 0, 2, 4 }, .survivors = &.{}, .trim_start = true, .trim_limit = true },
+        .{ .indices = &.{ 0, 1, 3 }, .survivors = &.{ 1, 3 }, .trim_start = true, .trim_limit = false },
+        .{ .indices = &.{ 1, 3, 4 }, .survivors = &.{ 1, 3 }, .trim_start = false, .trim_limit = true },
+    };
+    for (cases) |case| {
+        const request_accounts = try a.alloc([32]u8, batch_storage_code_req_size);
+        const request_roots = try a.alloc([32]u8, batch_storage_code_req_size);
+        var caller_owns_buffers = true;
+        defer if (caller_owns_buffers) {
+            a.free(request_accounts);
+            a.free(request_roots);
+        };
+        for (case.indices, 0..) |index, i| {
+            request_accounts[i] = keys[index];
+            request_roots[i] = @splat(0xaa); // the previously authenticated old root
+        }
+        const free_before = d.free_snap_requests.inner.len();
+        const progress_before = d.progress.storage_keyspace;
+        d.stashed_snap_requests.len = 1;
+        d.stashed_snap_requests[0] = .{
+            .id = 10,
+            .peer = invalid_peer,
+            .sent_at = .now(io, .real),
+            .deadline = .now(io, .real),
+            .keyspace = .{ 100, 200 },
+            .storage_roots = request_roots[0..case.indices.len],
+            .msg = .{ .get_storage_ranges = .{
+                .root_hash = @splat(0xbb),
+                .account_hashes = request_accounts[0..case.indices.len],
+                .starting_hash = @splat(0x66),
+                .limit_hash = @splat(0x99),
+            } },
+        };
+        try d.popSnapRequests();
+        try std.testing.expectEqual(0, d.stashed_snap_requests.len);
+        if (case.survivors.len == 0) {
+            caller_owns_buffers = false; // popSnapRequests completed and freed it
+            try std.testing.expect(d.pending_snap_requests.empty());
+            try std.testing.expectEqual(free_before, d.free_snap_requests.inner.len());
+            try std.testing.expectEqual(progress_before + 100, d.progress.storage_keyspace);
+        } else {
+            const request = d.pending_snap_requests.pop().?;
+            defer d.free_snap_requests.push(request);
+            const storage_request = request.msg.get_storage_ranges;
+            try std.testing.expectEqual(case.survivors.len, storage_request.account_hashes.len);
+            try std.testing.expectEqual(case.survivors.len, request.storage_roots.len);
+            for (case.survivors, storage_request.account_hashes, request.storage_roots) |index, key, root| {
+                try std.testing.expectEqual(keys[index], key);
+                try std.testing.expectEqual(storage_root, root);
+            }
+            try std.testing.expectEqual(header.state_root, storage_request.root_hash);
+            try std.testing.expectEqual(@as([32]u8, @splat(if (case.trim_start) 0 else 0x66)), storage_request.starting_hash);
+            try std.testing.expectEqual(@as([32]u8, @splat(if (case.trim_limit) 0xff else 0x99)), storage_request.limit_hash);
+            try std.testing.expectEqual(progress_before, d.progress.storage_keyspace);
+            const unavailable: snap.StorageRanges = .{ .id = 10, .slots = &.{}, .proof = &.{} };
+            try std.testing.expectError(error.EmptyStorageRanges, d.verifyStorage(alloc, storage_request, request.storage_roots, &unavailable));
+        }
+    }
 }
 
 pub const SyncTarget = struct {
