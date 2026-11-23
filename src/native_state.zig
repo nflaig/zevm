@@ -78,7 +78,7 @@ const NodeCache = struct {
     stats: NodeCacheStats = .{ .enabled = true },
 
     fn init(a: A, options: NodeCacheOptions) !*NodeCache {
-        if (options.max_entries == 0 or options.max_entries > 16384 or options.max_bytes > 16 << 20)
+        if (options.max_entries == 0 or options.max_entries > 32768 or options.max_bytes > 16 << 20)
             return error.InvalidNativeNodeCacheLimit;
         const self = try a.create(NodeCache);
         errdefer a.destroy(self);

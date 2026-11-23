@@ -666,7 +666,7 @@ test "native cache entry and byte limits preserve uncached fallbacks" {
     var limited = try reader.acquire(parent(header));
     defer limited.deinit();
     try std.testing.expectError(error.InvalidNativeNodeCacheLimit, limited.enableNodeCache(a, .{ .max_entries = 0 }));
-    try std.testing.expectError(error.InvalidNativeNodeCacheLimit, limited.enableNodeCache(a, .{ .max_entries = 16385 }));
+    try std.testing.expectError(error.InvalidNativeNodeCacheLimit, limited.enableNodeCache(a, .{ .max_entries = 32769 }));
     try std.testing.expectError(error.InvalidNativeNodeCacheLimit, limited.enableNodeCache(a, .{ .max_bytes = (16 << 20) + 1 }));
     try limited.enableNodeCache(a, .{ .max_entries = 2, .max_bytes = 0 });
     var arena = std.heap.ArenaAllocator.init(a);
