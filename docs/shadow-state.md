@@ -126,8 +126,9 @@ Write/commit failures propagate out of the downloader; no tight retry is added.
 
 Restart resumes the state checkpoint rather than the header tip. A checkpoint
 whose header is unavailable or no longer matches is rejected. A directory from
-an interrupted initial sync has no checkpoint and is refused; restart that
-experiment with a new directory. After the first verified checkpoint, recent
+an interrupted initial sync without a persisted trusted CL anchor is refused;
+restart that experiment with a new directory. Anchored unverified startup
+recovery is described below. After the first verified checkpoint, recent
 selected headers live transactionally in MDBX, independently of the initial-sync
 header files. Each verified BAL update journals its account/storage preimages in
 the same transaction as state and checkpoint. A branch switch rewinds to a common
@@ -138,7 +139,7 @@ Undo is bounded to 32 records / 128 MiB, at most 32 MiB per record. Selected
 headers retain a 256-height window and install at most 128 headers ahead of the
 verified state at a time. Missing history, corrupt preimages or a reorg preceding
 the first verified checkpoint fail closed without committing a partial rewind.
-Automatic partial-sync recovery and deeper reorg reconstruction remain gaps. The
+Resuming partial tables and deeper reorg reconstruction remain gaps. The
 peer-driven downloader still does not implement CL forkchoice. Retaining views
 from different branches is not full multi-branch sync.
 
@@ -208,15 +209,23 @@ arrival latency or a proposer deadline measurement.
 An interrupted bootstrap with a persisted trusted consensus anchor restarts
 automatically in the same directory when `--shadow-beacon-url` is supplied.
 It clears only unverified account/storage/code/trie tables, in one transaction,
-and repeats the full scan of the persisted authorized anchor. If interrupted
+then waits for a fresh authenticated finalized anchor from the configured CL
+before sending any state requests. A stale persisted anchor can be replaced
+only at this startup boundary: there must be no verified checkpoint, all five
+state/code/trie tables must be empty, and the exact new post-Gloas header must
+match the fresh finalized CL anchor. Its branch base and anchor metadata commit
+together. This permits recovery after a shutdown or clear longer than the
+128-block rolling window without claiming ancestry for discarded partial state.
+If interrupted
 between selecting a new finalized tip and completing its heal, the saved tip,
 anchor and authorization marker must agree; reset rebases to that tip atomically.
 Ordered append ingestion
 cannot safely resume into partially populated tables. No state view is published
 until full root hashing and code download finish. A verified checkpoint is never
-cleared; missing/mismatched anchor metadata still fails closed. The database tests
-cover reset commit/abort, wrong anchors, progressed branches and preserving a
-verified checkpoint (77 shadow tests and 81 general tests in Debug and safe).
+cleared; missing/mismatched anchor metadata still fails closed. Tests cover
+clear/reanchor commit and abort, every nonempty state table, conflicting or older
+anchors, progressed branches, and preserving a verified checkpoint and its
+linked-refresh checks.
 
 A separate live Plataberget process was killed with SIGKILL after account/storage
 download and during initial code/hash work. On restart in the **same** directory,
@@ -229,11 +238,12 @@ were during process startup; no partial state was published. Evidence lives in
 qualification workspace. This tests one interruption point, not power loss or
 exhausted history recovery.
 
-Current limits: finalized progress must remain within the 128-block extension
+During a populated bootstrap, finalized progress must remain within the 128-block extension
 bound and peers must serve each old root while its write queue drains. A larger
 gap fails with `BootstrapAnchorGapTooLarge` and requires a fresh bootstrap;
-there is no automatic state reset loop or unbounded history walk. After a long
-interruption, the persisted anchor may already be unservable. The account/storage
+there is no automatic state reset loop or unbounded history walk. A restart
+clears unverified partial state and admits a fresh finalized anchor as above;
+it does not resume the old partial scan. The account/storage
 phase can advance finalized roots; code download and final hashing do not.
 Recovery after the first verified checkpoint is bounded by retained
 undo history; only eight recent views are retained and one writer processes

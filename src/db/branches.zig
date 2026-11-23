@@ -144,6 +144,25 @@ pub fn rebaseUnverified(store: *kv.Store, txn: kv.Transaction, a: std.mem.Alloca
     return selected.head;
 }
 
+/// Startup-only replacement after the partial-state clear committed. The caller
+/// authenticates `fresh` against its current finalized CL anchor and persists
+/// that anchor in this same transaction. This does not authorize state reads or
+/// skip ancestry for a verified checkpoint or a populated rolling bootstrap.
+pub fn reanchorClearedUnverified(store: *kv.Store, txn: kv.Transaction, a: std.mem.Allocator, expected: [32]u8, fresh: types.BlockHeader) !void {
+    if (try @import("snapshot.zig").readCheckpoint(store, txn, a) != null) return error.StateAlreadyVerified;
+    const selected = try state(store, txn) orelse return error.IncompleteStateCheckpoint;
+    if (!std.meta.eql(selected.base.hash(), expected) or !std.meta.eql(selected.head.hash(), expected))
+        return error.BootstrapBranchMismatch;
+    if (fresh.slot_number == null or fresh.block_access_list_hash == null) return error.PostGloasRequired;
+    if (fresh.number < selected.head.number or (fresh.number == selected.head.number and !std.meta.eql(fresh.hash(), expected)))
+        return error.BootstrapBranchMismatch;
+    inline for (.{ .accounts, .storage, .codes, .account_trie, .storage_tries }) |table|
+        if ((try store.table(txn, table).stat()).entries != 0) return error.BootstrapStateNotCleared;
+    try store.table(txn, .branch_numbers).drop(false);
+    try writeHeader(store, txn, a, fresh);
+    try writeState(store, txn, a, .{ .base = fresh, .head = fresh });
+}
+
 /// Caller also rewinds state if needed, in this same RW transaction. Validate the
 /// entire extension before changing its selected-number mapping or head marker.
 pub fn select(store: *kv.Store, txn: kv.Transaction, a: std.mem.Allocator, ancestor: types.BlockHeader, headers: []const types.BlockHeader) !void {

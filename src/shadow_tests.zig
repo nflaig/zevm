@@ -16,6 +16,8 @@ const undo = @import("db/undo.zig");
 const branches = @import("db/branches.zig");
 const keccak256 = @import("evm/crypto/hash.zig").keccak256;
 const bootstrap = @import("db/bootstrap.zig");
+const consensus = @import("node/consensus.zig");
+const rlp = @import("rlp");
 
 test {
     _ = @import("node/consensus.zig");
@@ -95,6 +97,148 @@ test "shadow bootstrap reset rejects a progressed branch without a checkpoint" {
     defer txn.abort() catch unreachable;
     try branches.select(&fixture.store, txn, arena.allocator(), header, &.{child});
     try std.testing.expectError(error.BootstrapBranchMismatch, bootstrap.restart(&fixture.store, txn, a, child.hash()));
+}
+
+test "cleared startup reanchor and finalized metadata commit or abort together" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const old_header = try prepareIncompleteBootstrap(&fixture);
+    var fresh = old_header;
+    fresh.number += branches.extension_limit + 50;
+    fresh.slot_number = 500;
+    fresh.parent_hash = @splat(0x99);
+    const old_anchor: consensus.Anchor = .{ .beacon_root = @splat(1), .execution_hash = old_header.hash(), .slot = old_header.slot_number.? };
+    const fresh_anchor: consensus.Anchor = .{ .beacon_root = @splat(2), .execution_hash = fresh.hash(), .slot = fresh.slot_number.? };
+    var old_bytes = std.array_list.Managed(u8).init(alloc);
+    var fresh_bytes = std.array_list.Managed(u8).init(alloc);
+    try rlp.serialize(consensus.Anchor, alloc, old_anchor, &old_bytes);
+    try rlp.serialize(consensus.Anchor, alloc, fresh_anchor, &fresh_bytes);
+    {
+        var owned: kv.OwnedTransaction = .{ .txn = try fixture.store.transaction_rw() };
+        defer owned.deinit();
+        try fixture.store.table(owned.txn, .state_meta).set("consensus-anchor-v1", old_bytes.items, .Upsert);
+        try owned.commit();
+    }
+    const key = types.keccakOfU160(std.mem.readInt(u160, &queries[0].address.bytes, .big));
+    const old_view = try fixture.store.transaction_ro();
+    defer old_view.abort() catch unreachable;
+    // Aborting the entire clear/admission preserves both partial state and anchor.
+    {
+        var owned: kv.OwnedTransaction = .{ .txn = try fixture.store.transaction_rw() };
+        defer owned.deinit();
+        _ = try bootstrap.restart(&fixture.store, owned.txn, alloc, old_header.hash());
+        try branches.reanchorClearedUnverified(&fixture.store, owned.txn, alloc, old_header.hash(), fresh);
+        try fixture.store.table(owned.txn, .state_meta).set("consensus-anchor-v1", fresh_bytes.items, .Upsert);
+    }
+    {
+        var owned: kv.OwnedTransaction = .{ .txn = try fixture.store.transaction_rw() };
+        defer owned.deinit();
+        try std.testing.expect((try fixture.store.table(owned.txn, .accounts).get(&key)) != null);
+        try std.testing.expectEqual(old_header.hash(), (try branches.state(&fixture.store, owned.txn)).?.head.hash());
+        try std.testing.expectEqualSlices(u8, old_bytes.items, (try fixture.store.table(owned.txn, .state_meta).get("consensus-anchor-v1")).?);
+        _ = try bootstrap.restart(&fixture.store, owned.txn, alloc, old_header.hash());
+        try owned.commit();
+    }
+    // Once the clear commits, interruption during fresh admission leaves the
+    // cleared old base and its matching anchor, never a half-updated pair.
+    {
+        var owned: kv.OwnedTransaction = .{ .txn = try fixture.store.transaction_rw() };
+        defer owned.deinit();
+        try branches.reanchorClearedUnverified(&fixture.store, owned.txn, alloc, old_header.hash(), fresh);
+        try fixture.store.table(owned.txn, .state_meta).set("consensus-anchor-v1", fresh_bytes.items, .Upsert);
+    }
+    {
+        var owned: kv.OwnedTransaction = .{ .txn = try fixture.store.transaction_rw() };
+        defer owned.deinit();
+        try std.testing.expectEqual(null, try fixture.store.table(owned.txn, .accounts).get(&key));
+        try std.testing.expectEqual(old_header.hash(), (try branches.state(&fixture.store, owned.txn)).?.head.hash());
+        try std.testing.expectEqualSlices(u8, old_bytes.items, (try fixture.store.table(owned.txn, .state_meta).get("consensus-anchor-v1")).?);
+        try branches.reanchorClearedUnverified(&fixture.store, owned.txn, alloc, old_header.hash(), fresh);
+        try fixture.store.table(owned.txn, .state_meta).set("consensus-anchor-v1", fresh_bytes.items, .Upsert);
+        try owned.commit();
+    }
+    const latest = try fixture.store.transaction_ro();
+    defer latest.abort() catch unreachable;
+    try std.testing.expectEqual(fresh.hash(), (try branches.state(&fixture.store, latest)).?.base.hash());
+    try std.testing.expectEqualSlices(u8, fresh_bytes.items, (try fixture.store.table(latest, .state_meta).get("consensus-anchor-v1")).?);
+    try std.testing.expectEqual(null, try snapshots.readCheckpoint(&fixture.store, latest, alloc));
+    try std.testing.expect((try fixture.store.table(old_view, .accounts).get(&key)) != null);
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &fixture.store };
+    defer views.deinit();
+    try std.testing.expectError(error.StateNotReady, views.publish(alloc));
+    try std.testing.expectError(error.StateViewUnavailable, views.acquire(fresh.hash(), fresh.state_root));
+}
+
+test "startup reanchor rejects every populated table and stale or conflicting branch metadata" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const old_header = try prepareIncompleteBootstrap(&fixture);
+    var fresh = old_header;
+    fresh.number += branches.extension_limit + 50;
+    fresh.slot_number = 500;
+    fresh.parent_hash = @splat(0x99);
+    var owned: kv.OwnedTransaction = .{ .txn = try fixture.store.transaction_rw() };
+    defer owned.deinit();
+    try std.testing.expectError(error.BootstrapStateNotCleared, branches.reanchorClearedUnverified(&fixture.store, owned.txn, alloc, old_header.hash(), fresh));
+    _ = try bootstrap.restart(&fixture.store, owned.txn, alloc, old_header.hash());
+    inline for (.{ .accounts, .storage, .codes, .account_trie, .storage_tries }) |table| {
+        try fixture.store.table(owned.txn, table).set(&(@as([32]u8, @splat(0x11))), &.{1}, .Upsert);
+        try std.testing.expectError(error.BootstrapStateNotCleared, branches.reanchorClearedUnverified(&fixture.store, owned.txn, alloc, old_header.hash(), fresh));
+        try fixture.store.table(owned.txn, table).drop(false);
+        try std.testing.expectEqual(old_header.hash(), (try branches.state(&fixture.store, owned.txn)).?.base.hash());
+    }
+    try std.testing.expectError(error.BootstrapBranchMismatch, branches.reanchorClearedUnverified(&fixture.store, owned.txn, alloc, @splat(0x77), fresh));
+    var invalid = fresh;
+    invalid.slot_number = null;
+    try std.testing.expectError(error.PostGloasRequired, branches.reanchorClearedUnverified(&fixture.store, owned.txn, alloc, old_header.hash(), invalid));
+    invalid = fresh;
+    invalid.block_access_list_hash = null;
+    try std.testing.expectError(error.PostGloasRequired, branches.reanchorClearedUnverified(&fixture.store, owned.txn, alloc, old_header.hash(), invalid));
+    invalid = fresh;
+    invalid.number = old_header.number - 1;
+    try std.testing.expectError(error.BootstrapBranchMismatch, branches.reanchorClearedUnverified(&fixture.store, owned.txn, alloc, old_header.hash(), invalid));
+    invalid.number = old_header.number;
+    try std.testing.expectError(error.BootstrapBranchMismatch, branches.reanchorClearedUnverified(&fixture.store, owned.txn, alloc, old_header.hash(), invalid));
+    // Reauthentication at the same exact anchor is safe after a short restart.
+    try branches.reanchorClearedUnverified(&fixture.store, owned.txn, alloc, old_header.hash(), old_header);
+    try std.testing.expectEqual(null, try snapshots.readCheckpoint(&fixture.store, owned.txn, alloc));
+}
+
+test "startup reanchor cannot replace verified state or bypass linked verified refresh" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const verified = try prepareIncompleteBootstrap(&fixture);
+    {
+        var owned: kv.OwnedTransaction = .{ .txn = try fixture.store.transaction_rw() };
+        defer owned.deinit();
+        try snapshots.writeCheckpoint(&fixture.store, owned.txn, alloc, verified);
+        try owned.commit();
+    }
+    var views: snapshots.Snapshots = .{ .io = std.testing.io, .store = &fixture.store };
+    defer views.deinit();
+    try views.publish(alloc);
+    const lease = try views.acquire(verified.hash(), verified.state_root);
+    defer lease.deinit();
+    var unlinked = verified;
+    unlinked.number += 1;
+    unlinked.slot_number = verified.slot_number.? + 1;
+    unlinked.parent_hash = @splat(0x99);
+    var owned: kv.OwnedTransaction = .{ .txn = try fixture.store.transaction_rw() };
+    defer owned.deinit();
+    try std.testing.expectError(error.StateAlreadyVerified, branches.reanchorClearedUnverified(&fixture.store, owned.txn, alloc, verified.hash(), unlinked));
+    try std.testing.expectError(error.BranchParentMismatch, branches.select(&fixture.store, owned.txn, alloc, verified, &.{unlinked}));
+    try std.testing.expectEqual(verified.hash(), (try snapshots.readCheckpoint(&fixture.store, owned.txn, alloc)).?.hash());
+    try std.testing.expectEqual(verified.hash(), (try branches.state(&fixture.store, owned.txn)).?.head.hash());
+    try std.testing.expectEqual(verified.hash(), lease.header.hash());
 }
 
 test "finalized bootstrap advance is bounded linked atomic and restart uses only authorized tip" {

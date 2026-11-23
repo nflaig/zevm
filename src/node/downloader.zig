@@ -677,7 +677,8 @@ pub const Downloader = struct {
 
     /// Shadow mode resumes the committed state checkpoint, never the header
     /// head. Only a persisted finalized consensus anchor authorizes restarting an
-    /// incomplete bootstrap. Partial flat tables never become readable views.
+    /// incomplete bootstrap's clear. Its new scan waits for a fresh trusted CL
+    /// anchor; partial flat tables never become readable views.
     pub fn enableShadow(self: *Self, snapshots: *@import("../db/snapshot.zig").Snapshots, restart_bootstrap: bool) !void {
         var owned: kv.OwnedTransaction = .{ .txn = try self.eth_db.kv_store.transaction_rw() };
         defer owned.deinit();
@@ -706,7 +707,7 @@ pub const Downloader = struct {
             if (header.slot_number.? > anchor.slot) return error.BootstrapBranchMismatch;
             try owned.commit();
             self.pending_bootstrap = header;
-            log.info("shadow restarting incomplete bootstrap at authorized anchor {} hash {x}; no state view published", .{ header.number, header.hash() });
+            log.info("shadow cleared incomplete bootstrap at authorized anchor {} hash {x}; awaiting fresh finalized anchor, no state view published", .{ header.number, header.hash() });
         } else if ((try self.bc.head()).number != 0) return error.IncompleteStateCheckpoint;
         self.shadow_snapshots = snapshots;
     }
@@ -733,10 +734,9 @@ pub const Downloader = struct {
             self.consensus_anchor = anchor;
         } else if (snapshots.status().count != 0) return error.UnanchoredStateCheckpoint;
         self.consensus_updates = updates;
-        if (self.pending_bootstrap) |header| {
-            try self.startBootstrap(header);
-            self.pending_bootstrap = null;
-        }
+        // A long shutdown or clear can outlast the rolling bootstrap window.
+        // Keep the completed clear fenced from all state requests until a new
+        // finalized CL update authenticates the exact bootstrap header.
     }
 
     fn startBootstrap(self: *Self, header: types.BlockHeader) !void {
@@ -752,6 +752,10 @@ pub const Downloader = struct {
     fn desiredConsensusHash(self: *Self) ?[32]u8 {
         const update = self.consensus_update orelse return null;
         if (self.consensus_anchor == null) return update.anchor.execution_hash;
+        if (self.pending_bootstrap != null) {
+            if (update.anchor.slot < self.consensus_anchor.?.slot) return null;
+            return update.anchor.execution_hash;
+        }
         if (self.shadow_snapshots.?.status().count == 0) {
             // Freeze an admitted transition until its old-root work drains and
             // every intervening authenticated BAL has been applied. Live FULL
@@ -785,7 +789,7 @@ pub const Downloader = struct {
         const desired = self.desiredConsensusHash() orelse return;
         // A builder can ask for EMPTY while the writer has warmed FULL. The
         // immutable parent view already serves that request: do not rewind it.
-        const already_selected = self.consensus_anchor != null and
+        const already_selected = self.pending_bootstrap == null and self.consensus_anchor != null and
             (std.meta.eql(self.syncTarget().hash, desired) or self.shadow_snapshots.?.status().find(desired) != null);
         if (self.consensus_probe) |pending| {
             if (!already_selected and std.meta.eql(pending, desired)) return;
@@ -820,8 +824,18 @@ pub const Downloader = struct {
         self.consensus_probe = null;
         if (self.consensus_anchor != null and self.shadow_snapshots.?.status().find(expected) != null) return;
 
-        if (self.consensus_anchor == null) {
+        if (self.consensus_anchor == null or self.pending_bootstrap != null) {
             const anchor = self.consensus_update.?.anchor;
+            if (!std.meta.eql(anchor.execution_hash, expected) or header.slot_number.? > anchor.slot)
+                return error.BootstrapBranchMismatch;
+            if (self.consensus_anchor) |previous| {
+                if (anchor.slot < previous.slot or (anchor.slot == previous.slot and !std.meta.eql(anchor, previous)))
+                    return error.ConflictingConsensusAnchor;
+            }
+            if (self.pending_bootstrap != null and (self.state != null or self.header != null or self.state_heal != null or
+                !self.pending_snap_requests.empty() or !self.inflight_snap_requests.empty() or !self.validating_snap_requests.empty() or
+                self.stashed_snap_requests.len != 0 or !self.snap_flush_queue.empty()))
+                return error.BootstrapRestartBusy;
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
             const allocator = arena.allocator();
@@ -831,10 +845,16 @@ pub const Downloader = struct {
             const txn = owned.txn;
             var encoded = std.array_list.Managed(u8).init(allocator);
             try rlp.serialize(consensus.Anchor, allocator, anchor, &encoded);
-            try store.table(txn, .state_meta).set("consensus-anchor-v1", encoded.items, .Create);
-            try branches.initialize(store, txn, allocator, header);
+            if (self.pending_bootstrap) |cleared| {
+                try branches.reanchorClearedUnverified(store, txn, allocator, cleared.hash(), header);
+                try store.table(txn, .state_meta).set("consensus-anchor-v1", encoded.items, .Upsert);
+            } else {
+                try store.table(txn, .state_meta).set("consensus-anchor-v1", encoded.items, .Create);
+                try branches.initialize(store, txn, allocator, header);
+            }
             try owned.commit();
             self.consensus_anchor = anchor;
+            self.pending_bootstrap = null;
             try self.startBootstrap(header);
             log.info("shadow anchored bootstrap: beacon slot {}, execution {} hash {x}", .{ anchor.slot, header.number, expected });
         } else {
@@ -2673,6 +2693,7 @@ test "retained EMPTY parent cancels obsolete probes without rewinding warmed FUL
     var downloader: Downloader = undefined;
     downloader.io = io;
     downloader.shadow_snapshots = &snapshots;
+    downloader.pending_bootstrap = null;
     downloader.consensus_anchor = .{ .beacon_root = @splat(8), .execution_hash = parent.hash(), .slot = 100 };
     downloader.consensus_update = .{ .anchor = downloader.consensus_anchor.?, .head = .{ .hash = parent.hash(), .slot = 101 }, .observed_at_ms = 0 };
     downloader.consensus_probe = @splat(9);
@@ -2993,6 +3014,112 @@ test "shadow cancellation preserves in-validation ownership and BAL requests" {
     try std.testing.expectEqual(inflight, downloader.free_eth_requests.pop().?);
     try std.testing.expectEqual(pending, downloader.free_eth_requests.pop().?);
     try std.testing.expect(downloader.free_eth_requests.empty());
+}
+
+test "cleared unverified startup awaits a fresh finalized anchor beyond the rolling window" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.createDir(io, "db", .default_dir);
+    var path: [1024]u8 = undefined;
+    const length = try dir.dir.realPathFile(io, "db", &path);
+    var store = try kv.Store.initBounded(a, path[0..length], 64 << 20, 1 << 20);
+    defer store.deinit() catch unreachable;
+    var files = try @import("../db/file.zig").Storage.init(io, a, path[0..length]);
+    defer files.deinit(io, a) catch unreachable;
+    var db = EthDb.init(&store);
+    var bc: Blockchain = .{ .cfg = @import("blockchain.zig").glamsterdam_devnet8_config, .io = io, .allocator = alloc, .eth_db = &db, .file_storage = &files, .shadow_branches = .init(true) };
+    var previous = bc.cfg.genesis_header;
+    previous.number = 10;
+    previous.slot_number = 20;
+    previous.block_access_list_hash = @splat(1);
+    const old_anchor: consensus.Anchor = .{ .beacon_root = @splat(1), .execution_hash = previous.hash(), .slot = 20 };
+    {
+        var owned: kv.OwnedTransaction = .{ .txn = try store.transaction_rw() };
+        defer owned.deinit();
+        try db.writeAccount(alloc, owned.txn, types.keccakOfU160(1), types.EmptyAccount);
+        try branches.initialize(&store, owned.txn, alloc, previous);
+        var encoded = std.array_list.Managed(u8).init(alloc);
+        try rlp.serialize(consensus.Anchor, alloc, old_anchor, &encoded);
+        try store.table(owned.txn, .state_meta).set("consensus-anchor-v1", encoded.items, .Upsert);
+        try owned.commit();
+    }
+    var views: snapshots_db.Snapshots = .{ .io = io, .store = &store };
+    defer views.deinit();
+    var eth_provider = try eth.Provider.init(alloc);
+    var snap_provider = try snap.Provider.init(alloc);
+    var d = try Downloader.init(io, alloc, &bc, &db, &eth_provider, &snap_provider);
+    defer d.task_group.cancel(io);
+    defer if (d.state) |*state| state.code_hashes.deinit(std.heap.page_allocator);
+    try d.enableShadow(&views, true);
+    var queue_buffer: [4]consensus.Update = undefined;
+    var queue: std.Io.Queue(consensus.Update) = .init(&queue_buffer);
+    try d.enableConsensus(&queue);
+    // No old-root request may race the freshly cleared startup admission.
+    try std.testing.expectEqual(null, d.state);
+    try std.testing.expect(d.pending_bootstrap != null);
+    try std.testing.expect(d.pending_snap_requests.empty());
+    try std.testing.expectEqual(0, views.status().count);
+
+    var regressed = old_anchor;
+    regressed.slot -= 1;
+    d.consensus_update = .{ .anchor = regressed, .head = .{ .hash = @splat(0xee), .slot = 600 }, .observed_at_ms = 0 };
+    try std.testing.expectEqual(null, d.desiredConsensusHash());
+    var conflicting = old_anchor;
+    conflicting.beacon_root = @splat(0x33);
+    d.consensus_update = .{ .anchor = conflicting, .head = .{ .hash = @splat(0xee), .slot = 600 }, .observed_at_ms = 0 };
+    // Even an unchanged execution hash must be freshly admitted; a same-slot
+    // beacon conflict cannot be hidden by the already-selected fast path.
+    try d.advanceConsensusTarget();
+    const conflict_lookup = d.pending_eth_requests.pop().?;
+    var old_headers = [_]types.BlockHeader{previous};
+    var old_hashes = [_][32]u8{previous.hash()};
+    try std.testing.expectError(error.ConflictingConsensusAnchor, d.handleConsensusHeader(conflict_lookup, .{ .headers = .{ .headers = &old_headers, .hashes = &old_hashes } }));
+    try std.testing.expectEqual(null, d.state);
+    try std.testing.expectEqual(old_anchor, d.consensus_anchor.?);
+    try std.testing.expect(d.pending_bootstrap != null);
+    try std.testing.expect(d.pending_snap_requests.empty());
+
+    var fresh = previous;
+    fresh.number += branches.extension_limit + 50;
+    fresh.slot_number = 500;
+    fresh.parent_hash = @splat(0x99); // No claim of retained ancestry to old partial state.
+    fresh.state_root = types.empty_root_hash;
+    const new_anchor: consensus.Anchor = .{ .beacon_root = @splat(2), .execution_hash = fresh.hash(), .slot = 501 };
+    d.consensus_update = .{ .anchor = new_anchor, .head = .{ .hash = @splat(0xee), .slot = 600 }, .observed_at_ms = 0 };
+    try std.testing.expectEqual(fresh.hash(), d.desiredConsensusHash().?);
+    try d.advanceConsensusTarget();
+    const lookup = d.pending_eth_requests.pop().?;
+    var headers = [_]types.BlockHeader{fresh};
+    var hashes = [_][32]u8{fresh.hash()};
+    try d.handleConsensusHeader(lookup, .{ .headers = .{ .headers = &headers, .hashes = &hashes } });
+    try std.testing.expectEqual(null, d.pending_bootstrap);
+    try std.testing.expectEqual(fresh.hash(), d.state.?.pivot.hash());
+    try std.testing.expectEqual(new_anchor, d.consensus_anchor.?);
+    try std.testing.expectEqual(0, views.status().count);
+    const range = d.pending_snap_requests.pop().?;
+    try std.testing.expectEqual(fresh.state_root, range.msg.get_account_range.root);
+    d.free_snap_requests.push(range);
+    {
+        const txn = try store.transaction_ro();
+        defer txn.abort() catch unreachable;
+        try std.testing.expectEqual(null, try snapshots_db.readCheckpoint(&store, txn, alloc));
+        try std.testing.expectEqual(fresh.hash(), (try branches.state(&store, txn)).?.base.hash());
+        try std.testing.expectEqual(new_anchor, (try d.readConsensusAnchor(txn, alloc)).?);
+        try std.testing.expectEqual(null, try db.readAccount(txn, types.keccakOfU160(1)));
+    }
+    try std.testing.expectError(error.StateViewUnavailable, views.acquire(fresh.hash(), fresh.state_root));
+    try std.testing.expectError(error.RootMismatch, d.hashTrie(null, @splat(0x77)));
+    try std.testing.expectEqual(0, views.status().count);
+    try d.hashTrie(null, fresh.state_root);
+    try d.publishHashedState(fresh);
+    const lease = try views.acquire(fresh.hash(), fresh.state_root);
+    defer lease.deinit();
+    try std.testing.expectEqual(fresh.hash(), lease.header.hash());
 }
 
 test "incomplete bootstrap advances only a finalized linked root and publishes after full hashing" {
