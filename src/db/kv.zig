@@ -8,8 +8,8 @@ pub const Transaction = lmdbx.Transaction;
 pub const Cursor = lmdbx.Cursor;
 
 /// Owns one MDBX handle. Do not copy; borrow `txn` only before commit/deinit.
-/// Commit consumes a valid handle on success AND failure, except the documented
-/// wrong-thread rejection. A later fallible operation must never abort it again.
+/// Commit consumes a valid handle on success AND failure. A wrong-thread handle
+/// is an unrecoverable ownership violation, not an ordinary transaction error.
 pub const OwnedTransaction = struct {
     txn: Transaction,
     live: bool = true,
@@ -17,7 +17,7 @@ pub const OwnedTransaction = struct {
     pub fn deinit(self: *OwnedTransaction) void {
         if (self.live) {
             self.live = false;
-            self.txn.abort() catch unreachable;
+            self.txn.abort() catch |err| std.debug.panic("MDBX owned transaction abort failed: {t}", .{err});
         }
     }
 
@@ -29,7 +29,8 @@ pub const OwnedTransaction = struct {
         // The wrapper's generic throw accepts RESULT_TRUE, but for commit this
         // means a previously broken transaction was aborted. Never publish it.
         if (rc == lmdbx.c.MDBX_RESULT_TRUE) return error.DatabaseTransactionAborted;
-        if (rc == lmdbx.c.MDBX_THREAD_MISMATCH) self.live = true;
+        if (rc == lmdbx.c.MDBX_THREAD_MISMATCH)
+            std.debug.panic("MDBX owned transaction commit on a non-owning thread", .{});
         inline for (@typeInfo(lmdbx.Error).error_set.error_names.?) |name| {
             if (@hasDecl(lmdbx.c, name)) {
                 if (rc == @field(lmdbx.c, name)) return @field(lmdbx.Error, name);
