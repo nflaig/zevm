@@ -151,9 +151,10 @@ fn targetNode(graph: ForkChoice, hint: ?TargetHint) !Head {
         }
         return result orelse error.UnavailableExecutionHead;
     }
-    const selected = try selectedNode(graph);
     // Reconciliation must not undo warm FULL state just because the beacon still
     // selects EMPTY. Its execution parent remains available in a retained view.
+    // Validate the exact selected-root FULL independently: EMPTY may still carry
+    // an optimistic import-time status after FULL has been execution-verified.
     if (std.mem.eql(u8, graph.data.extra_data.head.payload_status, "empty")) {
         var full: ?Head = null;
         for (graph.data.fork_choice_nodes) |node| {
@@ -165,7 +166,7 @@ fn targetNode(graph: ForkChoice, hint: ?TargetHint) !Head {
         }
         if (full) |head| return head;
     }
-    return selected;
+    return selectedNode(graph);
 }
 
 pub const EventKind = enum { head, execution_payload, payload_attributes };
@@ -887,4 +888,48 @@ test "unverified preferred head never turns a valid branch hint into a sync fall
     defer a.free(unbound);
     try std.testing.expectError(error.UnavailableExecutionHead, tracker.publishForkChoice(a, .payload_attributes, unbound, graph, 101, 11));
     try std.testing.expectEqual(@as(usize, 1), sink.count);
+}
+
+test "verified FULL on selected root warms despite optimistic EMPTY without accepting other roots" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const graph = try testForkChoice(a, "empty");
+    defer a.free(graph);
+    const payload = "{\"slot\":\"124\",\"block_root\":\"" ++ test_root ++ "\",\"block_hash\":\"" ++ test_payload ++ "\",\"execution_optimistic\":false}";
+    const full_attrs = try std.mem.replaceOwned(u8, a, test_attributes, test_parent, test_payload);
+    defer a.free(full_attrs);
+    inline for (.{ "valid", "optimistic", "invalid" }) |validity| {
+        const optimistic_empty = try std.mem.replaceOwned(u8, a, graph, "\"payload_status\":\"empty\",\"validity\":\"valid\",\"execution_block_hash\":\"" ++ test_parent ++ "\",\"extra_data\":{\"execution_optimistic\":false}", "\"payload_status\":\"empty\",\"validity\":\"" ++ validity ++ "\",\"execution_block_hash\":\"" ++ test_parent ++ "\",\"extra_data\":{\"execution_optimistic\":true}");
+        defer a.free(optimistic_empty);
+        try std.testing.expectError(error.UnverifiedConsensusHead, selectedHead(a, optimistic_empty));
+        var buffer: [1]Update = undefined;
+        var queue: std.Io.Queue(Update) = .init(&buffer);
+        var tracker = try Tracker.init(io, a, "http://localhost:9596", &queue);
+        defer tracker.deinit();
+        tracker.anchor = test_anchor;
+        var sink: AttributesTestSink = .{};
+        tracker.attributes_sink = sink.sink();
+        try tracker.publishForkChoice(a, .execution_payload, payload, optimistic_empty, 100, 10);
+        queue.close(io);
+        try tracker.publishForkChoice(a, .payload_attributes, full_attrs, optimistic_empty, 101, 11);
+        try std.testing.expectEqual(@as(usize, 1), sink.count);
+        try std.testing.expectEqual(@as([32]u8, @splat(0x33)), sink.copies[0].parent.hash);
+        try std.testing.expectEqual(@as([32]u8, @splat(0x33)), (try queue.getOne(io)).head.hash);
+        try std.testing.expectError(error.Closed, queue.getOne(io));
+
+        // No verified FULL on this selected root means the EMPTY itself must
+        // pass validation; neither an optimistic FULL nor another root helps.
+        const both_optimistic = try std.mem.replaceOwned(u8, a, optimistic_empty, "\"execution_block_hash\":\"" ++ test_payload ++ "\",\"extra_data\":{\"execution_optimistic\":false}", "\"execution_block_hash\":\"" ++ test_payload ++ "\",\"extra_data\":{\"execution_optimistic\":true}");
+        defer a.free(both_optimistic);
+        try std.testing.expectError(error.UnverifiedConsensusHead, targetHead(a, both_optimistic, null));
+        const other_root = try std.mem.replaceOwned(u8, a, optimistic_empty, "\"block_root\":\"" ++ test_root ++ "\",\"payload_status\":\"full\"", "\"block_root\":\"0x" ++ std.fmt.bytesToHex(@as([32]u8, @splat(0x99)), .lower) ++ "\",\"payload_status\":\"full\"");
+        defer a.free(other_root);
+        try std.testing.expectError(error.UnverifiedConsensusHead, targetHead(a, other_root, null));
+    }
+    const ambiguous = try std.mem.replaceOwned(u8, a, graph, "\"payload_status\":\"empty\",\"validity\":", "\"payload_status\":\"full\",\"validity\":");
+    defer a.free(ambiguous);
+    try std.testing.expectError(error.UnverifiedConsensusHead, targetHead(a, ambiguous, null));
+    const pending = try testForkChoice(a, "pending");
+    defer a.free(pending);
+    try std.testing.expectError(error.UnavailableExecutionHead, targetHead(a, pending, null));
 }
