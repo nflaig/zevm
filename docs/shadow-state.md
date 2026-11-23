@@ -325,3 +325,29 @@ log for a comparison. It matches slot/number/hash, handles midnight, reports
 incomplete/duplicate events and excludes ambiguous sibling heal-start attribution.
 Its three parser tests pass, and it reproduces every row and median of the saved
 68-block baseline exactly.
+
+## Tracker fixture correction, 23 November 2026
+
+The hosted shadow-state jobs at `655865a2` passed their Zig checks but failed the
+Python tracker fixture with `ObservationTimeout`. The fixture still expected
+an EMPTY-parent attribute event to replace the preferred FULL sync target,
+which the branch-priority change deliberately prevents. This was a stale test
+expectation, not an execution or state-verification failure.
+
+The loopback fixture now observes warm FULL, an intervening EMPTY attribute
+event, and a genuinely new preferred head. It requires the sync sequence
+`PARENT, FULL, NEXT`; the reconnect scenario requires `FULL, NEXT`. The existing
+separate Zig regression, `branch attributes cannot supersede the verified FULL
+sync target`, verifies that all three authorized attributes still reach the
+sink while only FULL reaches the sync queue. Fresh targeted runs passed all
+four loopback scenarios and that sink regression in both Debug and safe mode.
+The old fixture reproduced the timeout against the same Debug probe. No runtime
+source changed for this correction; hosted results must be checked separately.
+
+The merge audit also closed the earlier conditional review observation about
+`popSnapRequests` errors. Its database-read errors propagate through
+`advanceStateHeal`, the downloader handlers and `Downloader.run`; the embedded
+main returns that error and cancels/joins both owners. It does not retry the
+partly changed in-memory stash. A restarted incomplete bootstrap uses the
+existing clear/reanchor procedure. This is a source-path check, not a new
+fault-injection or crash-durability qualification.

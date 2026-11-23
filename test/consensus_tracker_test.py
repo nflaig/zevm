@@ -82,6 +82,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.event("execution_payload", payload)
                     time.sleep(.3)
                     self.event("payload_attributes", attrs)
+                    # An authorized EMPTY branch must not displace warm FULL
+                    # state. Keep observing until a genuinely new preferred
+                    # target proves the branch event was handled in between.
+                    time.sleep(.3)
+                    s.phase = "next"
+                    self.event()
                     time.sleep(2)
                 if s.mode == "events":
                     if connection == 1:
@@ -125,13 +131,14 @@ def trial(probe, mode, count, deadline):
             assert len(rows) == count
             assert all(row["executionAnchor"] == PARENT and row["beaconAnchor"] == ROOT for row in rows)
             if mode == "events":
-                assert [row["executionHead"] for row in rows] == [FULL, PARENT, NEXT], rows
+                assert [row["executionHead"] for row in rows] == [FULL, NEXT], rows
                 assert server.streams >= 2 and server.lookups >= 4
                 assert "UnverifiedConsensusHead" in run.stderr
             if mode == "warm":
-                assert [row["executionHead"] for row in rows] == [PARENT, FULL, PARENT], rows
+                assert [row["executionHead"] for row in rows] == [PARENT, FULL, NEXT], rows
                 assert elapsed < 3, elapsed
-                assert server.phase == "empty"  # no selected-FULL event was emitted
+                assert server.phase == "next"
+                assert server.lookups >= 4  # initial, warm FULL, EMPTY attrs, new preferred head
             if mode == "timeout":
                 assert server.headers >= 2 and elapsed >= 3 and "ConsensusTimeout" in run.stderr
         return {"scenario": mode, "passed": True, "seconds": elapsed,
@@ -147,7 +154,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--probe", required=True)
     args = parser.parse_args()
-    for mode, count, deadline in (("warm", 3, 5), ("events", 3, 10), ("timeout", 1, 9), ("unfinalized", 1, 3)):
+    for mode, count, deadline in (("warm", 3, 5), ("events", 2, 10), ("timeout", 1, 9), ("unfinalized", 1, 3)):
         print(json.dumps(trial(args.probe, mode, count, deadline)), flush=True)
 
 
