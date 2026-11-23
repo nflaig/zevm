@@ -134,7 +134,10 @@ fn selectedNode(graph: ForkChoice) !Head {
 pub fn targetHead(a: std.mem.Allocator, json: []const u8, hint: ?TargetHint) !Head {
     const parsed = try std.json.parseFromSlice(ForkChoice, a, json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    const graph = parsed.value;
+    return targetNode(parsed.value, hint);
+}
+
+fn targetNode(graph: ForkChoice, hint: ?TargetHint) !Head {
     if (hint) |wanted| {
         var result: ?Head = null;
         for (graph.data.fork_choice_nodes) |node| {
@@ -286,12 +289,31 @@ pub const Tracker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const hint = try eventHint(a, kind, data);
-        const head = try targetHead(a, try self.timedGet(a, "/eth/v2/debug/fork_choice"), hint);
-        try self.publishVerified(kind, data, hint, head, observed_at_ms, observed_mono_ms);
+        try self.publishForkChoice(a, kind, data, try self.timedGet(a, "/eth/v2/debug/fork_choice"), observed_at_ms, observed_mono_ms);
     }
 
-    fn publishVerified(self: *Tracker, kind: EventKind, data: []const u8, hint: ?TargetHint, head: Head, observed_at_ms: i64, observed_mono_ms: i64) !void {
+    fn publishForkChoice(self: *Tracker, a: std.mem.Allocator, kind: EventKind, data: []const u8, graph: []const u8, observed_at_ms: i64, observed_mono_ms: i64) !void {
+        const hint = try eventHint(a, kind, data);
+        const parsed = try std.json.parseFromSlice(ForkChoice, a, graph, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const branch = try targetNode(parsed.value, hint);
+        // Attribute/payload hints authorize one exact branch, not a change to
+        // the writer's preferred target. EMPTY/older-parent notifications must
+        // not cancel a pending FULL download and leave it waiting for the next
+        // five-second reconciliation. Select both from the same verified graph;
+        // FULL on the selected beacon root may still warm before its timeliness
+        // decision, and a real same-height reorg remains a new writer target.
+        const preferred = if (hint == null) branch else targetNode(parsed.value, null) catch |err| {
+            // A valid retained branch remains useful if the selected head is
+            // temporarily unavailable. Deliver only its authenticated attrs;
+            // never promote that hint as a fallback state-sync target.
+            try self.publishVerified(kind, data, hint, branch, null, observed_at_ms, observed_mono_ms);
+            return err;
+        };
+        try self.publishVerified(kind, data, hint, branch, preferred, observed_at_ms, observed_mono_ms);
+    }
+
+    fn publishVerified(self: *Tracker, kind: EventKind, data: []const u8, hint: ?TargetHint, head: Head, preferred: ?Head, observed_at_ms: i64, observed_mono_ms: i64) !void {
         // Attribute identity includes target slot, beacon parent and all fields.
         // Repeated EL parents can describe distinct legitimate build requests.
         // Deliver before the sync-target dedup and before any queue backpressure.
@@ -306,10 +328,11 @@ pub const Tracker = struct {
                 .received_mono_ms = observed_mono_ms,
             })) log.warn("native attribute mailbox full", .{});
         };
-        if (self.latest_hash) |previous| if (std.meta.eql(previous, head.hash) and
+        const sync_head = preferred orelse return;
+        if (self.latest_hash) |previous| if (std.meta.eql(previous, sync_head.hash) and
             self.published_anchor != null and std.meta.eql(self.published_anchor.?, self.anchor.?)) return;
-        try self.updates.putOne(self.io, .{ .anchor = self.anchor.?, .head = head, .observed_at_ms = observed_at_ms });
-        self.latest_hash = head.hash;
+        try self.updates.putOne(self.io, .{ .anchor = self.anchor.?, .head = sync_head, .observed_at_ms = observed_at_ms });
+        self.latest_hash = sync_head.hash;
         self.published_anchor = self.anchor;
     }
 
@@ -426,7 +449,7 @@ test "delayed finalized refresh cannot regress authority and anchor change bypas
     const newer: Anchor = .{ .slot = 132, .beacon_root = @splat(3), .execution_hash = @splat(4) };
     const head: Head = .{ .slot = 200, .hash = @splat(5) };
     try std.testing.expect(try tracker.acceptAnchor(old));
-    try tracker.publishVerified(.head, "", null, head, 1, 1);
+    try tracker.publishVerified(.head, "", null, head, head, 1, 1);
     try std.testing.expectEqual(old, (try queue.getOne(std.testing.io)).anchor);
     try std.testing.expect(try tracker.acceptAnchor(newer));
     // Model a slower refresh completing after the newer response. The same
@@ -437,9 +460,9 @@ test "delayed finalized refresh cannot regress authority and anchor change bypas
     conflicting.execution_hash = @splat(9);
     try std.testing.expectError(error.ConflictingConsensusAnchor, tracker.acceptAnchor(conflicting));
     try std.testing.expectEqual(newer, tracker.anchor.?);
-    try tracker.publishVerified(.head, "", null, head, 2, 2);
+    try tracker.publishVerified(.head, "", null, head, head, 2, 2);
     try std.testing.expectEqual(newer, (try queue.getOne(std.testing.io)).anchor);
-    try tracker.publishVerified(.head, "", null, head, 3, 3);
+    try tracker.publishVerified(.head, "", null, head, head, 3, 3);
     try std.testing.expectEqual(0, try queue.get(std.testing.io, &buffer, 0));
 }
 
@@ -640,15 +663,15 @@ test "consensus attributes repeat on the same parent before sync dedup with exac
     const head = try targetHead(a, graph, hint);
     const wall: i64 = 1795357860123;
     const mono: i64 = 490123;
-    try tracker.publishVerified(.payload_attributes, test_attributes, hint, head, wall, mono);
+    try tracker.publishVerified(.payload_attributes, test_attributes, hint, head, head, wall, mono);
 
     // Closing the now-full sync queue makes this a bounded regression: each
     // later attribute must still reach the sink but must not enqueue a target.
     queue.close(io);
     const next_slot = try std.mem.replaceOwned(u8, a, test_attributes, "125", "126");
     defer a.free(next_slot);
-    try tracker.publishVerified(.payload_attributes, next_slot, hint, head, wall + 12000, mono + 12000);
-    try tracker.publishVerified(.payload_attributes, next_slot, hint, head, wall + 12007, mono + 12007);
+    try tracker.publishVerified(.payload_attributes, next_slot, hint, head, head, wall + 12000, mono + 12000);
+    try tracker.publishVerified(.payload_attributes, next_slot, hint, head, head, wall + 12007, mono + 12007);
     try std.testing.expectEqual(@as(usize, 3), sink.count);
     for (sink.copies[0..sink.count], 0..) |copy, i| {
         const expected = if (i == 0) test_attributes else next_slot;
@@ -681,14 +704,14 @@ test "declined attribute delivery preserves sync updates and same-parent dedup" 
     defer a.free(graph);
     const empty_hint = try eventHint(a, .payload_attributes, test_attributes);
     const empty = try targetHead(a, graph, empty_hint);
-    try tracker.publishVerified(.payload_attributes, test_attributes, empty_hint, empty, 101, 51);
+    try tracker.publishVerified(.payload_attributes, test_attributes, empty_hint, empty, empty, 101, 51);
     const full_json = try std.mem.replaceOwned(u8, a, test_attributes, test_parent, test_payload);
     defer a.free(full_json);
     const full_hint = try eventHint(a, .payload_attributes, full_json);
     const full = try targetHead(a, graph, full_hint);
-    try tracker.publishVerified(.payload_attributes, full_json, full_hint, full, 102, 52);
+    try tracker.publishVerified(.payload_attributes, full_json, full_hint, full, full, 102, 52);
     queue.close(io);
-    try tracker.publishVerified(.payload_attributes, full_json, full_hint, full, 103, 53);
+    try tracker.publishVerified(.payload_attributes, full_json, full_hint, full, full, 103, 53);
 
     try std.testing.expectEqual(@as(usize, 3), sink.count);
     const first = try queue.getOne(io);
@@ -714,10 +737,10 @@ test "unbound or mismatched verified attributes never reach the sink or change s
     tracker.attributes_sink = sink.sink();
     const head: Head = .{ .hash = @splat(0x22), .slot = 124 };
     tracker.latest_hash = head.hash;
-    try std.testing.expectError(error.UnverifiedConsensusHead, tracker.publishVerified(.payload_attributes, test_attributes, null, head, 1, 2));
+    try std.testing.expectError(error.UnverifiedConsensusHead, tracker.publishVerified(.payload_attributes, test_attributes, null, head, head, 1, 2));
     var hint = (try eventHint(a, .payload_attributes, test_attributes)).?;
     hint.execution_hash = @splat(0x99);
-    try std.testing.expectError(error.UnverifiedConsensusHead, tracker.publishVerified(.payload_attributes, test_attributes, hint, head, 1, 2));
+    try std.testing.expectError(error.UnverifiedConsensusHead, tracker.publishVerified(.payload_attributes, test_attributes, hint, head, head, 1, 2));
     try std.testing.expectEqual(@as(usize, 0), sink.count);
     try std.testing.expectEqual(head.hash, tracker.latest_hash.?);
     try std.testing.expectError(error.Closed, queue.getOne(io));
@@ -736,7 +759,7 @@ test "consensus attribute invalidation is optional and independent of sync state
     tracker.attributes_sink = sink.sink();
     const hint = try eventHint(a, .payload_attributes, test_attributes);
     const head: Head = .{ .hash = hint.?.execution_hash, .slot = 124 };
-    try tracker.publishVerified(.payload_attributes, test_attributes, hint, head, 9, 4);
+    try tracker.publishVerified(.payload_attributes, test_attributes, hint, head, head, 9, 4);
     queue.close(io);
     tracker.invalidate();
     tracker.invalidate();
@@ -747,7 +770,7 @@ test "consensus attribute invalidation is optional and independent of sync state
     try std.testing.expectError(error.Closed, queue.getOne(io));
     // A renewed verified event reaches the sink even if the sync target stayed
     // unchanged across invalidation. Host generation admission owns its policy.
-    try tracker.publishVerified(.payload_attributes, test_attributes, hint, head, 10, 5);
+    try tracker.publishVerified(.payload_attributes, test_attributes, hint, head, head, 10, 5);
     try std.testing.expectEqual(@as(usize, 2), sink.count);
 }
 
@@ -762,10 +785,106 @@ test "ordinary consensus head notifications never enter the attribute sink" {
     var sink: AttributesTestSink = .{};
     tracker.attributes_sink = sink.sink();
     const head: Head = .{ .hash = @splat(0x33), .slot = 124 };
-    try tracker.publishVerified(.head, "", null, head, 1, 2);
+    try tracker.publishVerified(.head, "", null, head, head, 1, 2);
     queue.close(io);
-    try tracker.publishVerified(.execution_payload, "opaque payload event", null, head, 3, 4);
+    try tracker.publishVerified(.execution_payload, "opaque payload event", null, head, head, 3, 4);
     try std.testing.expectEqual(@as(usize, 0), sink.count);
     try std.testing.expectEqualDeep(head, (try queue.getOne(io)).head);
     try std.testing.expectError(error.Closed, queue.getOne(io));
+}
+
+test "branch attributes cannot supersede the verified FULL sync target" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var buffer: [1]Update = undefined;
+    var queue: std.Io.Queue(Update) = .init(&buffer);
+    var tracker = try Tracker.init(io, a, "http://localhost:9596", &queue);
+    defer tracker.deinit();
+    tracker.anchor = test_anchor;
+    var sink: AttributesTestSink = .{};
+    tracker.attributes_sink = sink.sink();
+    const graph = try testForkChoice(a, "empty");
+    defer a.free(graph);
+    const full = try std.mem.replaceOwned(u8, a, test_attributes, test_parent, test_payload);
+    defer a.free(full);
+    const alternate = try std.mem.replaceOwned(u8, a, test_attributes, "{\"version\":", "{\"context\":{\"role\":\"alternate\"},\"version\":");
+    defer a.free(alternate);
+    try tracker.publishForkChoice(a, .payload_attributes, full, graph, 100, 10);
+    queue.close(io); // a second sync enqueue fails, rather than hanging the test
+    try tracker.publishForkChoice(a, .payload_attributes, alternate, graph, 101, 11);
+    try tracker.publishForkChoice(a, .payload_attributes, test_attributes, graph, 102, 12);
+    try std.testing.expectEqual(@as(usize, 3), sink.count);
+    try std.testing.expectEqualStrings(alternate, sink.copies[1].bytes[0..sink.copies[1].len]);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x22)), sink.copies[1].parent.hash);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x22)), sink.copies[2].parent.hash);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x33)), (try queue.getOne(io)).head.hash);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x33)), tracker.latest_hash.?);
+    try std.testing.expectError(error.Closed, queue.getOne(io));
+}
+
+fn testReorgForkChoice(a: std.mem.Allocator, optimistic: bool) ![]u8 {
+    const root = "0x" ++ std.fmt.bytesToHex(@as([32]u8, @splat(0x66)), .lower);
+    const payload = "0x" ++ std.fmt.bytesToHex(@as([32]u8, @splat(0x77)), .lower);
+    const old_nodes = test_nodes[0 .. test_nodes.len - 1];
+    return std.fmt.allocPrint(a, "{{\"data\":{{\"extra_data\":{{\"head\":{{\"block_root\":\"{s}\",\"payload_status\":\"full\"}}}},\"fork_choice_nodes\":{s},{{\"slot\":\"124\",\"block_root\":\"{s}\",\"payload_status\":\"full\",\"validity\":\"valid\",\"execution_block_hash\":\"{s}\",\"extra_data\":{{\"execution_optimistic\":{s}}}}}]}}}}", .{ root, old_nodes, root, payload, if (optimistic) "true" else "false" });
+}
+
+test "same-height reorg changes sync target while older FULL branch remains authenticated" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var buffer: [3]Update = undefined;
+    var queue: std.Io.Queue(Update) = .init(&buffer);
+    var tracker = try Tracker.init(io, a, "http://localhost:9596", &queue);
+    defer tracker.deinit();
+    tracker.anchor = test_anchor;
+    var sink: AttributesTestSink = .{};
+    tracker.attributes_sink = sink.sink();
+    const old = try testForkChoice(a, "empty");
+    defer a.free(old);
+    const reorg = try testReorgForkChoice(a, false);
+    defer a.free(reorg);
+    const full = try std.mem.replaceOwned(u8, a, test_attributes, test_parent, test_payload);
+    defer a.free(full);
+    try tracker.publishForkChoice(a, .payload_attributes, full, old, 100, 10);
+    try tracker.publishForkChoice(a, .payload_attributes, full, reorg, 101, 11);
+    // A stale execution-payload hint is verified but cannot restore the old
+    // writer target either. An actual selected-root reorg back can do so.
+    const payload = "{\"slot\":\"124\",\"block_root\":\"" ++ test_root ++ "\",\"block_hash\":\"" ++ test_payload ++ "\",\"execution_optimistic\":false}";
+    try tracker.publishForkChoice(a, .execution_payload, payload, reorg, 102, 12);
+    try tracker.publishForkChoice(a, .head, "", old, 103, 13);
+    queue.close(io);
+    try std.testing.expectEqual(@as(usize, 2), sink.count);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x33)), sink.copies[1].parent.hash);
+    const first = try queue.getOne(io);
+    const second = try queue.getOne(io);
+    const third = try queue.getOne(io);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x33)), first.head.hash);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x77)), second.head.hash);
+    try std.testing.expectEqual(first.head.slot, second.head.slot);
+    try std.testing.expectEqualDeep(first.head, third.head);
+    try std.testing.expectError(error.Closed, queue.getOne(io));
+}
+
+test "unverified preferred head never turns a valid branch hint into a sync fallback" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var buffer: [1]Update = undefined;
+    var queue: std.Io.Queue(Update) = .init(&buffer);
+    queue.close(io);
+    var tracker = try Tracker.init(io, a, "http://localhost:9596", &queue);
+    defer tracker.deinit();
+    tracker.anchor = test_anchor;
+    var sink: AttributesTestSink = .{};
+    tracker.attributes_sink = sink.sink();
+    const graph = try testReorgForkChoice(a, true);
+    defer a.free(graph);
+    try std.testing.expectError(error.UnverifiedConsensusHead, tracker.publishForkChoice(a, .payload_attributes, test_attributes, graph, 100, 10));
+    try std.testing.expectEqual(@as(usize, 1), sink.count);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x22)), sink.copies[0].parent.hash);
+    try std.testing.expectEqual(@as(?[32]u8, null), tracker.latest_hash);
+    try std.testing.expectError(error.Closed, queue.getOne(io));
+    const unbound = try std.mem.replaceOwned(u8, a, test_attributes, test_parent, "0x" ++ std.fmt.bytesToHex(@as([32]u8, @splat(0x88)), .lower));
+    defer a.free(unbound);
+    try std.testing.expectError(error.UnavailableExecutionHead, tracker.publishForkChoice(a, .payload_attributes, unbound, graph, 101, 11));
+    try std.testing.expectEqual(@as(usize, 1), sink.count);
 }
