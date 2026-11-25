@@ -237,11 +237,27 @@ pub const Tracker = struct {
     }
 
     fn timedGet(self: *Tracker, a: std.mem.Allocator, path: []const u8) ![]const u8 {
+        return self.timedGetRetry(a, path, false);
+    }
+
+    fn getRetry(self: *Tracker, a: std.mem.Allocator, path: []const u8, retry_close: bool) ![]const u8 {
+        return self.get(a, path) catch |err| {
+            // A connection can close before returning any response headers.
+            // Only this observed transport failure is retried, once. This is a
+            // read-only GET; no event was authenticated or delivered yet.
+            if (!retry_close or err != error.HttpConnectionClosing) return err;
+            return self.get(a, path);
+        };
+    }
+
+    fn timedGetRetry(self: *Tracker, a: std.mem.Allocator, path: []const u8, retry_close: bool) ![]const u8 {
         const Event = union(enum) { response: anyerror![]const u8, timeout: anyerror!void };
         var buffer: [2]Event = undefined;
         var select: std.Io.Select(Event) = .init(self.io, &buffer);
         defer select.cancelDiscard();
-        try select.concurrent(.response, get, .{ self, a, path });
+        // Both attempts share the original two-second budget. Cancellation
+        // joins the lookup before its arena can be released.
+        try select.concurrent(.response, getRetry, .{ self, a, path, retry_close });
         try select.concurrent(.timeout, std.Io.sleep, .{ self.io, .fromSeconds(2), .awake });
         return switch (try select.await()) {
             .response => |result| try result,
@@ -290,7 +306,12 @@ pub const Tracker = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        try self.publishForkChoice(a, kind, data, try self.timedGet(a, "/eth/v2/debug/fork_choice"), observed_at_ms, observed_mono_ms);
+        // The SSE frame remains borrowed and unchanged until this returns.
+        // Preserve its first dispatch clocks across the bounded transport retry;
+        // the sink retains its own target-based immutable expiry policy.
+        // Revalidate the exact original parent/root against the returned graph;
+        // semantic errors, sink refusal and publication are never retried.
+        try self.publishForkChoice(a, kind, data, try self.timedGetRetry(a, "/eth/v2/debug/fork_choice", kind == .payload_attributes), observed_at_ms, observed_mono_ms);
     }
 
     fn publishForkChoice(self: *Tracker, a: std.mem.Allocator, kind: EventKind, data: []const u8, graph: []const u8, observed_at_ms: i64, observed_mono_ms: i64) !void {
@@ -373,7 +394,7 @@ pub const Tracker = struct {
                     // or transient lookup timeout does not revoke a previously
                     // verified EMPTY/parent context. Stream loss invalidates the
                     // feed below; every accepted request has a short deadline.
-                    log.warn("head event lookup: {t}", .{e});
+                    log.warn("head event lookup kind={t}: {t}", .{ event_kind, e });
                 };
                 kind = null;
                 data.clearRetainingCapacity();
@@ -647,6 +668,31 @@ const AttributesTestSink = struct {
 
 const test_attributes = "{\"version\":\"gloas\",\"data\":{\"proposal_slot\":\"125\",\"parent_block_root\":\"" ++ test_root ++ "\",\"parent_block_hash\":\"" ++ test_parent ++ "\"}}";
 const test_anchor: Anchor = .{ .beacon_root = @splat(0x44), .execution_hash = @splat(0x55), .slot = 120 };
+
+test "consensus attribute authentication allocation failures never deliver partial authority" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const io = std.testing.io;
+            var buffer: [1]Update = undefined;
+            var queue: std.Io.Queue(Update) = .init(&buffer);
+            var tracker = try Tracker.init(io, a, "http://127.0.0.1:9596", &queue);
+            defer tracker.deinit();
+            tracker.anchor = test_anchor;
+            var sink: AttributesTestSink = .{};
+            tracker.attributes_sink = sink.sink();
+            const graph = try testForkChoice(a, "empty");
+            defer a.free(graph);
+            tracker.publishForkChoice(a, .payload_attributes, test_attributes, graph, 100, 10) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), sink.count);
+                try std.testing.expectEqual(@as(?[32]u8, null), tracker.latest_hash);
+                return err;
+            };
+            try std.testing.expectEqual(@as(usize, 1), sink.count);
+            try std.testing.expectEqualStrings(test_attributes, sink.copies[0].bytes[0..sink.copies[0].len]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
 
 test "consensus attributes repeat on the same parent before sync dedup with exact receipt stamps" {
     const a = std.testing.allocator;

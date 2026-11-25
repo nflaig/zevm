@@ -25,6 +25,29 @@ FULL event can precede its validated fork-choice entry while the EMPTY context
 remains usable. The adapter must still impose short deadlines and explicit
 authority generations on retained contexts. No callback may outlive the adapter.
 
+An attribute event's read-only fork-choice GET retries once only on clean EOF
+before any response bytes (`HttpConnectionClosing`). Both attempts share the
+existing two-second timeout and publication mutex. The SSE
+frame and wall/monotonic clocks sampled at its first dispatch remain unchanged;
+the consumer's original target-based expiry policy is untouched. The successful
+response must still certify the event's exact execution parent and beacon root.
+Other transport failures,
+semantic rejection, mailbox refusal and publication failure are not retried;
+head/reconciliation and execution-payload events retain their existing policy.
+This bounded GET policy also applies to the stock node without an attribute sink.
+Another pooled connection can also be stale; two failures still drop the event.
+Terminal event warnings identify the event kind without exposing its contents.
+
+`test/consensus_attributes_retry_test.py` uses the optional `attributes` mode of
+`consensus-probe` against a local fixture. It exercises recovery, primary and
+alternate frames, a single stale pooled keep-alive socket, exhausted retry,
+shared timeout, cancellation, malformed and unverified/unbound attributes, and
+unchanged non-attribute behavior. The probe
+copies only fixed scalar metadata and a body digest into a bounded nonblocking
+observation queue. These tests establish recovery from one clean pre-header EOF,
+not recovery from every possible transport interruption, nor the cause or
+outcome of any particular historical missed slot.
+
 Node supervision joins the sync and builder tasks together. It then joins the
 tracker/public producers before destroying the adapter, and destroys snapshots
 and the store last. Adapter failures cannot silently leave sync running under
