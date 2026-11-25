@@ -4,9 +4,12 @@
 requires `--shadow-state`. The node receives public transaction announcements,
 requests missing transactions from the announcing peers, and accepts direct
 transaction broadcasts. It uses no Geth subscription, transaction RPC or database.
-It does **not** feed a production constructor, advertise or serve transactions,
-or receive private bundles. The only installed sink emits public hashes, sizes
-and receipt timestamps; no transaction bodies or credentials are logged.
+In the standalone zevm CLI, it does **not** feed a production constructor,
+advertise or serve transactions, or receive private bundles. That CLI's observer
+sink emits public hashes, sizes and receipt timestamps; no transaction bodies or
+credentials are logged. The combined zbuilder node separately installs an owning
+native sink that copies admitted public transactions into construction. Its
+peer-intake integration tests exercise that complete path and retained payloads.
 
 The wire adapter uses the ETH/68–71 three-field announcement format, plus
 request-ID-wrapped pooled requests/responses. It does not negotiate ETH/72 or
@@ -28,8 +31,19 @@ Announcement metadata remains tied to its advertiser. A dishonest first size or
 type does not overwrite the independent binding from a second peer. Transactions
 must match requested hashes, order and announced sizes/types. Canonical RLP,
 chain ID, low-s signature recovery and basic fee shape are checked using zevm's
-existing transaction decoder and sender recovery. An entire response is checked
-before any of its records reaches the sink. Repeated hashes are deduplicated,
+existing transaction decoder and sender recovery. The normal path checks each
+bounded item sequentially: its envelope, response hash/order/announcement binding,
+then its budgeted signature verification. All items pass before batch delivery.
+If a local signature budget runs out partway through the
+batch, the verified prefix can still be delivered after the remaining transaction
+envelopes, response bindings, transaction structures, canonical encodings and
+basic fee shapes pass validation. The response cursor continues from the refused
+item; no earlier item is rehashed or charged another signature token. No sender
+recovery or signature/chain-ID validation is attempted for that refused suffix,
+and none of its records reaches the sink. This intentionally admits valid public
+gossip independently of an unverified suffix; it is not atomic private-bundle
+semantics. A signature failure encountered while budget remains still rejects
+the whole batch before delivery. Repeated hashes are deduplicated,
 including direct broadcasts that race a requested response. Ordinary missing
 items, empty responses, disconnections and timeouts release reservations so a
 retained alternate peer can supply them.
@@ -61,7 +75,7 @@ candidate-specific eligibility still require builder validation/execution.
 | Frame bytes before parsing/hash work | 4 MiB/s global, 1 MiB/s per peer slot |
 | Frame-byte burst | 4 MiB global, 2 MiB + 1 KiB per peer slot |
 | Frames before parsing/hash work | 512/s global (burst 256), 128/s per peer slot (burst 128) |
-| Decode/signature attempts | 256/s global, 64/s per peer slot; burst 256 |
+| Signature verification attempts | 256/s global, 64/s per peer slot; burst 256 |
 | Timeout retry backoff | Exponential 1–10 s, reset after a valid response |
 
 Wire lists enforce their element limit before decoding/allocating further
@@ -71,8 +85,14 @@ Oversized/malformed messages are counted; invalid transactions never reach the
 sink. These limits are experimental admission policy, not consensus limits.
 The observer never disconnects a shared state-sync peer for an intake verdict;
 it releases only its own reservations. Token buckets charge incoming bytes before
-parsing or hashing and unknown transactions before decoding/signature work.
+parsing or hashing and unknown transactions before signature verification.
 Denied work spends neither the other bucket's tokens nor any signature attempt.
+Preserving a nonempty verified prefix requires parsing its refused suffix without
+signature recovery, within the same frame-byte and item limits. This structural
+work is charged to the existing frame/byte limits, not the signature bucket. An
+empty verified prefix retains the original cheap refusal without scanning or
+hashing the remaining items. No deferred frames, retry queue or increased work
+limits are introduced.
 Denied frames return from the adapter immediately without scanning pending
 inventory or draining outgoing work. A refused pooled response releases only its
 own peer/epoch's request (at most 16 slots checked and 64 hashes released), so our
@@ -82,7 +102,21 @@ flood from moving expensive work into the rejection path. Empty announcements
 also return before the pending-ownership scan. A compile-time assertion keeps the
 intake's peer-slot bounds at least as large as the provider's capacity.
 Rate-limit loss is expected under overload and must not be mistaken for complete
-coverage. A frame rejected during validation contributes no records to the sink.
+coverage. A frame rejected during structural validation, or a signature failure
+encountered before local quota refusal, contributes no records to the sink. A
+structurally valid frame refused by local signature quota may contribute only
+its verified prefix. The adapter still treats that outcome as local refusal:
+it does not fault the peer or drain outgoing work, and a matching response releases
+its remaining request reservation without a timeout penalty. Only successful
+sink admissions enter the seen set; backpressure and unverified suffixes remain
+eligible through retained alternate announcements or a later announcement.
+That no-fault/no-drain rule applies to the `SignatureRateLimit` outcome. If suffix
+inspection instead discovers malformed structure, the existing invalid-frame
+path releases that peer's intake requests/advertisements and drains outgoing
+work, including for a broadcast with an unrelated pending request. It leaves the
+shared sync connection intact. OOM retains the existing capacity-drop accounting
+and outgoing drain. With zero verified prefix the later suffix is not inspected,
+so the same frame can take the cheap local-refusal path instead.
 The bounded work remains on the downloader thread, so this limits additional CPU
 work without claiming immunity from transport/decompression load or a real-time
 latency guarantee.
@@ -93,10 +127,15 @@ pending, capacity-drop, sink-full and timeout counts every minute.
 It also records frame/signature rate drops, per-peer pending drops and backoff
 selection skips. `frame_refused_requests` counts local admission releases
 separately from remote timeouts. `decoded` counts completed verification work,
-including records discarded before batch delivery; `signature_discarded_decoded`
-counts that verified work discarded by signature admission, and
-`signature_unprocessed_items` counts the refused item and remaining wire items
-(which may contain duplicates), not unique transactions. Repeated announcements cannot renew the ten-second pending
+including records discarded before batch delivery. On local signature refusal,
+`signature_preserved_decoded` counts prefix records newly accepted by the sink;
+`signature_discarded_decoded` counts the rest of that verified prefix, including
+sink backpressure, allocation failure, or suffix structural rejection. These
+are limited-batch counters, not counts of all invalid-frame losses or eventual
+transaction loss. `signature_unprocessed_items` counts the refused item and
+remaining wire items whose signatures were not processed (which may contain
+duplicates), even when their structure was subsequently parsed. It does not count
+unique transactions. Repeated announcements cannot renew the ten-second pending
 lifetime, and a stalled peer is bypassed while a remembered alternative is usable.
 `public_transaction` records monotonic announcement time, frame-dispatch time in
 both clocks, and wall-clock acceptance time after validation. Frame dispatch is
@@ -123,6 +162,11 @@ and disconnect recovery, sink backpressure, inventory/request bounds and
 allocation failures. Run the repository's normal `test` target with the pinned
 Zig 0.17 toolchain in Debug and safe modes. Live results must be recorded separately;
 passing these tests does not establish real peer coverage or better block value.
+Use `-Dtest-filter=node.public_intake` to run both the core and peer-adapter
+intake tests, including the blob paths. Prefix regressions cover global and peer
+budgets, structural and signature-invalid suffixes, alternate retries, duplicate
+races, backpressure, and every injected allocation failure. A callback that
+accepts a prefix owns its copy even if later bookkeeping reservation fails.
 
 ## Review closure
 

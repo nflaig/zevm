@@ -225,6 +225,7 @@ pub fn build(b: *std.Build) void {
     // Tests
     const test_step = b.step("test", "Run unit tests");
     const unit_tests = b.addTest(.{
+        .filters = if (b.option([]const u8, "test-filter", "Run unit tests whose names contain this text")) |filter| &.{filter} else &.{},
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/unit_tests.zig"),
             .target = target,

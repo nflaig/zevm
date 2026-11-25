@@ -141,6 +141,7 @@ pub const Stats = struct {
     frame_rate_drops: u64 = 0,
     frame_refused_requests: u64 = 0,
     signature_rate_drops: u64 = 0,
+    signature_preserved_decoded: u64 = 0,
     signature_discarded_decoded: u64 = 0,
     signature_unprocessed_items: u64 = 0,
     peer_pending_drops: u64 = 0,
@@ -339,7 +340,9 @@ pub const Intake = struct {
         return encoded.toOwnedSlice();
     }
 
-    /// Validate the complete bounded response before admitting any transaction.
+    /// Validate the complete bounded response structure before admission. A
+    /// local signature limit can admit its already-verified prefix only after
+    /// checking the refused suffix structure, without verifying/delivering it.
     /// Missing hashes are normal (peer eviction/response limits); alternatives
     /// remain eligible after this request releases its reservation.
     pub fn response(self: *Intake, a: std.mem.Allocator, peer: Peer, raw: []const u8, receipt: ReceiptTime) !void {
@@ -373,25 +376,21 @@ pub const Intake = struct {
         if (request.blob) return self.blobResponse(a, request, msg.transactions.slice(), receipt);
         var records: [max_request_hashes]Record = undefined;
         var record_count: usize = 0;
-        var cursor: usize = 0;
+        var cursor: ResponseCursor = .{ .request = &request };
         for (msg.transactions.slice(), 0..) |raw_tx, item_index| {
             const bytes = try canonicalBytes(a, raw_tx.value);
             const tx_hash = hash(bytes);
-            while (cursor < request.count and !std.mem.eql(u8, &request.hashes[cursor], &tx_hash)) : (cursor += 1) {}
-            if (cursor == request.count) return error.UnrequestedTransaction;
-            const entry = request.announced[cursor];
-            cursor += 1;
-            if (bytes.len != entry.size or transactionKind(bytes) != entry.kind) return error.AnnouncementMismatch;
+            const announced_at_ms = try cursor.validate(bytes, tx_hash);
             if (self.known(tx_hash, now)) {
                 self.stats.duplicate += 1;
                 continue;
             }
-            self.reserveSignature(peer, now) catch |err| {
-                self.stats.signature_discarded_decoded += record_count;
-                self.stats.signature_unprocessed_items += msg.transactions.count - item_index;
-                return err;
-            };
-            records[record_count] = try decodeRecord(a, self.chain_id, peer, bytes, entry.at_ms, now);
+            self.reserveSignature(peer, now) catch return self.deliverLimitedPrefix(a, records[0..record_count], .{
+                .first = bytes,
+                .remaining = msg.transactions.slice()[item_index + 1 ..],
+                .response = cursor,
+            }, now);
+            records[record_count] = try decodeRecord(a, self.chain_id, peer, bytes, announced_at_ms, now);
             records[record_count].frame_received_wall_ms = receipt.wall_ms;
             record_count += 1;
             self.stats.decoded += 1;
@@ -426,17 +425,44 @@ pub const Intake = struct {
                 self.stats.duplicate += 1;
                 continue;
             }
-            self.reserveSignature(peer, now) catch |err| {
-                self.stats.signature_discarded_decoded += count;
-                self.stats.signature_unprocessed_items += txs.len - item_index;
-                return err;
-            };
+            self.reserveSignature(peer, now) catch return self.deliverLimitedPrefix(a, records[0..count], .{
+                .first = bytes,
+                .remaining = txs[item_index + 1 ..],
+            }, now);
             records[count] = try decodeRecord(a, self.chain_id, peer, bytes, now, now);
             records[count].frame_received_wall_ms = receipt.wall_ms;
             count += 1;
             self.stats.decoded += 1;
         }
         for (records[0..count]) |record| try self.deliver(record, now);
+    }
+
+    fn deliverLimitedPrefix(self: *Intake, a: std.mem.Allocator, records: []const Record, suffix: LimitedSuffix, now: i64) !void {
+        self.stats.signature_unprocessed_items += 1 + suffix.remaining.len;
+        const accepted_before = self.stats.accepted;
+        defer {
+            const preserved = self.stats.accepted - accepted_before;
+            self.stats.signature_preserved_decoded += preserved;
+            self.stats.signature_discarded_decoded += records.len - preserved;
+        }
+        // With nothing to deliver, retain the original cheap local refusal.
+        // A nonempty prefix requires validating every remaining envelope,
+        // response binding and transaction structure before any callback. The
+        // first refused item was already canonicalized/hashed/bound by the
+        // sequential scan; reuse it and continue at its advanced request cursor.
+        if (records.len != 0) {
+            try validateOrdinaryStructure(a, suffix.first);
+            var binding = suffix.response;
+            for (suffix.remaining) |raw_tx| {
+                const bytes = try canonicalBytes(a, raw_tx.value);
+                if (binding) |*cursor| _ = try cursor.validate(bytes, hash(bytes));
+                try validateOrdinaryStructure(a, bytes);
+            }
+            for (records) |record| try self.deliver(record, now);
+        }
+        // The driver treats this as local refusal: no peer fault, no outgoing
+        // drain, and response's defer releases the remaining reservation.
+        return error.SignatureRateLimit;
     }
 
     fn known(self: *Intake, tx_hash: Hash, now: i64) bool {
@@ -691,6 +717,25 @@ fn removePeer(entry: *Pending, peer: Peer) void {
     };
 }
 
+const ResponseCursor = struct {
+    request: *const Request,
+    next: usize = 0,
+    fn validate(self: *@This(), bytes: []const u8, tx_hash: Hash) !i64 {
+        while (self.next < self.request.count and !std.mem.eql(u8, &self.request.hashes[self.next], &tx_hash)) : (self.next += 1) {}
+        if (self.next == self.request.count) return error.UnrequestedTransaction;
+        const entry = self.request.announced[self.next];
+        self.next += 1;
+        if (bytes.len != entry.size or transactionKind(bytes) != entry.kind) return error.AnnouncementMismatch;
+        return entry.at_ms;
+    }
+};
+
+const LimitedSuffix = struct {
+    first: []const u8,
+    remaining: []const rlp.RawValue,
+    response: ?ResponseCursor = null,
+};
+
 fn transactionKind(bytes: []const u8) u8 {
     return if (bytes[0] >= 0xc0) 0 else bytes[0];
 }
@@ -717,7 +762,27 @@ fn decodeRecord(a: std.mem.Allocator, chain_id: u64, peer: Peer, bytes: []const 
     if (transactionKind(bytes) == 3) return error.BlobSidecarRequired;
     return decodeSigned(a, chain_id, peer, bytes, announced, now);
 }
+
+fn validateOrdinaryStructure(a: std.mem.Allocator, bytes: []const u8) !void {
+    if (transactionKind(bytes) == 3) return error.BlobSidecarRequired;
+    _ = try decodeTransaction(a, bytes);
+}
 fn decodeSigned(a: std.mem.Allocator, chain_id: u64, peer: Peer, bytes: []const u8, announced: i64, now: i64) !Record {
+    const tx = try decodeTransaction(a, bytes);
+    return .{
+        .hash = hash(bytes),
+        .sender = try processor.recoverTxSender(a, &tx, chain_id),
+        .tx = tx,
+        .bytes = bytes,
+        .peer = peer,
+        .announced_at_ms = announced,
+        .received_at_ms = now,
+    };
+}
+
+/// Canonical transaction structure and basic fee shape only. Signature and
+/// chain validation remain in the separately budgeted recoverTxSender call.
+fn decodeTransaction(a: std.mem.Allocator, bytes: []const u8) !types.Transaction {
     const kind = transactionKind(bytes);
     if (kind > 4) return error.UnsupportedTransaction;
     var tx: types.Transaction = undefined;
@@ -736,15 +801,7 @@ fn decodeSigned(a: std.mem.Allocator, chain_id: u64, peer: Peer, bytes: []const 
         },
     }
     if (!std.mem.eql(u8, bytes, encoded.items)) return error.NonCanonicalTransaction;
-    return .{
-        .hash = hash(bytes),
-        .sender = try processor.recoverTxSender(a, &tx, chain_id),
-        .tx = tx,
-        .bytes = bytes,
-        .peer = peer,
-        .announced_at_ms = announced,
-        .received_at_ms = now,
-    };
+    return tx;
 }
 
 /// Bounded wire arrays reject excess items before allocating or decoding them.
@@ -1248,7 +1305,7 @@ test "public intake local response refusal releases only the matching epoch with
     try std.testing.expectEqual(1, recorder.count);
 }
 
-test "public intake counts decoded and unprocessed items discarded by signature admission" {
+test "public intake preserves verified batch prefix at local signature limit" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1274,10 +1331,434 @@ test "public intake counts decoded and unprocessed items discarded by signature 
             try std.testing.expectError(error.SignatureRateLimit, intake.broadcast(a, peer_a, broadcast, .{ .mono_ms = 0 }));
         }
         try std.testing.expectEqual(1, intake.stats.decoded);
-        try std.testing.expectEqual(1, intake.stats.signature_discarded_decoded);
+        try std.testing.expectEqual(1, intake.stats.signature_preserved_decoded);
+        try std.testing.expectEqual(0, intake.stats.signature_discarded_decoded);
         try std.testing.expectEqual(1, intake.stats.signature_unprocessed_items);
+        try std.testing.expectEqual(1, recorder.count);
+        try std.testing.expectEqual(1, intake.stats.accepted);
+    }
+}
+
+fn batchWire(a: std.mem.Allocator, transactions: []const []const u8, id: ?u64) ![]const u8 {
+    var items: [max_broadcast_transactions]rlp.RawValue = undefined;
+    for (transactions, 0..) |bytes, i| items[i] = .{ .value = if (transactionKind(bytes) == 0) bytes else try encode(a, bytes) };
+    const slice: []const rlp.RawValue = items[0..transactions.len];
+    return if (id) |request_id| encode(a, .{ request_id, slice }) else encode(a, slice);
+}
+
+fn batchAnnouncement(a: std.mem.Allocator, transactions: []const []const u8) ![]const u8 {
+    var kinds: [max_broadcast_transactions]u8 = undefined;
+    var sizes: [max_broadcast_transactions]u32 = undefined;
+    var hashes: [max_broadcast_transactions]Hash = undefined;
+    for (transactions, 0..) |bytes, i| {
+        kinds[i] = transactionKind(bytes);
+        sizes[i] = @intCast(bytes.len);
+        hashes[i] = hash(bytes);
+    }
+    return encode(a, .{ @as([]const u8, kinds[0..transactions.len]), @as([]const u32, sizes[0..transactions.len]), @as([]const Hash, hashes[0..transactions.len]) });
+}
+
+fn submitTestBatch(intake: *Intake, a: std.mem.Allocator, transactions: []const []const u8, is_response: bool) !void {
+    if (is_response) {
+        try intake.announce(a, peer_a, try batchAnnouncement(a, transactions), 0);
+        const request = intake.nextRequest(1, 0).?;
+        try std.testing.expectEqual(transactions.len, request.count);
+        return intake.response(a, peer_a, try batchWire(a, transactions, 1), .{ .mono_ms = 0, .wall_ms = 12345 });
+    }
+    return intake.broadcast(a, peer_a, try batchWire(a, transactions, null), .{ .mono_ms = 0, .wall_ms = 12345 });
+}
+
+test "public intake prefix preservation respects empty partial and full global and peer budgets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const txs = [_][]const u8{ try fixture(a), try unhex(a, typed2_hex) };
+    for ([_]bool{ false, true }) |is_response| {
+        for ([_]bool{ false, true }) |peer_limited| {
+            for (0..3) |tokens| {
+                var recorder: Recorder = .{};
+                var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+                defer intake.deinit();
+                const limited = if (peer_limited) &intake.peer_work[peer_a.index].signatures else &intake.signature_budget;
+                limited.* = .{ .last_ms = 0, .milli_tokens = tokens * 1000 };
+                const result = submitTestBatch(&intake, a, &txs, is_response);
+                if (tokens == 2) try result else try std.testing.expectError(error.SignatureRateLimit, result);
+                try std.testing.expectEqual(tokens, intake.stats.decoded);
+                try std.testing.expectEqual(tokens, intake.stats.accepted);
+                try std.testing.expectEqual(tokens, recorder.count);
+                try std.testing.expectEqual(0, limited.milli_tokens);
+                const other = if (peer_limited) intake.signature_budget else intake.peer_work[peer_a.index].signatures;
+                try std.testing.expectEqual(256000 - tokens * 1000, other.milli_tokens);
+                try std.testing.expectEqual(@intFromBool(tokens < 2), intake.stats.signature_rate_drops);
+                try std.testing.expectEqual(@intFromBool(tokens == 1), intake.stats.signature_preserved_decoded);
+                try std.testing.expectEqual(0, intake.stats.signature_discarded_decoded);
+                try std.testing.expectEqual(2 - tokens, intake.stats.signature_unprocessed_items);
+                if (tokens != 0) try std.testing.expectEqual(12345, recorder.last_received_wall.?);
+                for (intake.requests) |request| try std.testing.expect(request == null);
+            }
+        }
+    }
+}
+
+test "public intake limited prefix keeps sink refusals retryable and releases only remaining response work" {
+    const Receiver = struct {
+        calls: usize = 0,
+        accepted: usize = 0,
+        refuse_first: bool = true,
+        fn accept(ctx: *anyopaque, _: Record) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (self.refuse_first and self.calls == 1) return false;
+            self.accepted += 1;
+            return true;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const txs = [_][]const u8{ try fixture(a), try unhex(a, typed2_hex), try unhex(a, typed4_hex) };
+    for ([_]bool{ false, true }) |is_response| {
+        var receiver: Receiver = .{};
+        var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = .{ .context = &receiver, .accept = Receiver.accept } };
+        defer intake.deinit();
+        intake.signature_budget = .{ .last_ms = 0, .milli_tokens = 2000 };
+        const announcement = try batchAnnouncement(a, &txs);
+        try intake.announce(a, peer_a, announcement, 0);
+        try intake.announce(a, peer_b, announcement, 0);
+        const request = intake.nextRequest(1, 0).?;
+        try std.testing.expectEqual(peer_a, request.peer);
+        const raw = try batchWire(a, &txs, if (is_response) 1 else null);
+        if (is_response) {
+            try std.testing.expectError(error.SignatureRateLimit, intake.response(a, peer_a, raw, .{ .mono_ms = 0 }));
+        } else {
+            try std.testing.expectError(error.SignatureRateLimit, intake.broadcast(a, peer_a, raw, .{ .mono_ms = 0 }));
+            // An unsolicited broadcast must not release the outstanding request.
+            try std.testing.expect(intake.findRequest(peer_a, 1) != null);
+            intake.release(intake.findRequest(peer_a, 1).?);
+        }
+        try std.testing.expectEqual(2, receiver.calls);
+        try std.testing.expectEqual(1, receiver.accepted);
+        try std.testing.expectEqual(1, intake.stats.sink_full);
+        try std.testing.expectEqual(1, intake.stats.signature_preserved_decoded);
+        try std.testing.expectEqual(1, intake.stats.signature_discarded_decoded);
+        try std.testing.expect(!intake.known(hash(txs[0]), 0));
+        try std.testing.expect(intake.known(hash(txs[1]), 0));
+        try std.testing.expect(!intake.known(hash(txs[2]), 0));
+        try std.testing.expectEqual(2, intake.pending.count());
+        // No timeout/backoff penalty; the alternate supplies exactly the refused
+        // verified item and the unverified suffix after ordinary bucket refill.
+        const retry = intake.nextRequest(2, 32).?;
+        try std.testing.expectEqual(peer_b, retry.peer);
+        try std.testing.expectEqual(2, retry.count);
+        var retry_txs: [2][]const u8 = undefined;
+        for (retry.hashes[0..retry.count], 0..) |tx_hash, i| {
+            try std.testing.expect(!std.mem.eql(u8, &tx_hash, &hash(txs[1])));
+            retry_txs[i] = if (std.mem.eql(u8, &tx_hash, &hash(txs[0]))) txs[0] else txs[2];
+        }
+        receiver.refuse_first = false;
+        try intake.response(a, peer_b, try batchWire(a, &retry_txs, 2), .{ .mono_ms = 33 });
+        try std.testing.expectEqual(3, receiver.accepted);
+        try std.testing.expectEqual(3, intake.stats.accepted);
+        try std.testing.expectEqual(0, intake.pending.count());
+        intake.expire(2500);
+        try std.testing.expectEqual(0, intake.stats.expired_requests);
+        try std.testing.expectEqual(0, intake.peer_work[peer_a.index].timeouts);
+        try std.testing.expectEqual(0, intake.peer_work[peer_a.index].retry_after_ms);
+    }
+}
+
+test "public intake limited prefix still rejects structurally invalid suffix before delivery" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first = try fixture(a);
+    const second = try unhex(a, typed2_hex);
+    var tx: types.Transaction = undefined;
+    _ = try tx.decodeFromRLP(a, first);
+    tx.legacy.gas_limit = 0;
+    const zero_gas = try encode(a, tx.legacy);
+    tx.legacy.gas_limit = 100000;
+    tx.legacy.to = null;
+    const noncanonical = try a.dupe(u8, try encode(a, tx.legacy));
+    var fields: BoundedList(rlp.RawValue, 9) = undefined;
+    _ = try fields.decodeFromRLP(a, noncanonical);
+    const offset = @intFromPtr(fields.items[3].value.ptr) - @intFromPtr(noncanonical.ptr);
+    noncanonical[offset] = 0xc0;
+    for ([_]bool{ false, true }) |is_response| {
+        for ([_]bool{ false, true }) |late| {
+            for ([_][]const u8{ &.{0xc0}, zero_gas, noncanonical }) |suffix| {
+                var recorder: Recorder = .{};
+                var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+                defer intake.deinit();
+                intake.signature_budget = .{ .last_ms = 0, .milli_tokens = 1000 };
+                if (submitTestBatch(&intake, a, if (late) &.{ first, second, suffix } else &.{ first, suffix }, is_response)) |_| {
+                    return error.ExpectedInvalidSuffix;
+                } else |err| {
+                    try std.testing.expect(err != error.SignatureRateLimit);
+                    try std.testing.expect(err != error.OutOfMemory);
+                }
+                try std.testing.expectEqual(0, recorder.count);
+                try std.testing.expectEqual(1, intake.stats.decoded);
+                try std.testing.expectEqual(0, intake.stats.signature_preserved_decoded);
+                try std.testing.expectEqual(1, intake.stats.signature_discarded_decoded);
+                try std.testing.expectEqual(if (late) @as(u64, 2) else 1, intake.stats.signature_unprocessed_items);
+                try std.testing.expectEqual(0, intake.seen.count());
+                for (intake.requests) |request| try std.testing.expect(request == null);
+            }
+        }
+    }
+    // Bare blobs and future typed envelopes cannot hide behind the local quota.
+    for ([_]struct { bytes: []const u8, err: anyerror }{
+        .{ .bytes = &.{ 3, 0xc0 }, .err = error.BlobSidecarRequired },
+        .{ .bytes = &.{ 5, 0xc0 }, .err = error.UnsupportedTransaction },
+    }) |case| {
+        var recorder: Recorder = .{};
+        var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+        defer intake.deinit();
+        intake.signature_budget = .{ .last_ms = 0, .milli_tokens = 1000 };
+        try std.testing.expectError(case.err, submitTestBatch(&intake, a, &.{ first, case.bytes }, false));
         try std.testing.expectEqual(0, recorder.count);
-        try std.testing.expectEqual(0, intake.stats.accepted);
+    }
+}
+
+test "public intake quota suffix never bypasses verification and full invalid batches stay atomic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first = try fixture(a);
+    var tx: types.Transaction = undefined;
+    _ = try tx.decodeFromRLP(a, first);
+    tx.legacy.s = 0;
+    const invalid_signature = try encode(a, tx.legacy);
+    const wrong_chain = try unhex(a, large_chain_hex);
+    for ([_]bool{ false, true }) |is_response| {
+        for ([_]struct { bytes: []const u8, err: anyerror }{
+            .{ .bytes = invalid_signature, .err = error.InvalidSignature },
+            .{ .bytes = wrong_chain, .err = error.InvalidChainId },
+        }) |case| {
+            for ([_]u64{ 1000, 2000 }) |budget| {
+                var recorder: Recorder = .{};
+                var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+                defer intake.deinit();
+                intake.signature_budget = .{ .last_ms = 0, .milli_tokens = budget };
+                const limited = budget == 1000;
+                try std.testing.expectError(if (limited) error.SignatureRateLimit else case.err, submitTestBatch(&intake, a, &.{ first, case.bytes }, is_response));
+                try std.testing.expectEqual(@intFromBool(limited), recorder.count);
+                try std.testing.expectEqual(@intFromBool(limited), intake.stats.signature_preserved_decoded);
+                try std.testing.expect(!intake.known(hash(case.bytes), 0));
+                if (limited) {
+                    try std.testing.expectEqual(hash(first), recorder.last_hash);
+                    // A fresh budget verifies the previously skipped suffix and
+                    // rejects it; the accepted prefix is not redelivered.
+                    const suffix = try batchWire(a, &.{case.bytes}, null);
+                    try std.testing.expectError(case.err, intake.broadcast(a, peer_b, suffix, .{ .mono_ms = 32 }));
+                    try std.testing.expectEqual(1, recorder.count);
+                }
+            }
+        }
+    }
+}
+
+test "public intake checks late response bindings and broadcast framing before prefix delivery" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first = try fixture(a);
+    const second = try unhex(a, typed2_hex);
+    const third = try unhex(a, typed4_hex);
+    for (0..3) |case| {
+        var recorder: Recorder = .{};
+        var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+        defer intake.deinit();
+        intake.signature_budget = .{ .last_ms = 0, .milli_tokens = 1000 };
+        const announced = if (case == 0) [_][]const u8{ first, third, second } else [_][]const u8{ first, second, third };
+        try intake.announce(a, peer_a, try batchAnnouncement(a, &announced), 0);
+        _ = intake.nextRequest(1, 0).?;
+        if (case == 1) intake.requests[intake.findRequest(peer_a, 1).?].?.announced[2].size += 1;
+        const raw = try batchWire(a, if (case == 2) &.{ first, second, second } else &.{ first, second, third }, 1);
+        try std.testing.expectError(if (case == 1) error.AnnouncementMismatch else error.UnrequestedTransaction, intake.response(a, peer_a, raw, .{ .mono_ms = 0 }));
+        try std.testing.expectEqual(0, recorder.count);
+        try std.testing.expectEqual(1, intake.stats.decoded);
+        try std.testing.expectEqual(0, intake.signature_budget.milli_tokens);
+        try std.testing.expectEqual(1, intake.stats.signature_discarded_decoded);
+    }
+    const valid = try batchWire(a, &.{ first, second }, null);
+    const trailing = try std.mem.concat(a, u8, &.{ valid, &.{0} });
+    const invalid_wrapper = try encode(a, @as([]const rlp.RawValue, &.{ .{ .value = first }, .{ .value = try encode(a, second) }, .{ .value = &.{0} } }));
+    for ([_]struct { raw: []const u8, err: anyerror }{
+        .{ .raw = trailing, .err = error.TrailingRlp },
+        .{ .raw = invalid_wrapper, .err = error.InvalidTypedWrapper },
+    }) |case| {
+        var recorder: Recorder = .{};
+        var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+        defer intake.deinit();
+        intake.signature_budget = .{ .last_ms = 0, .milli_tokens = 1000 };
+        try std.testing.expectError(case.err, intake.broadcast(a, peer_a, case.raw, .{ .mono_ms = 0 }));
+        try std.testing.expectEqual(0, recorder.count);
+        try std.testing.expectEqual(@intFromBool(case.err == error.InvalidTypedWrapper), intake.stats.decoded);
+    }
+}
+
+test "public intake zero prefix refuses without inspecting later transaction envelopes or bindings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first = try fixture(a);
+    const second = try unhex(a, typed2_hex);
+    for ([_]bool{ false, true }) |is_response| {
+        var recorder: Recorder = .{};
+        var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+        defer intake.deinit();
+        intake.signature_budget = .{ .last_ms = 0, .milli_tokens = 0 };
+        if (is_response) {
+            try intake.announce(a, peer_a, try batchAnnouncement(a, &.{ first, second }), 0);
+            _ = intake.nextRequest(1, 0).?;
+            // The later hash is not requested. No record can be admitted, so
+            // the existing local refusal does not inspect or fault this suffix.
+            try std.testing.expectError(error.SignatureRateLimit, intake.response(a, peer_a, try batchWire(a, &.{ first, &.{0xc0} }, 1), .{ .mono_ms = 0 }));
+        } else {
+            const raw = try encode(a, @as([]const rlp.RawValue, &.{ .{ .value = first }, .{ .value = &.{0} } }));
+            try std.testing.expectError(error.SignatureRateLimit, intake.broadcast(a, peer_a, raw, .{ .mono_ms = 0 }));
+        }
+        try std.testing.expectEqual(0, recorder.count);
+        try std.testing.expectEqual(0, intake.stats.decoded);
+        try std.testing.expectEqual(0, intake.stats.signature_preserved_decoded);
+        try std.testing.expectEqual(0, intake.stats.signature_discarded_decoded);
+        try std.testing.expectEqual(2, intake.stats.signature_unprocessed_items);
+        for (intake.requests) |request| try std.testing.expect(request == null);
+    }
+}
+
+test "public intake limited broadcasts deduplicate without spending more signature tokens" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first = try fixture(a);
+    const second = try unhex(a, typed2_hex);
+    var recorder: Recorder = .{};
+    var intake: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = recorder.sink() };
+    defer intake.deinit();
+    intake.signature_budget = .{ .last_ms = 0, .milli_tokens = 1000 };
+    const raw = try batchWire(a, &.{ first, first, second, first }, null);
+    try std.testing.expectError(error.SignatureRateLimit, intake.broadcast(a, peer_a, raw, .{ .mono_ms = 0 }));
+    try std.testing.expectEqual(1, recorder.count);
+    try std.testing.expectEqual(1, intake.stats.decoded);
+    try std.testing.expectEqual(1, intake.stats.duplicate);
+    try std.testing.expectEqual(2, intake.stats.signature_unprocessed_items);
+    try std.testing.expectEqual(0, intake.signature_budget.milli_tokens);
+    try intake.broadcast(a, peer_a, raw, .{ .mono_ms = 32 });
+    try std.testing.expectEqual(2, recorder.count);
+    try std.testing.expectEqual(2, intake.stats.decoded);
+    try std.testing.expectEqual(4, intake.stats.duplicate);
+    try std.testing.expectEqual(7192, intake.signature_budget.milli_tokens);
+}
+
+const PrefixOwner = struct {
+    count: usize = 0,
+    bodies: [3][256]u8 = undefined,
+    lengths: [3]usize = undefined,
+    hashes: [3]Hash = undefined,
+    fn accept(ctx: *anyopaque, record: Record) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        std.debug.assert(self.count < self.bodies.len and record.bytes.len <= self.bodies[0].len);
+        @memcpy(self.bodies[self.count][0..record.bytes.len], record.bytes);
+        self.lengths[self.count] = record.bytes.len;
+        self.hashes[self.count] = record.hash;
+        self.count += 1;
+        return true;
+    }
+    fn sink(self: *@This()) Sink {
+        return .{ .context = self, .accept = accept };
+    }
+};
+
+fn prefixAllocationCase(allocator: std.mem.Allocator, is_response: bool) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var owner: PrefixOwner = .{};
+    var intake: Intake = .{ .allocator = allocator, .chain_id = 1, .sink = owner.sink() };
+    defer intake.deinit();
+    const txs = [_][]const u8{ try unhex(a, typed2_hex), try unhex(a, typed4_hex), try fixture(a) };
+    intake.signature_budget = .{ .last_ms = 0, .milli_tokens = 2000 };
+    const result = submitTestBatch(&intake, a, &txs, is_response);
+    // Check ownership/accounting on every injected failure, including failures
+    // during suffix structural parsing and before sink bookkeeping reservation.
+    try std.testing.expectEqual(owner.count, intake.stats.accepted);
+    try std.testing.expectEqual(owner.count, intake.seen.count());
+    if (intake.stats.signature_rate_drops != 0) {
+        try std.testing.expectEqual(owner.count, intake.stats.signature_preserved_decoded);
+        try std.testing.expectEqual(intake.stats.decoded, intake.stats.signature_preserved_decoded + intake.stats.signature_discarded_decoded);
+    }
+    for (owner.hashes[0..owner.count]) |tx_hash| try std.testing.expect(intake.seen.contains(tx_hash));
+    if (result) |_| {
+        return error.ExpectedSignatureLimit;
+    } else |err| if (err != error.SignatureRateLimit) return err;
+    try std.testing.expectEqual(2, owner.count);
+}
+
+test "public intake limited prefix ownership survives every allocation failure" {
+    // Arena growth may resize in place depending on allocator layout, which
+    // changes the number of allocation calls between failure-injection runs.
+    // Force growth through alloc/free so every allocation index is exercised
+    // deterministically, with the same leak-checking backing allocator.
+    var vtable = std.testing.allocator.vtable.*;
+    vtable.resize = std.mem.Allocator.noResize;
+    vtable.remap = std.mem.Allocator.noRemap;
+    const allocator: std.mem.Allocator = .{ .ptr = std.testing.allocator.ptr, .vtable = &vtable };
+    try std.testing.checkAllAllocationFailures(allocator, prefixAllocationCase, .{false});
+    try std.testing.checkAllAllocationFailures(allocator, prefixAllocationCase, .{true});
+}
+
+test "public intake prefix delivery OOM preserves admitted ownership and truthful counters" {
+    for ([_]bool{ false, true }) |is_response| {
+        for ([_]bool{ false, true }) |allow_first| {
+            var owner: PrefixOwner = .{};
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var intake: Intake = .{ .allocator = failing.allocator(), .chain_id = 1, .sink = owner.sink() };
+            defer intake.deinit();
+            {
+                var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer arena.deinit();
+                const a = arena.allocator();
+                const txs = [_][]const u8{ try fixture(a), try unhex(a, typed2_hex), try unhex(a, typed4_hex) };
+                if (is_response) {
+                    try intake.announce(a, peer_a, try batchAnnouncement(a, &txs), 0);
+                    _ = intake.nextRequest(1, 0).?;
+                }
+                if (allow_first) {
+                    try intake.seen.ensureTotalCapacity(intake.allocator, 1);
+                    for (0..intake.seen.capacity() - 1) |i| {
+                        var tx_hash: Hash = @splat(0xaa);
+                        std.mem.writeInt(u64, tx_hash[0..8], i, .big);
+                        intake.seen.putAssumeCapacity(tx_hash, 30000);
+                    }
+                }
+                failing.fail_index = failing.alloc_index;
+                failing.resize_fail_index = failing.resize_index;
+                intake.signature_budget = .{ .last_ms = 0, .milli_tokens = 2000 };
+                const raw = try batchWire(a, &txs, if (is_response) 1 else null);
+                const result = if (is_response) intake.response(a, peer_a, raw, .{ .mono_ms = 0 }) else intake.broadcast(a, peer_a, raw, .{ .mono_ms = 0 });
+                try std.testing.expectError(error.OutOfMemory, result);
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(@intFromBool(allow_first), owner.count);
+                try std.testing.expectEqual(owner.count, intake.stats.accepted);
+                try std.testing.expectEqual(owner.count, intake.stats.signature_preserved_decoded);
+                try std.testing.expectEqual(2 - owner.count, intake.stats.signature_discarded_decoded);
+                try std.testing.expectEqual(1, intake.stats.signature_unprocessed_items);
+                try std.testing.expectEqual(2, intake.stats.decoded);
+                try std.testing.expect(!intake.known(hash(txs[1]), 0));
+                try std.testing.expect(!intake.known(hash(txs[2]), 0));
+                if (allow_first) try std.testing.expect(intake.known(hash(txs[0]), 0));
+                for (intake.requests) |request| try std.testing.expect(request == null);
+            }
+            // Callback-owned bytes remain intact after all borrowed frame and
+            // decoded-transaction allocations have been released.
+            for (owner.hashes[0..owner.count], 0..) |tx_hash, i| {
+                try std.testing.expectEqual(tx_hash, hash(owner.bodies[i][0..owner.lengths[i]]));
+                try std.testing.expect(intake.known(tx_hash, 1));
+            }
+        }
     }
 }
 
