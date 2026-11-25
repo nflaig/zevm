@@ -39,7 +39,9 @@ pub const Driver = struct {
                 error.OutOfMemory => self.source.stats.bounded_drops += 1,
                 // Do not scan the inventory or drain outgoing work after
                 // refusal. response() may release that peer's one request,
-                // bounded by 16 request slots and 64 reserved hashes.
+                // bounded by 16 request slots and 64 reserved hashes. Structural
+                // errors found while preserving a prefix still fault intake and
+                // drain below; OOM also keeps its existing accounting/drain path.
                 error.FrameRateLimit, error.SignatureRateLimit => return,
                 error.ResponseByteLimit, error.AnnouncementByteLimit, error.TransactionByteLimit, error.WireItemLimit => {
                     // These are our admission limits, not consensus-invalid
@@ -74,11 +76,11 @@ pub const Driver = struct {
             outstanding += 1;
         };
         const s = self.source.stats;
-        log.info("public_intake_stats accepted={} decoded={} announced={} requested={} duplicate={} deferred_blobs={} unsupported={} invalid={} oversized={} stale={} outstanding={} pending={} capacity_drops={} sink_full={} timeouts={} frame_rate_drops={} signature_rate_drops={} peer_pending_drops={} backoff_skips={} frame_refused_requests={} signature_discarded_decoded={} signature_unprocessed_items={}", .{
-            s.accepted,                    s.decoded,          s.announced,            s.requested,          s.duplicate,                 s.deferred_blobs,         s.unsupported,
-            self.invalid,                  self.oversized,     self.stale,             outstanding,          self.source.pending.count(), s.bounded_drops,          s.sink_full,
-            s.expired_requests,            s.frame_rate_drops, s.signature_rate_drops, s.peer_pending_drops, s.backoff_skips,             s.frame_refused_requests, s.signature_discarded_decoded,
-            s.signature_unprocessed_items,
+        log.info("public_intake_stats accepted={} decoded={} announced={} requested={} duplicate={} deferred_blobs={} unsupported={} invalid={} oversized={} stale={} outstanding={} pending={} capacity_drops={} sink_full={} timeouts={} frame_rate_drops={} signature_rate_drops={} peer_pending_drops={} backoff_skips={} frame_refused_requests={} signature_discarded_decoded={} signature_unprocessed_items={} signature_preserved_decoded={}", .{
+            s.accepted,                    s.decoded,                     s.announced,            s.requested,          s.duplicate,                 s.deferred_blobs,         s.unsupported,
+            self.invalid,                  self.oversized,                self.stale,             outstanding,          self.source.pending.count(), s.bounded_drops,          s.sink_full,
+            s.expired_requests,            s.frame_rate_drops,            s.signature_rate_drops, s.peer_pending_drops, s.backoff_skips,             s.frame_refused_requests, s.signature_discarded_decoded,
+            s.signature_unprocessed_items, s.signature_preserved_decoded,
         });
         log.info("public_blob_intake_stats requested={} queued={} ready={} failed={} sink_full={} inventory_drops={} request_rate_drops={} frame_rate_drops={}", .{
             s.blob_requested, s.blob_queued, s.blob_ready, s.blob_failed, s.blob_sink_full, s.blob_inventory_drops, s.blob_request_rate_drops, s.blob_frame_rate_drops,
@@ -274,6 +276,155 @@ test "public intake driver drops refused responses without draining or penalizin
         try std.testing.expectEqual(0, driver.invalid);
         try std.testing.expectEqual(16, provider.peers[0].info.load(.acquire).offset);
         try std.testing.expectEqual(16, provider.peers[1].info.load(.acquire).offset);
+    }
+}
+
+test "public intake driver preserves limited prefixes without peer faults and retries the alternate" {
+    const rlp = @import("rlp");
+    const hash = @import("../evm/crypto/hash.zig").keccak256;
+    const Wire = struct {
+        fn encode(a: std.mem.Allocator, value: anytype) ![]u8 {
+            var bytes = std.array_list.Managed(u8).init(a);
+            errdefer bytes.deinit();
+            try rlp.serialize(@TypeOf(value), a, value, &bytes);
+            return bytes.toOwnedSlice();
+        }
+        fn frame(a: std.mem.Allocator, txs: []const []const u8, id: ?u64) ![]u8 {
+            var items: [2]rlp.RawValue = undefined;
+            for (txs, 0..) |bytes, i| items[i] = .{ .value = if (bytes[0] >= 0xc0) bytes else try encode(a, bytes) };
+            const slice: []const rlp.RawValue = items[0..txs.len];
+            return if (id) |request| encode(a, .{ request, slice }) else encode(a, slice);
+        }
+    };
+    const Receiver = struct {
+        count: usize = 0,
+        full: bool,
+        fn accept(ctx: *anyopaque, _: intake.Record) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.full) return false;
+            self.count += 1;
+            return true;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first_hex = "f860800a830186a0941257767465d91292f29c15df1e25e063daed8b59808026a0a7eaaef383a6b7fc7192d2adbdaf0331b4d82f352f89956ce8be97e9fe5d0590a01a5ae493968f37d3462cdca0d30f0e3bb4799025e48682bcb1eefe152c847d52";
+    const second_hex = "02f8630180020a830186a09411111111111111111111111111111111111111118080c080a05f03a658ba564255214fbb83eb0145422acd9b711cd72f241491730e9fecae78a07a6381b231454cfa93bfe68dfde6f7eaa3dfb46a0b1871288c6942a49fbfe63f";
+    const first = try std.fmt.hexToBytes(try a.alloc(u8, first_hex.len / 2), first_hex);
+    const second = try std.fmt.hexToBytes(try a.alloc(u8, second_hex.len / 2), second_hex);
+    const peer_a: intake.Peer = .{ .index = 0, .epoch = 1 };
+    const peer_b: intake.Peer = .{ .index = 1, .epoch = 1 };
+    const announcement = try Wire.encode(a, .{ @as([]const u8, &.{ 0, 2 }), @as([]const u32, &.{ @intCast(first.len), @intCast(second.len) }), @as([]const intake.Hash, &.{ hash(first), hash(second) }) });
+    for ([_]bool{ false, true }) |is_response| {
+        for ([_]bool{ false, true }) |full| {
+            var provider = try eth.Provider.init(a);
+            provider.peers[0].info.store(.{ .epoch = 1, .offset = 16 }, .release);
+            provider.peers[1].info.store(.{ .epoch = 1, .offset = 16 }, .release);
+            var receiver: Receiver = .{ .full = full };
+            var source: Intake = .{ .allocator = std.testing.allocator, .chain_id = 1, .sink = .{ .context = &receiver, .accept = Receiver.accept } };
+            defer source.deinit();
+            var driver: Driver = .{ .source = &source, .provider = &provider };
+            try source.announce(a, peer_a, announcement, 0);
+            try source.announce(a, peer_b, announcement, 0);
+            if (is_response) _ = source.nextRequest(1, 0).?;
+            source.signature_budget = .{ .last_ms = 0, .milli_tokens = 1000 };
+            const payload = try Wire.frame(a, &.{ first, second }, if (is_response) 1 else null);
+            driver.handle(a, .{
+                .msg = if (is_response) .{ .pooled_transactions = .{ .value = payload } } else .{ .transactions = .{ .value = payload } },
+                .read = .{ .peer = .{ .peer_index = 0, .peer_epoch = 1 }, .id = if (is_response) 10 else 2, .payload = payload },
+            }, .{ .mono_ms = 0 });
+            // A mistaken drain would try to send the eligible alternate request
+            // through this provider's deliberately absent server.
+            try std.testing.expectEqual(@intFromBool(!full), receiver.count);
+            try std.testing.expectEqual(@intFromBool(!full), source.stats.signature_preserved_decoded);
+            try std.testing.expectEqual(@intFromBool(full), source.stats.signature_discarded_decoded);
+            try std.testing.expectEqual(@intFromBool(full), source.stats.sink_full);
+            try std.testing.expectEqual(1, source.stats.signature_unprocessed_items);
+            try std.testing.expectEqual(0, driver.invalid);
+            try std.testing.expectEqual(0, driver.oversized);
+            try std.testing.expectEqual(0, driver.stale);
+            try std.testing.expectEqual(0, source.stats.bounded_drops);
+            try std.testing.expectEqual(0, source.peer_work[0].timeouts);
+            try std.testing.expectEqual(0, source.peer_work[0].retry_after_ms);
+            if (!is_response) source.disconnect(peer_a);
+            const retry = source.nextRequest(2, 32).?;
+            try std.testing.expectEqual(peer_b, retry.peer);
+            try std.testing.expectEqual(1 + @as(usize, @intFromBool(full)), retry.count);
+            var retry_items: [2][]const u8 = undefined;
+            for (retry.hashes[0..retry.count], 0..) |tx_hash, i| retry_items[i] = if (std.mem.eql(u8, &tx_hash, &hash(first))) first else second;
+            receiver.full = false;
+            const retry_payload = try Wire.frame(a, retry_items[0..retry.count], 2);
+            driver.handle(a, .{
+                .msg = .{ .pooled_transactions = .{ .value = retry_payload } },
+                .read = .{ .peer = .{ .peer_index = 1, .peer_epoch = 1 }, .id = 10, .payload = retry_payload },
+            }, .{ .mono_ms = 33 });
+            try std.testing.expectEqual(2, receiver.count);
+            try std.testing.expectEqual(2, source.stats.accepted);
+            try std.testing.expectEqual(0, source.pending.count());
+            for (source.requests) |request| try std.testing.expect(request == null);
+            source.expire(2500);
+            try std.testing.expectEqual(0, source.stats.expired_requests);
+            try std.testing.expectEqual(0, driver.invalid);
+            try std.testing.expectEqual(16, provider.peers[0].info.load(.acquire).offset);
+            try std.testing.expectEqual(16, provider.peers[1].info.load(.acquire).offset);
+        }
+    }
+    // The same bad broadcast faults intake only when verification gets far
+    // enough to inspect the malformed suffix. A disconnected alternate makes
+    // drain observable through requested counters without needing a server.
+    for (0..4) |case| {
+        const oom = case == 3;
+        const tokens: u64 = if (oom) 1 else case;
+        var provider = try eth.Provider.init(a);
+        provider.peers[0].info.store(.{ .epoch = 1, .offset = 16 }, .release);
+        provider.peers[1].info.store(.{ .epoch = 1, .offset = 0 }, .release);
+        var receiver: Receiver = .{ .full = false };
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var source: Intake = .{ .allocator = failing.allocator(), .chain_id = 1, .sink = .{ .context = &receiver, .accept = Receiver.accept } };
+        defer source.deinit();
+        var driver: Driver = .{ .source = &source, .provider = &provider };
+        const unrelated = try Wire.encode(a, .{ @as([]const u8, &.{2}), @as([]const u32, &.{@intCast(second.len)}), @as([]const intake.Hash, &.{hash(second)}) });
+        try source.announce(a, peer_a, unrelated, 0);
+        _ = source.nextRequest(99, 0).?;
+        const alternate = try Wire.encode(a, .{ @as([]const u8, &.{0}), @as([]const u32, &.{@intCast(first.len)}), @as([]const intake.Hash, &.{hash(first)}) });
+        try source.announce(a, peer_b, alternate, 0);
+        if (oom) {
+            failing.fail_index = failing.alloc_index;
+            failing.resize_fail_index = failing.resize_index;
+        }
+        source.signature_budget = .{ .last_ms = 0, .milli_tokens = tokens * 1000 };
+        const payload = try Wire.frame(a, &.{ first, if (oom) second else &.{0xc0} }, null);
+        driver.handle(a, .{
+            .msg = .{ .transactions = .{ .value = payload } },
+            .read = .{ .peer = .{ .peer_index = 0, .peer_epoch = 1 }, .id = 2, .payload = payload },
+        }, .{ .mono_ms = 0 });
+        const invalid = case == 1 or case == 2;
+        try std.testing.expectEqual(@intFromBool(invalid), driver.invalid);
+        try std.testing.expectEqual(@intFromBool(oom), source.stats.bounded_drops);
+        try std.testing.expectEqual(0, receiver.count);
+        try std.testing.expectEqual(0, source.stats.accepted);
+        try std.testing.expectEqual(@intFromBool(tokens != 0), source.stats.decoded);
+        try std.testing.expectEqual(@intFromBool(case != 2), source.stats.signature_rate_drops);
+        try std.testing.expectEqual(@intFromBool(tokens == 1), source.stats.signature_discarded_decoded);
+        try std.testing.expectEqual(1 + @as(u64, @intFromBool(case != 0)), source.stats.requested);
+        var unrelated_outstanding = false;
+        for (source.requests) |optional| if (optional) |request| {
+            try std.testing.expectEqual(99, request.id);
+            unrelated_outstanding = true;
+        };
+        try std.testing.expectEqual(!invalid, unrelated_outstanding);
+        if (case == 0) {
+            // No drain: the alternate is still immediately eligible.
+            try std.testing.expectEqual(peer_b, source.nextRequest(100, 0).?.peer);
+        } else {
+            // The ordinary error/OOM drain tried and released the disconnected
+            // alternate; it did not affect the shared live sync connection.
+            try std.testing.expect(source.nextRequest(100, 0) == null);
+        }
+        try std.testing.expectEqual(0, source.stats.expired_requests);
+        try std.testing.expectEqual(16, provider.peers[0].info.load(.acquire).offset);
+        if (oom) try std.testing.expect(failing.has_induced_failure);
     }
 }
 

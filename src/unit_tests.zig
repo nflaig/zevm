@@ -25,6 +25,7 @@ comptime {
     _ = @import("node/downloader.zig");
     _ = @import("node/public_intake.zig");
     _ = @import("node/public_intake_peer.zig");
+    _ = @import("prefix_cost_test.zig");
     _ = @import("node/engine.zig");
     _ = @import("rpc/jsonrpc.zig");
     _ = @import("rpc/http.zig");
