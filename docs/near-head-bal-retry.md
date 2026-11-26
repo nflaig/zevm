@@ -35,16 +35,22 @@ The server copies the wire bytes into its bounded write queue; failed enqueue
 leaves no alias. The alias also counts against the alternate peer's request limit.
 
 Downloader event dispatch is single-owner and cancellation protected. The first
-matching original or alternate reply claims the single inflight node and transfers
+matching nonempty reply claims the single inflight node and transfers
 it to validation; late duplicates and the losing reply cannot start another
-validation. An already-received original reply remains eligible. A timeout clears
+validation. An already-received original reply remains eligible. An unavailable response (no entries or the protocol
+`0x80` missing-BAL sentinel) keeps the other identity eligible: an empty alternate retires only its alias; an
+empty original promotes the alternate on the same node with the original deadline.
+Neither unavailable response enters validation while the other identity remains
+live. The valid `0xc0` empty BAL still enters normal commitment validation. A timeout clears
 the alias before the normal reissue. Exact original identity binding prevents an
 old alternate reply from claiming a later retry for the same block. Requests
 already handed to asynchronous validation cannot acquire a hedge. This neither
 adds a second request-pool owner nor extends the original timeout.
 
 The extra attempt applies no synthetic RTT penalty and disconnects no peer.
-Generic timeout handling remains the fallback; both peers can still be slow.
+Generic timeout handling remains the fallback; both peers can still be slow. A
+nonempty alternate still needs full validation: if it is invalid, ordinary reissue
+applies. This is not a race of independently validated responses.
 BAL decoding, commitment matching, authenticated trie updates, root checks and
 atomic checkpoint publication are unchanged. No state is accepted because a
 retry succeeded, and the retry does not access a second database writer.
