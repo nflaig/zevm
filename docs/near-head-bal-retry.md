@@ -47,7 +47,9 @@ old alternate reply from claiming a later retry for the same block. Requests
 already handed to asynchronous validation cannot acquire a hedge. This neither
 adds a second request-pool owner nor extends the original timeout.
 
-The extra attempt applies no synthetic RTT penalty and disconnects no peer.
+The hedge itself applies no synthetic RTT penalty or disconnect. A reply that
+claims the request, including the remaining alternate after promotion, follows
+ordinary validation and peer policy.
 Generic timeout handling remains the fallback; both peers can still be slow. A
 nonempty alternate still needs full validation: if it is invalid, ordinary reissue
 applies. This is not a race of independently validated responses.
@@ -68,3 +70,13 @@ and identical authenticated checkpoint state with/without retry in Debug and
 Safe. Production promotion additionally requires the normal native owner handoff
 and a bounded Plataberget observation before Sepolia. A quiet observation alone
 does not prove that a slow-peer retry was exercised or that win rate improved.
+
+## Follow-up observations
+
+A silent original rescued by the alternate does not get a completed RTT sample
+or timeout penalty. Use the original peer identity in retry logs to detect
+repeated rescues before changing peer selection or scoring. The exhaustion
+counter currently counts timeouts with a live alias; a timeout of a promoted
+alternate instead appears in the generic ETH timeout counter. State-heal duration
+and missed-slot coverage remain the primary rollout gates. No latency or winning
+share guarantee follows from these component tests.

@@ -4223,6 +4223,7 @@ const BalRetryTestFixture = struct {
         self.server = undefined;
         self.server.allocator = allocator;
         self.server.io = io;
+        self.server.stats = .{};
         self.server.write_queue_buf = &self.writes;
         self.server.write_queue = .init(&self.writes);
         self.write_slots = @splat(.init(32));
@@ -4960,13 +4961,14 @@ test "near-head BAL retry production heal and timeout driver dispatch a bounded 
     // deadline and real one-second owner callback are preserved.
     f.request.sent_at = std.Io.Clock.now(.real, std.testing.io).addDuration(.fromSeconds(-2));
     const original = f.request.*;
-    try f.downloader.checkEthRequestTimeouts();
+    try f.downloader.handleTick();
     // A production BAL request does not initialize unused SNAP-only fields.
     // Compare every field that defines its wire identity and ownership.
     try std.testing.expectEqualDeep(.{ original.id, original.peer, original.msg, original.sent_at, original.deadline }, .{ f.request.id, f.request.peer, f.request.msg, f.request.sent_at, f.request.deadline });
     try std.testing.expectEqual(1, f.downloader.inflight_eth_requests.inner.len());
     try std.testing.expect(f.downloader.pending_eth_requests.empty());
     try std.testing.expect(f.downloader.validating_eth_requests.empty());
+    try std.testing.expect(f.downloader.state_heal.?.bal_hedge != null);
     const hedge = f.downloader.state_heal.?.bal_hedge.?;
     try std.testing.expect(!std.meta.eql(original.peer, hedge.peer));
     const retry_write = (try f.takeWrite()).?;
@@ -4977,7 +4979,7 @@ test "near-head BAL retry production heal and timeout driver dispatch a bounded 
     defer arena.allocator().free(retry_expected);
     try std.testing.expectEqual(hedge.peer, retry_write.peer_id);
     try std.testing.expectEqualSlices(u8, retry_expected[0..retry_expected_len], retry_write.payload[0..retry_write.payload_len]);
-    try f.downloader.checkEthRequestTimeouts();
+    try f.downloader.handleTick();
     try std.testing.expectEqual(null, try f.takeWrite());
     try std.testing.expect(try f.deliver(hedge.peer, hedge.id, &.{f.bal_bytes}));
     try f.finishValidation();
@@ -5041,4 +5043,53 @@ test "near-head BAL retry provider rejects malformed frames without consuming ei
     try std.testing.expect(try f.deliver(hedge.peer, hedge.id, &.{f.bal_bytes}));
     try f.finishValidation();
     try f.expectChildState(old);
+}
+
+test "near-head BAL retry nonempty invalid alternate validates once then uses ordinary recovery" {
+    inline for (.{ true, false }) |decode_error| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var dir = std.testing.tmpDir(.{});
+        defer dir.cleanup();
+        try dir.dir.createDir(std.testing.io, "db", .default_dir);
+        var path: [1024]u8 = undefined;
+        const length = try dir.dir.realPathFile(std.testing.io, "db", &path);
+        var f: BalRetryTestFixture = undefined;
+        try f.init(arena.allocator(), path[0..length]);
+        defer f.deinit();
+        const old = try f.snapshots.acquire(f.parent.hash(), f.parent.state_root);
+        defer old.deinit();
+        const original = f.request.*;
+        f.tick(std.time.ns_per_s);
+        try std.testing.expectEqual(1, try f.drainWrites());
+        const hedge = f.downloader.state_heal.?.bal_hedge.?;
+        // Both are non-unavailable RLP entries. 0x01 cannot decode as a BAL
+        // list; 0xc0 decodes but does not match this nonempty block's commitment.
+        try std.testing.expect(try f.deliver(hedge.peer, hedge.id, if (decode_error) &.{&.{0x01}} else &.{&.{0xc0}}));
+        try std.testing.expectEqual(original.deadline, f.request.deadline);
+        try std.testing.expect(f.downloader.inflight_eth_requests.empty());
+        try std.testing.expectEqual(1, f.downloader.validating_eth_requests.inner.len());
+        try std.testing.expectEqual(null, f.downloader.state_heal.?.bal_hedge);
+        try std.testing.expect(!try f.deliver(original.peer, original.id, &.{f.bal_bytes}));
+        try f.finishValidation();
+        try std.testing.expectError(error.StateViewUnavailable, f.snapshots.acquire(f.child.hash(), f.child.state_root));
+        try std.testing.expectEqual(null, try f.db.readAccount(old.txn, types.keccakOfU160(1)));
+        try std.testing.expectEqual(16, f.eth_provider.peers[0].info.load(.acquire).offset);
+        try std.testing.expectEqual(@as(usize, if (decode_error) 0 else 16), f.eth_provider.peers[1].info.load(.acquire).offset);
+        try std.testing.expectEqual(@as(usize, 0), f.peer_slots[0].disconnect_epoch.load(.acquire));
+        try std.testing.expectEqual(@as(usize, if (decode_error) BalRetryTestFixture.alternate.peer_epoch + 1 else 0), f.peer_slots[1].disconnect_epoch.load(.acquire));
+        try std.testing.expectEqual(f.child.hash(), f.downloader.state_heal.?.bal_early_retry_hash.?);
+        try std.testing.expect(f.request.id != original.id and f.request.id != hedge.id);
+        try std.testing.expectEqual(1, try f.drainWrites()); // ordinary validation-failure reissue
+        const reissued = f.request.*;
+        f.downloader.retryNearHeadBal(&f.eth_provider, reissued.sent_at.addDuration(.fromSeconds(2)));
+        try f.expectOriginal(reissued);
+        try std.testing.expectEqual(null, try f.takeWrite());
+        try std.testing.expect(!try f.deliver(original.peer, original.id, &.{f.bal_bytes}));
+        try std.testing.expect(!try f.deliver(hedge.peer, hedge.id, &.{f.bal_bytes}));
+        try std.testing.expect(try f.deliver(reissued.peer, reissued.id, &.{f.bal_bytes}));
+        try f.finishValidation();
+        try f.expectChildState(old);
+        try std.testing.expectEqual(max_inflight_requests, f.downloader.free_eth_requests.inner.len());
+    }
 }
