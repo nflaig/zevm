@@ -681,6 +681,9 @@ test "native cache entry and byte limits preserve uncached fallbacks" {
     try std.testing.expectEqual(@as(usize, 0), stats.retained_bytes);
     try std.testing.expectEqual(@as(u64, 0), stats.hits);
     try std.testing.expect(stats.authorized_reads > 0 and stats.fallback_reads > 0 and stats.capacity_misses > 0);
+    // The first storage read authenticates its owner. Missing child edges still
+    // walk the storage trie, but a full map must not repeat the account walk.
+    try std.testing.expectEqual(@as(u64, 1), stats.owner_reads);
     // Authorization-only with room for all edges skips root walks without
     // retaining any RLP. This is a separate benchmark variant from byte hits.
     var authorized = try reader.acquire(parent(header));
@@ -737,6 +740,106 @@ test "native authorized cache reads still reject missing and corrupt child preim
     _ = try intact.readNode(alloc, address, child.path, child.expected_hash);
 }
 
+test "native saturated owner roots remain exact across sibling state and absent owners" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const keys = cacheKeys();
+    const first = try f.writeStorage(1, 42, null, &keys, &.{ 1, 2, 3 });
+    var eth = native.Eth.init(&f.store);
+    var views: native.Snapshots = .{ .io = io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var reader: native.Reader = .{ .eth = &eth, .snapshots = &views };
+    defer reader.deinit();
+    var control = try reader.acquire(parent(first));
+    defer control.deinit();
+    var old = try reader.acquire(parent(first));
+    defer old.deinit();
+    try old.enableNodeCache(a, .{ .max_entries = 2, .max_bytes = 0 });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const queries = try nodeQueries(alloc, &control, address);
+    const child = queries[1];
+    const expected = try control.readNode(alloc, address, child.path, child.expected_hash);
+    _ = try old.readAccount(alloc, address);
+    try std.testing.expectEqual(@as(usize, 2), old.nodeCacheStats().entries);
+    const owned = try old.readNode(alloc, address, child.path, child.expected_hash);
+    try std.testing.expectEqualSlices(u8, expected, owned);
+    try std.testing.expectEqual(@as(u64, 1), old.nodeCacheStats().fallback_reads);
+    try std.testing.expectEqual(@as(u64, 0), old.nodeCacheStats().owner_reads);
+
+    const sibling = try f.writeStorage(1, 90, null, &keys, &.{ 8, 9, 10 });
+    try views.publish(a);
+    var current = try reader.acquire(parent(sibling));
+    defer current.deinit();
+    try current.enableNodeCache(a, .{ .max_entries = 2, .max_bytes = 0 });
+    _ = try current.readAccount(alloc, address);
+    try std.testing.expectError(error.TrieNodeHashMismatch, current.readNode(alloc, address, child.path, child.expected_hash));
+    try std.testing.expectEqual(@as(u64, 0), current.nodeCacheStats().owner_reads);
+    try std.testing.expectEqualSlices(u8, expected, try old.readNode(alloc, address, child.path, child.expected_hash));
+    try std.testing.expectEqual(@as(u64, 0), old.nodeCacheStats().owner_reads);
+    try std.testing.expectError(error.TrieNodeNotHashReference, old.readNode(alloc, 0xffff, &.{}, queries[0].expected_hash));
+    try std.testing.expectEqual(@as(u64, 1), old.nodeCacheStats().owner_reads);
+
+    // A cache too small to hold the owner root must keep authenticating it.
+    var missing_root = try reader.acquire(parent(sibling));
+    defer missing_root.deinit();
+    try missing_root.enableNodeCache(a, .{ .max_entries = 1, .max_bytes = 0 });
+    const root = (try current.readAccount(alloc, address)).storage_hash;
+    for (0..2) |_| _ = try missing_root.readNode(alloc, address, &.{}, root);
+    try std.testing.expectEqual(@as(u64, 2), missing_root.nodeCacheStats().owner_reads);
+    old.deinit();
+    try std.testing.expectEqual(child.expected_hash, @import("evm/crypto/hash.zig").keccak256(owned));
+    try std.testing.expectError(error.NativeStateLeaseClosed, old.readNode(alloc, address, child.path, child.expected_hash));
+}
+
+test "native saturated owner root fallback rejects unreachable corrupt and missing nodes" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const keys = cacheKeys();
+    const header = try f.writeStorage(1, 42, null, &keys, &.{ 1, 2, 3 });
+    var eth = native.Eth.init(&f.store);
+    var views: native.Snapshots = .{ .io = io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var reader: native.Reader = .{ .eth = &eth, .snapshots = &views };
+    defer reader.deinit();
+    var intact = try reader.acquire(parent(header));
+    defer intact.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const queries = try nodeQueries(alloc, &intact, address);
+    const child = queries[1];
+    const root = queries[0];
+    const bytes = try intact.readNode(alloc, address, root.path, root.expected_hash);
+    const corrupt = try f.store.transaction_rw();
+    try eth.putStorageTrieNode(corrupt, types.keccakOfU160(address), child.path, &.{0xc0});
+    try eth.putStorageTrieNode(corrupt, types.keccakOfU160(address), &.{15}, bytes);
+    try corrupt.commit();
+    try views.publish(a);
+    var bad = try reader.acquire(parent(header));
+    defer bad.deinit();
+    try bad.enableNodeCache(a, .{ .max_entries = 2, .max_bytes = 0 });
+    _ = try bad.readAccount(alloc, address);
+    try std.testing.expectError(error.TrieNodePathUnavailable, bad.readNode(alloc, address, &.{15}, root.expected_hash));
+    try std.testing.expectError(error.StateRootMismatch, bad.readNode(alloc, address, child.path, child.expected_hash));
+    try std.testing.expectEqual(@as(u64, 0), bad.nodeCacheStats().owner_reads);
+    const missing = try f.store.transaction_rw();
+    try eth.deleteStorageTrieNode(missing, types.keccakOfU160(address), child.path);
+    try f.store.table(missing, .storage).drop(false);
+    try missing.commit();
+    try views.publish(a);
+    var absent = try reader.acquire(parent(header));
+    defer absent.deinit();
+    try absent.enableNodeCache(a, .{ .max_entries = 2, .max_bytes = 0 });
+    _ = try absent.readAccount(alloc, address);
+    try std.testing.expectError(error.SubTrieNotAvailable, absent.readNode(alloc, address, child.path, child.expected_hash));
+    try std.testing.expectEqual(@as(u64, 0), absent.nodeCacheStats().owner_reads);
+    _ = try intact.readNode(alloc, address, child.path, child.expected_hash);
+}
+
 test "native node cache cancellation precedes hits and authorization publication" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -788,6 +891,63 @@ test "native node cache cancellation precedes hits and authorization publication
     try std.testing.expectEqualSlices(u8, bytes, try lease.readNode(alloc, null, &.{}, header.state_root));
 }
 
+test "native saturated owner fallback cancellation keeps lease and authorization usable" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const keys = cacheKeys();
+    const header = try f.writeStorage(1, 42, null, &keys, &.{ 1, 2, 3 });
+    var eth = native.Eth.init(&f.store);
+    var views: native.Snapshots = .{ .io = io, .store = &f.store };
+    defer views.deinit();
+    try views.publish(a);
+    var reader: native.Reader = .{ .eth = &eth, .snapshots = &views };
+    defer reader.deinit();
+    var lease = try reader.acquire(parent(header));
+    defer lease.deinit();
+    var control = try reader.acquire(parent(header));
+    defer control.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const child = (try nodeQueries(alloc, &control, address))[1];
+    try lease.enableNodeCache(a, .{ .max_entries = 2, .max_bytes = 0 });
+    _ = try lease.readAccount(alloc, address);
+    const before = lease.nodeCacheStats();
+    const Cancel = struct {
+        var calls: usize = 0;
+        fn check(_: ?*anyopaque) std.Io.Cancelable!void {
+            calls += 1;
+            if (calls == 2) return error.Canceled;
+        }
+    };
+    var vtable = io.vtable.*;
+    vtable.checkCancel = Cancel.check;
+    views.io = .{ .userdata = io.userdata, .vtable = &vtable };
+    defer views.io = io;
+    Cancel.calls = 0;
+    try std.testing.expectError(error.Canceled, lease.readNode(alloc, address, child.path, child.expected_hash));
+    try std.testing.expectEqual(before.entries, lease.nodeCacheStats().entries);
+    try std.testing.expectEqual(before.retained_bytes, lease.nodeCacheStats().retained_bytes);
+    try std.testing.expectEqual(@as(u64, 0), lease.nodeCacheStats().owner_reads);
+    views.io = io;
+    try std.testing.expectEqualSlices(u8, try control.readNode(alloc, address, child.path, child.expected_hash), try lease.readNode(alloc, address, child.path, child.expected_hash));
+}
+
+fn saturatedAllocationRead(allocator: std.mem.Allocator, reader: *native.Reader, p: native.Parent, child: native.NodeQuery) !void {
+    var lease = try reader.acquire(p);
+    defer lease.deinit();
+    try lease.enableNodeCache(allocator, .{ .max_entries = 2, .max_bytes = 0 });
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    _ = try lease.readAccount(alloc, address);
+    const bytes = try lease.readNode(alloc, address, child.path, child.expected_hash);
+    try std.testing.expectEqual(child.expected_hash, @import("evm/crypto/hash.zig").keccak256(bytes));
+    try std.testing.expectEqual(@as(u64, 0), lease.nodeCacheStats().owner_reads);
+    try std.testing.expectEqual(@as(usize, 2), lease.nodeCacheStats().entries);
+    try std.testing.expectEqualSlices(u8, bytes, try lease.readNode(alloc, address, child.path, child.expected_hash));
+}
+
 fn cacheAllocationRead(allocator: std.mem.Allocator, reader: *native.Reader, p: native.Parent) !void {
     var lease = try reader.acquire(p);
     defer lease.deinit();
@@ -819,6 +979,15 @@ test "native cache allocation failures release admission metadata and preimages"
     try std.testing.checkAllAllocationFailures(deterministic, cacheAllocationRead, .{ &reader, parent(header) });
     try std.testing.expectEqual(@as(usize, 0), reader.active_leases);
     try cacheAllocationRead(a, &reader, parent(header));
+    try std.testing.expectEqual(@as(usize, 0), reader.active_leases);
+    var control = try reader.acquire(parent(header));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const child = (try nodeQueries(arena.allocator(), &control, address))[1];
+    control.deinit();
+    try std.testing.checkAllAllocationFailures(deterministic, saturatedAllocationRead, .{ &reader, parent(header), child });
+    try std.testing.expectEqual(@as(usize, 0), reader.active_leases);
+    try saturatedAllocationRead(a, &reader, parent(header), child);
     try std.testing.expectEqual(@as(usize, 0), reader.active_leases);
 }
 

@@ -1,0 +1,3325 @@
+{
+  "schemaVersion": 1,
+  "producerBase": "63ab43c84ffa3fb430f386364a35d3607b3887e6",
+  "deployedProducer": "1fe7a0efb10bb8534346b5eb4c8aab3cdf9b0dd2",
+  "baseTreesIdentical": "5132007deb40226d3567ab1b88f5f4e5c0c8e1cd",
+  "consumerBase": "6c64b11ec8d277de1cb5b236c5320aa2b9309d13",
+  "localFixtureCommit": "d416a1c009837823075e527e8811db15b0b2fbdb",
+  "replayPatchSha256": "477f3838bc2ba5c29640e7ac0bae1802d574daa4a70f01bca7afa311649610e8",
+  "compilerVersion": "0.17.0",
+  "compilerSha256": "7c61539af19fa4082c94848f1c2b57b89e76dc6cfd5bd4c57764c3caf8f82272",
+  "builds": [
+    {
+      "arm": "control",
+      "binarySha256": "4bdf0275190fa68504f6700728f5e831c3a94a91f2300afd00183119662f6d90",
+      "nativeStateSourceSha256": "b44a1ad13f38955674dea967137afbe01383ed46af05825b5256ffbfd3fbd2b5",
+      "benchmarkSourceSha256": "7912ff3f25bd2f05ca254d648d8e8bcb2b88c276f74e427d823c04affd8a3e0b",
+      "logSha256": "4a0eafd417aa566c68912ff6ea8607055d65b9fef15be65fdbb10bbe76db6cdf",
+      "mode": "safe",
+      "target": "x86_64-linux-gnu.2.35",
+      "cpu": "baseline+cx16"
+    },
+    {
+      "arm": "treatment",
+      "binarySha256": "04d95e25f60030787175abf5bf0b3c32cf157333cebec39892c83b2764e38698",
+      "nativeStateSourceSha256": "d92defcfa2cb4527d591c9a48e11ae553d744a9565fe01c903964dc776c2046e",
+      "benchmarkSourceSha256": "7912ff3f25bd2f05ca254d648d8e8bcb2b88c276f74e427d823c04affd8a3e0b",
+      "logSha256": "f2ed48df27a9223df275ebaf5595d8d4e74ed9d67bee485093f4521ae6daf013",
+      "mode": "safe",
+      "target": "x86_64-linux-gnu.2.35",
+      "cpu": "baseline+cx16"
+    }
+  ],
+  "tests": [
+    {
+      "mode": "safe",
+      "passed": 57,
+      "exitCode": 0,
+      "sources": {
+        "src/native_state.zig": "d92defcfa2cb4527d591c9a48e11ae553d744a9565fe01c903964dc776c2046e",
+        "src/native_state_tests.zig": "8b0f5be7b5dcea6cb109727999b419dacf53e6df5a9e30d6cc70fcc08e89d193"
+      },
+      "logSha256": "de43cea9f2b51d02b2256517b77c9297cf3b72e6b656461eabf645ad4404e20c"
+    },
+    {
+      "mode": "debug",
+      "passed": 57,
+      "exitCode": 0,
+      "sources": {
+        "src/native_state.zig": "d92defcfa2cb4527d591c9a48e11ae553d744a9565fe01c903964dc776c2046e",
+        "src/native_state_tests.zig": "8b0f5be7b5dcea6cb109727999b419dacf53e6df5a9e30d6cc70fcc08e89d193"
+      },
+      "logSha256": "2455261696a8b078c6ed78857bc094dcd369a1f91dc4ff78c564ea56acb70b66"
+    }
+  ],
+  "negativeControl": {
+    "expectedFailures": 5,
+    "otherPassed": 52,
+    "allFailuresAtOwnerReads": true,
+    "failingTests": [
+      "native_state_tests.test.native cache entry and byte limits preserve uncached fallbacks",
+      "native_state_tests.test.native saturated owner roots remain exact across sibling state and absent owners",
+      "native_state_tests.test.native saturated owner root fallback rejects unreachable corrupt and missing nodes",
+      "native_state_tests.test.native saturated owner fallback cancellation keeps lease and authorization usable",
+      "native_state_tests.test.native cache allocation failures release admission metadata and preimages"
+    ],
+    "logSha256": "80c6b150e19d7e7e9c211dbf5f87548f1c912cd5943affedc613d228cb874e52"
+  },
+  "reviews": [
+    {
+      "model": "claude-opus-5-5",
+      "effort": "xhigh",
+      "tools": [],
+      "exitCode": 0,
+      "packetSha256": "84480c24301505f89dba5557114d9bf18e75272f9e81da0f395b82c83983b456"
+    },
+    {
+      "model": "claude-opus-5-5",
+      "effort": "xhigh",
+      "tools": [],
+      "exitCode": 0,
+      "packetSha256": "08293ee3672c08b2c00cec2eb1df9a22b4ed38c2f5f6f6b6cf1effa4141c5985"
+    }
+  ],
+  "reviewRecordSha256": "356939e4393d1b5d2a560bf72461c58e8948bb1c32884174ef40a07ff517e3d4",
+  "performance": {
+    "scriptSha256": "e892362d1dc2f346e4ff0bfc27c1f499cc24e2c8105669cb54aeb81384d165a8",
+    "blocks": [
+      {
+        "index": 0,
+        "order": "ABBA",
+        "manifestSha256": "fff5f6ce56113b2a72df10495939d14b0d84da7128765f381dbc2430550fd296",
+        "startedUtc": "2026-11-27T09:53:23.797523+00:00",
+        "finishedUtc": "2026-11-27T10:00:50.686578+00:00",
+        "runs": [
+          {
+            "index": 0,
+            "arm": "control",
+            "metrics": {
+              "fixed_work": {
+                "inLoopProcessCpuMs": 22172.867649,
+                "inLoopElapsedMs": 22248.344348,
+                "sealCpuPerSealMs": 160.4559198730769,
+                "sealWallPerSealMs": 160.9990305076923,
+                "stateRootWallMs": 20282.6162945,
+                "lateQueueMs": 820.712975,
+                "lateReceiveToPrimaryPublicationMs": 1459.3837565,
+                "lateAppendToPrimaryPublicationMs": 637.4390075,
+                "nodeReads": 1244212,
+                "fallbackReads": 224148,
+                "ownerReads": 224148,
+                "seals": 130,
+                "peakSealScratchBytes": 42313884
+              },
+              "deployed_owner": {
+                "inLoopProcessCpuMs": 14151.981642,
+                "inLoopElapsedMs": 14199.8288845,
+                "sealCpuPerSealMs": 172.34236202000002,
+                "sealWallPerSealMs": 172.9062895733333,
+                "stateRootWallMs": 12574.287088,
+                "lateQueueMs": 755.6428395,
+                "lateReceiveToPrimaryPublicationMs": 1346.2586225,
+                "lateAppendToPrimaryPublicationMs": 584.4568985,
+                "nodeReads": 771514,
+                "fallbackReads": 154143.5,
+                "ownerReads": 154143.5,
+                "seals": 75,
+                "peakSealScratchBytes": 42313884
+              }
+            },
+            "processUsage": {
+              "maxRssKiB": 425344,
+              "userSeconds": 89.07,
+              "systemSeconds": 24.63,
+              "elapsedSeconds": 115.91,
+              "exitCode": 0
+            },
+            "load1Range": [
+              11.6318359375,
+              17.7177734375
+            ],
+            "cpuPressureAvg10Range": [
+              1.32,
+              9.96
+            ]
+          },
+          {
+            "index": 1,
+            "arm": "treatment",
+            "metrics": {
+              "fixed_work": {
+                "inLoopProcessCpuMs": 20014.2588105,
+                "inLoopElapsedMs": 20074.652692,
+                "sealCpuPerSealMs": 144.1635123576923,
+                "sealWallPerSealMs": 144.59059243461536,
+                "stateRootWallMs": 18176.847822,
+                "lateQueueMs": 690.073602,
+                "lateReceiveToPrimaryPublicationMs": 1186.7890435,
+                "lateAppendToPrimaryPublicationMs": 495.525876,
+                "nodeReads": 1244212,
+                "fallbackReads": 224148,
+                "ownerReads": 0,
+                "seals": 130,
+                "peakSealScratchBytes": 42313884
+              },
+              "deployed_owner": {
+                "inLoopProcessCpuMs": 14550.499424,
+                "inLoopElapsedMs": 14593.9963555,
+                "sealCpuPerSealMs": 175.1933557368421,
+                "sealWallPerSealMs": 175.7174482631579,
+                "stateRootWallMs": 12944.6805145,
+                "lateQueueMs": 590.230774,
+                "lateReceiveToPrimaryPublicationMs": 1119.76439,
+                "lateAppendToPrimaryPublicationMs": 528.5708815,
+                "nodeReads": 800301.5,
+                "fallbackReads": 163744.5,
+                "ownerReads": 0,
+                "seals": 76,
+                "peakSealScratchBytes": 42313884
+              }
+            },
+            "processUsage": {
+              "maxRssKiB": 425480,
+              "userSeconds": 83.22,
+              "systemSeconds": 23.75,
+              "elapsedSeconds": 109.12,
+              "exitCode": 0
+            },
+            "load1Range": [
+              5.47021484375,
+              12.38232421875
+            ],
+            "cpuPressureAvg10Range": [
+              1.08,
+              7.87
+            ]
+          },
+          {
+            "index": 2,
+            "arm": "treatment",
+            "metrics": {
+              "fixed_work": {
+                "inLoopProcessCpuMs": 19966.731429,
+                "inLoopElapsedMs": 20027.997569,
+                "sealCpuPerSealMs": 143.87238956538462,
+                "sealWallPerSealMs": 144.29334135,
+                "stateRootWallMs": 18129.867932,
+                "lateQueueMs": 681.704278,
+                "lateReceiveToPrimaryPublicationMs": 1204.52512,
+                "lateAppendToPrimaryPublicationMs": 521.564628,
+                "nodeReads": 1244212,
+                "fallbackReads": 224148,
+                "ownerReads": 0,
+                "seals": 130,
+                "peakSealScratchBytes": 42313884
+              },
+              "deployed_owner": {
+                "inLoopProcessCpuMs": 14372.1299545,
+                "inLoopElapsedMs": 14433.2677265,
+                "sealCpuPerSealMs": 174.10332181456954,
+                "sealWallPerSealMs": 174.869958410596,
+                "stateRootWallMs": 12784.9658935,
+                "lateQueueMs": 710.853599,
+                "lateReceiveToPrimaryPublicationMs": 1260.6707235,
+                "lateAppendToPrimaryPublicationMs": 542.014157,
+                "nodeReads": 802478.5,
+                "fallbackReads": 160732,
+                "ownerReads": 0,
+                "seals": 75.5,
+                "peakSealScratchBytes": 42313884
+              }
+            },
+            "processUsage": {
+              "maxRssKiB": 425560,
+              "userSeconds": 81.58,
+              "systemSeconds": 23.98,
+              "elapsedSeconds": 107.74,
+              "exitCode": 0
+            },
+            "load1Range": [
+              5.98828125,
+              17.4970703125
+            ],
+            "cpuPressureAvg10Range": [
+              4.14,
+              10.11
+            ]
+          },
+          {
+            "index": 3,
+            "arm": "control",
+            "metrics": {
+              "fixed_work": {
+                "inLoopProcessCpuMs": 21245.2153525,
+                "inLoopElapsedMs": 21342.5704605,
+                "sealCpuPerSealMs": 153.75664575,
+                "sealWallPerSealMs": 154.4492966153846,
+                "stateRootWallMs": 19453.6844375,
+                "lateQueueMs": 711.7164405,
+                "lateReceiveToPrimaryPublicationMs": 1318.144705,
+                "lateAppendToPrimaryPublicationMs": 605.2105715,
+                "nodeReads": 1244212,
+                "fallbackReads": 224148,
+                "ownerReads": 224148,
+                "seals": 130,
+                "peakSealScratchBytes": 42313884
+              },
+              "deployed_owner": {
+                "inLoopProcessCpuMs": 14671.1760745,
+                "inLoopElapsedMs": 14703.604299,
+                "sealCpuPerSealMs": 182.02998435135135,
+                "sealWallPerSealMs": 182.4331319054054,
+                "stateRootWallMs": 13095.4271625,
+                "lateQueueMs": 680.6688445,
+                "lateReceiveToPrimaryPublicationMs": 1284.7985125,
+                "lateAppendToPrimaryPublicationMs": 598.2105335,
+                "nodeReads": 783714.5,
+                "fallbackReads": 160648,
+                "ownerReads": 160648,
+                "seals": 74,
+                "peakSealScratchBytes": 42313884
+              }
+            },
+            "processUsage": {
+              "maxRssKiB": 425324,
+              "userSeconds": 87.39,
+              "systemSeconds": 24.08,
+              "elapsedSeconds": 113.65,
+              "exitCode": 0
+            },
+            "load1Range": [
+              7.4873046875,
+              15.1142578125
+            ],
+            "cpuPressureAvg10Range": [
+              3.47,
+              11.98
+            ]
+          }
+        ]
+      },
+      {
+        "index": 1,
+        "order": "BAAB",
+        "manifestSha256": "fde65145c1acd2ce9a1884baf98b3bdbd5d3eb603795f043344fddac69134121",
+        "startedUtc": "2026-11-27T10:04:46.476084+00:00",
+        "finishedUtc": "2026-11-27T10:12:09.131975+00:00",
+        "runs": [
+          {
+            "index": 0,
+            "arm": "treatment",
+            "metrics": {
+              "fixed_work": {
+                "inLoopProcessCpuMs": 20103.395109,
+                "inLoopElapsedMs": 20167.4832685,
+                "sealCpuPerSealMs": 144.89836541923077,
+                "sealWallPerSealMs": 145.36501230384616,
+                "stateRootWallMs": 18274.4952405,
+                "lateQueueMs": 731.7243125,
+                "lateReceiveToPrimaryPublicationMs": 1274.479936,
+                "lateAppendToPrimaryPublicationMs": 541.3908835,
+                "nodeReads": 1244212,
+                "fallbackReads": 224148,
+                "ownerReads": 0,
+                "seals": 130,
+                "peakSealScratchBytes": 42313884
+              },
+              "deployed_owner": {
+                "inLoopProcessCpuMs": 13777.71937,
+                "inLoopElapsedMs": 13816.579693,
+                "sealCpuPerSealMs": 172.3422499109589,
+                "sealWallPerSealMs": 172.8415160547945,
+                "stateRootWallMs": 12223.1788895,
+                "lateQueueMs": 656.543924,
+                "lateReceiveToPrimaryPublicationMs": 1178.339655,
+                "lateAppendToPrimaryPublicationMs": 520.4725975,
+                "nodeReads": 770718,
+                "fallbackReads": 158244.5,
+                "ownerReads": 0,
+                "seals": 73,
+                "peakSealScratchBytes": 42313884
+              }
+            },
+            "processUsage": {
+              "maxRssKiB": 425104,
+              "userSeconds": 81.61,
+              "systemSeconds": 23.79,
+              "elapsedSeconds": 107.55,
+              "exitCode": 0
+            },
+            "load1Range": [
+              7.7685546875,
+              12.53369140625
+            ],
+            "cpuPressureAvg10Range": [
+              4.62,
+              8.93
+            ]
+          },
+          {
+            "index": 1,
+            "arm": "control",
+            "metrics": {
+              "fixed_work": {
+                "inLoopProcessCpuMs": 20790.6842015,
+                "inLoopElapsedMs": 20860.6373375,
+                "sealCpuPerSealMs": 150.87568816538462,
+                "sealWallPerSealMs": 151.38777111923076,
+                "stateRootWallMs": 19074.8298525,
+                "lateQueueMs": 762.6256935,
+                "lateReceiveToPrimaryPublicationMs": 1331.687461,
+                "lateAppendToPrimaryPublicationMs": 567.3931485,
+                "nodeReads": 1244212,
+                "fallbackReads": 224148,
+                "ownerReads": 224148,
+                "seals": 130,
+                "peakSealScratchBytes": 42313884
+              },
+              "deployed_owner": {
+                "inLoopProcessCpuMs": 14154.1433795,
+                "inLoopElapsedMs": 14185.5752625,
+                "sealCpuPerSealMs": 175.30493236486487,
+                "sealWallPerSealMs": 175.70386452702704,
+                "stateRootWallMs": 12614.47934,
+                "lateQueueMs": 542.505964,
+                "lateReceiveToPrimaryPublicationMs": 1173.346154,
+                "lateAppendToPrimaryPublicationMs": 625.1520885,
+                "nodeReads": 773297.5,
+                "fallbackReads": 156484,
+                "ownerReads": 156484,
+                "seals": 74,
+                "peakSealScratchBytes": 42313884
+              }
+            },
+            "processUsage": {
+              "maxRssKiB": 425348,
+              "userSeconds": 84.8,
+              "systemSeconds": 22.71,
+              "elapsedSeconds": 109.61,
+              "exitCode": 0
+            },
+            "load1Range": [
+              3.5712890625,
+              8.865234375
+            ],
+            "cpuPressureAvg10Range": [
+              0.26,
+              5.0
+            ]
+          },
+          {
+            "index": 2,
+            "arm": "control",
+            "metrics": {
+              "fixed_work": {
+                "inLoopProcessCpuMs": 21516.546745,
+                "inLoopElapsedMs": 21576.074337,
+                "sealCpuPerSealMs": 155.94243937307692,
+                "sealWallPerSealMs": 156.37424915,
+                "stateRootWallMs": 19706.02301,
+                "lateQueueMs": 784.6442975,
+                "lateReceiveToPrimaryPublicationMs": 1388.810056,
+                "lateAppendToPrimaryPublicationMs": 602.7895235,
+                "nodeReads": 1244212,
+                "fallbackReads": 224148,
+                "ownerReads": 224148,
+                "seals": 130,
+                "peakSealScratchBytes": 42313884
+              },
+              "deployed_owner": {
+                "inLoopProcessCpuMs": 15040.237621,
+                "inLoopElapsedMs": 15079.289639,
+                "sealCpuPerSealMs": 185.5540655704698,
+                "sealWallPerSealMs": 186.01909416107384,
+                "stateRootWallMs": 13457.5670495,
+                "lateQueueMs": 723.4855145,
+                "lateReceiveToPrimaryPublicationMs": 1310.4756095,
+                "lateAppendToPrimaryPublicationMs": 580.9128315,
+                "nodeReads": 784191,
+                "fallbackReads": 160840.5,
+                "ownerReads": 160840.5,
+                "seals": 74.5,
+                "peakSealScratchBytes": 42313884
+              }
+            },
+            "processUsage": {
+              "maxRssKiB": 425396,
+              "userSeconds": 88.84,
+              "systemSeconds": 24.34,
+              "elapsedSeconds": 115.3,
+              "exitCode": 0
+            },
+            "load1Range": [
+              3.1552734375,
+              10.578125
+            ],
+            "cpuPressureAvg10Range": [
+              2.87,
+              7.35
+            ]
+          },
+          {
+            "index": 3,
+            "arm": "treatment",
+            "metrics": {
+              "fixed_work": {
+                "inLoopProcessCpuMs": 20337.0880565,
+                "inLoopElapsedMs": 20398.340737,
+                "sealCpuPerSealMs": 146.85607127307694,
+                "sealWallPerSealMs": 147.29994465000001,
+                "stateRootWallMs": 18525.451285,
+                "lateQueueMs": 723.662119,
+                "lateReceiveToPrimaryPublicationMs": 1289.8325975,
+                "lateAppendToPrimaryPublicationMs": 564.710994,
+                "nodeReads": 1244212,
+                "fallbackReads": 224148,
+                "ownerReads": 0,
+                "seals": 130,
+                "peakSealScratchBytes": 42313884
+              },
+              "deployed_owner": {
+                "inLoopProcessCpuMs": 13863.4667385,
+                "inLoopElapsedMs": 13897.4184145,
+                "sealCpuPerSealMs": 171.03535814864864,
+                "sealWallPerSealMs": 171.4662347162162,
+                "stateRootWallMs": 12295.326244,
+                "lateQueueMs": 512.0290595,
+                "lateReceiveToPrimaryPublicationMs": 1064.7383085,
+                "lateAppendToPrimaryPublicationMs": 551.7971135,
+                "nodeReads": 775763,
+                "fallbackReads": 156878,
+                "ownerReads": 0,
+                "seals": 74,
+                "peakSealScratchBytes": 42313884
+              }
+            },
+            "processUsage": {
+              "maxRssKiB": 425768,
+              "userSeconds": 83.72,
+              "systemSeconds": 23.8,
+              "elapsedSeconds": 109.7,
+              "exitCode": 0
+            },
+            "load1Range": [
+              8.05908203125,
+              13.306640625
+            ],
+            "cpuPressureAvg10Range": [
+              4.1,
+              8.99
+            ]
+          }
+        ]
+      },
+      {
+        "index": 2,
+        "order": "ABBA",
+        "manifestSha256": "de7751df0224044c7ae8ff2c259623bda53ad8fbf580fc39583c678023bfb960",
+        "startedUtc": "2026-11-27T10:12:09.200741+00:00",
+        "finishedUtc": "2026-11-27T10:19:19.681826+00:00",
+        "runs": [
+          {
+            "index": 0,
+            "arm": "control",
+            "metrics": {
+              "fixed_work": {
+                "inLoopProcessCpuMs": 20744.308454,
+                "inLoopElapsedMs": 20806.0879095,
+                "sealCpuPerSealMs": 150.38153301923077,
+                "sealWallPerSealMs": 150.84124985,
+                "stateRootWallMs": 18999.042886,
+                "lateQueueMs": 700.679825,
+                "lateReceiveToPrimaryPublicationMs": 1256.667425,
+                "lateAppendToPrimaryPublicationMs": 554.784756,
+                "nodeReads": 1244212,
+                "fallbackReads": 224148,
+                "ownerReads": 224148,
+                "seals": 130,
+                "peakSealScratchBytes": 42313884
+              },
+              "deployed_owner": {
+                "inLoopProcessCpuMs": 13841.0746355,
+                "inLoopElapsedMs": 13878.8271565,
+                "sealCpuPerSealMs": 176.0447962222222,
+                "sealWallPerSealMs": 176.5286386736111,
+                "stateRootWallMs": 12331.480715,
+                "lateQueueMs": 679.3436415,
+                "lateReceiveToPrimaryPublicationMs": 1216.9604815,
+                "lateAppendToPrimaryPublicationMs": 536.411404,
+                "nodeReads": 757907,
+                "fallbackReads": 154230.5,
+                "ownerReads": 154230.5,
+                "seals": 72,
+                "peakSealScratchBytes": 42313884
+              }
+            },
+            "processUsage": {
+              "maxRssKiB": 425892,
+              "userSeconds": 84.68,
+              "systemSeconds": 22.97,
+              "elapsedSeconds": 109.75,
+              "exitCode": 0
+            },
+            "load1Range": [
+              7.02587890625,
+              16.51513671875
+            ],
+            "cpuPressureAvg10Range": [
+              0.61,
+              9.09
+            ]
+          },
+          {
+            "index": 1,
+            "arm": "treatment",
+            "metrics": {
+              "fixed_work": {
+                "inLoopProcessCpuMs": 19733.411027,
+                "inLoopElapsedMs": 19779.095819,
+                "sealCpuPerSealMs": 142.5129000076923,
+                "sealWallPerSealMs": 142.8503299884615,
+                "stateRootWallMs": 17956.30865,
+                "lateQueueMs": 691.3335415,
+                "lateReceiveToPrimaryPublicationMs": 1179.99713,
+                "lateAppendToPrimaryPublicationMs": 487.4407,
+                "nodeReads": 1244212,
+                "fallbackReads": 224148,
+                "ownerReads": 0,
+                "seals": 130,
+                "peakSealScratchBytes": 42313884
+              },
+              "deployed_owner": {
+                "inLoopProcessCpuMs": 13371.058425,
+                "inLoopElapsedMs": 13406.2326705,
+                "sealCpuPerSealMs": 168.04821984827586,
+                "sealWallPerSealMs": 168.50222040689656,
+                "stateRootWallMs": 11828.939916,
+                "lateQueueMs": 619.2157405,
+                "lateReceiveToPrimaryPublicationMs": 1184.499617,
+                "lateAppendToPrimaryPublicationMs": 559.2459075,
+                "nodeReads": 761235.5,
+                "fallbackReads": 153994,
+                "ownerReads": 0,
+                "seals": 72.5,
+                "peakSealScratchBytes": 42313884
+              }
+            },
+            "processUsage": {
+              "maxRssKiB": 425660,
+              "userSeconds": 79.74,
+              "systemSeconds": 22.86,
+              "elapsedSeconds": 104.68,
+              "exitCode": 0
+            },
+            "load1Range": [
+              3.6904296875,
+              8.40185546875
+            ],
+            "cpuPressureAvg10Range": [
+              0.49,
+              6.41
+            ]
+          },
+          {
+            "index": 2,
+            "arm": "treatment",
+            "metrics": {
+              "fixed_work": {
+                "inLoopProcessCpuMs": 19785.315142,
+                "inLoopElapsedMs": 19838.919329,
+                "sealCpuPerSealMs": 142.78197751538463,
+                "sealWallPerSealMs": 143.17636282692308,
+                "stateRootWallMs": 17996.059085,
+                "lateQueueMs": 694.731519,
+                "lateReceiveToPrimaryPublicationMs": 1241.83452,
+                "lateAppendToPrimaryPublicationMs": 545.740142,
+                "nodeReads": 1244212,
+                "fallbackReads": 224148,
+                "ownerReads": 0,
+                "seals": 130,
+                "peakSealScratchBytes": 42313884
+              },
+              "deployed_owner": {
+                "inLoopProcessCpuMs": 12925.8294045,
+                "inLoopElapsedMs": 12958.7026875,
+                "sealCpuPerSealMs": 166.8796994184397,
+                "sealWallPerSealMs": 167.32385629078013,
+                "stateRootWallMs": 11426.2592395,
+                "lateQueueMs": 687.593804,
+                "lateReceiveToPrimaryPublicationMs": 1177.00497,
+                "lateAppendToPrimaryPublicationMs": 483.3990145,
+                "nodeReads": 740006.5,
+                "fallbackReads": 150170.5,
+                "ownerReads": 0,
+                "seals": 70.5,
+                "peakSealScratchBytes": 42313884
+              }
+            },
+            "processUsage": {
+              "maxRssKiB": 425940,
+              "userSeconds": 80.29,
+              "systemSeconds": 23.06,
+              "elapsedSeconds": 105.44,
+              "exitCode": 0
+            },
+            "load1Range": [
+              5.4833984375,
+              7.97412109375
+            ],
+            "cpuPressureAvg10Range": [
+              2.85,
+              5.99
+            ]
+          },
+          {
+            "index": 3,
+            "arm": "control",
+            "metrics": {
+              "fixed_work": {
+                "inLoopProcessCpuMs": 21183.8259425,
+                "inLoopElapsedMs": 21230.6934305,
+                "sealCpuPerSealMs": 153.51938100769232,
+                "sealWallPerSealMs": 153.86357237307692,
+                "stateRootWallMs": 19391.742894,
+                "lateQueueMs": 794.0444005,
+                "lateReceiveToPrimaryPublicationMs": 1415.769027,
+                "lateAppendToPrimaryPublicationMs": 620.3253545,
+                "nodeReads": 1244212,
+                "fallbackReads": 224148,
+                "ownerReads": 224148,
+                "seals": 130,
+                "peakSealScratchBytes": 42313884
+              },
+              "deployed_owner": {
+                "inLoopProcessCpuMs": 13332.379875,
+                "inLoopElapsedMs": 13408.5043885,
+                "sealCpuPerSealMs": 172.84221204964538,
+                "sealWallPerSealMs": 173.90820769503546,
+                "stateRootWallMs": 11890.0541405,
+                "lateQueueMs": 578.1732395,
+                "lateReceiveToPrimaryPublicationMs": 1183.4340135,
+                "lateAppendToPrimaryPublicationMs": 604.268745,
+                "nodeReads": 747622,
+                "fallbackReads": 150980.5,
+                "ownerReads": 150980.5,
+                "seals": 70.5,
+                "peakSealScratchBytes": 42313884
+              }
+            },
+            "processUsage": {
+              "maxRssKiB": 425400,
+              "userSeconds": 84.81,
+              "systemSeconds": 23.18,
+              "elapsedSeconds": 110.16,
+              "exitCode": 0
+            },
+            "load1Range": [
+              6.5078125,
+              9.01904296875
+            ],
+            "cpuPressureAvg10Range": [
+              0.91,
+              5.98
+            ]
+          }
+        ]
+      }
+    ],
+    "pairs": [
+      {
+        "block": 0,
+        "controlProcess": 0,
+        "treatmentProcess": 1,
+        "metrics": {
+          "fixed_work": {
+            "inLoopProcessCpuMs": {
+              "control": 22172.867649,
+              "treatment": 20014.2588105,
+              "difference": -2158.6088385000003,
+              "percent": -9.73536158096968
+            },
+            "inLoopElapsedMs": {
+              "control": 22248.344348,
+              "treatment": 20074.652692,
+              "difference": -2173.691655999999,
+              "percent": -9.770127709280096
+            },
+            "sealCpuPerSealMs": {
+              "control": 160.4559198730769,
+              "treatment": 144.1635123576923,
+              "difference": -16.29240751538461,
+              "percent": -10.153821391116114
+            },
+            "sealWallPerSealMs": {
+              "control": 160.9990305076923,
+              "treatment": 144.59059243461536,
+              "difference": -16.40843807307695,
+              "percent": -10.191637813802224
+            },
+            "stateRootWallMs": {
+              "control": 20282.6162945,
+              "treatment": 18176.847822,
+              "difference": -2105.7684725,
+              "percent": -10.382134345612092
+            },
+            "lateQueueMs": {
+              "control": 820.712975,
+              "treatment": 690.073602,
+              "difference": -130.63937299999998,
+              "percent": -15.917790625888417
+            },
+            "lateReceiveToPrimaryPublicationMs": {
+              "control": 1459.3837565,
+              "treatment": 1186.7890435,
+              "difference": -272.59471299999996,
+              "percent": -18.678754767954686
+            },
+            "lateAppendToPrimaryPublicationMs": {
+              "control": 637.4390075,
+              "treatment": 495.525876,
+              "difference": -141.91313150000002,
+              "percent": -22.263013375440476
+            },
+            "nodeReads": {
+              "control": 1244212,
+              "treatment": 1244212,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "fallbackReads": {
+              "control": 224148,
+              "treatment": 224148,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "ownerReads": {
+              "control": 224148,
+              "treatment": 0,
+              "difference": -224148,
+              "percent": -100.0
+            },
+            "seals": {
+              "control": 130,
+              "treatment": 130,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "peakSealScratchBytes": {
+              "control": 42313884,
+              "treatment": 42313884,
+              "difference": 0,
+              "percent": 0.0
+            }
+          },
+          "deployed_owner": {
+            "inLoopProcessCpuMs": {
+              "control": 14151.981642,
+              "treatment": 14550.499424,
+              "difference": 398.517781999999,
+              "percent": 2.8159857190408255
+            },
+            "inLoopElapsedMs": {
+              "control": 14199.8288845,
+              "treatment": 14593.9963555,
+              "difference": 394.16747099999884,
+              "percent": 2.775860710760103
+            },
+            "sealCpuPerSealMs": {
+              "control": 172.34236202000002,
+              "treatment": 175.1933557368421,
+              "difference": 2.8509937168420834,
+              "percent": 1.6542617168675111
+            },
+            "sealWallPerSealMs": {
+              "control": 172.9062895733333,
+              "treatment": 175.7174482631579,
+              "difference": 2.8111586898245946,
+              "percent": 1.6258278960016304
+            },
+            "stateRootWallMs": {
+              "control": 12574.287088,
+              "treatment": 12944.6805145,
+              "difference": 370.3934265000007,
+              "percent": 2.9456415612896025
+            },
+            "lateQueueMs": {
+              "control": 755.6428395,
+              "treatment": 590.230774,
+              "difference": -165.41206550000004,
+              "percent": -21.890244551175954
+            },
+            "lateReceiveToPrimaryPublicationMs": {
+              "control": 1346.2586225,
+              "treatment": 1119.76439,
+              "difference": -226.49423249999995,
+              "percent": -16.82397636788394
+            },
+            "lateAppendToPrimaryPublicationMs": {
+              "control": 584.4568985,
+              "treatment": 528.5708815,
+              "difference": -55.886016999999924,
+              "percent": -9.562042495080568
+            },
+            "nodeReads": {
+              "control": 771514,
+              "treatment": 800301.5,
+              "difference": 28787.5,
+              "percent": 3.731299756064055
+            },
+            "fallbackReads": {
+              "control": 154143.5,
+              "treatment": 163744.5,
+              "difference": 9601.0,
+              "percent": 6.228611650831861
+            },
+            "ownerReads": {
+              "control": 154143.5,
+              "treatment": 0,
+              "difference": -154143.5,
+              "percent": -100.0
+            },
+            "seals": {
+              "control": 75,
+              "treatment": 76,
+              "difference": 1,
+              "percent": 1.333333333333342
+            },
+            "peakSealScratchBytes": {
+              "control": 42313884,
+              "treatment": 42313884,
+              "difference": 0,
+              "percent": 0.0
+            }
+          }
+        }
+      },
+      {
+        "block": 0,
+        "controlProcess": 3,
+        "treatmentProcess": 2,
+        "metrics": {
+          "fixed_work": {
+            "inLoopProcessCpuMs": {
+              "control": 21245.2153525,
+              "treatment": 19966.731429,
+              "difference": -1278.4839235,
+              "percent": -6.017749889974899
+            },
+            "inLoopElapsedMs": {
+              "control": 21342.5704605,
+              "treatment": 20027.997569,
+              "difference": -1314.5728915,
+              "percent": -6.15939347105805
+            },
+            "sealCpuPerSealMs": {
+              "control": 153.75664575,
+              "treatment": 143.87238956538462,
+              "difference": -9.884256184615367,
+              "percent": -6.428506642039156
+            },
+            "sealWallPerSealMs": {
+              "control": 154.4492966153846,
+              "treatment": 144.29334135,
+              "difference": -10.15595526538462,
+              "percent": -6.575591788336443
+            },
+            "stateRootWallMs": {
+              "control": 19453.6844375,
+              "treatment": 18129.867932,
+              "difference": -1323.816505499999,
+              "percent": -6.804965453989464
+            },
+            "lateQueueMs": {
+              "control": 711.7164405,
+              "treatment": 681.704278,
+              "difference": -30.01216249999993,
+              "percent": -4.21687076371533
+            },
+            "lateReceiveToPrimaryPublicationMs": {
+              "control": 1318.144705,
+              "treatment": 1204.52512,
+              "difference": -113.61958499999992,
+              "percent": -8.619659478129904
+            },
+            "lateAppendToPrimaryPublicationMs": {
+              "control": 605.2105715,
+              "treatment": 521.564628,
+              "difference": -83.64594350000004,
+              "percent": -13.82096536957138
+            },
+            "nodeReads": {
+              "control": 1244212,
+              "treatment": 1244212,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "fallbackReads": {
+              "control": 224148,
+              "treatment": 224148,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "ownerReads": {
+              "control": 224148,
+              "treatment": 0,
+              "difference": -224148,
+              "percent": -100.0
+            },
+            "seals": {
+              "control": 130,
+              "treatment": 130,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "peakSealScratchBytes": {
+              "control": 42313884,
+              "treatment": 42313884,
+              "difference": 0,
+              "percent": 0.0
+            }
+          },
+          "deployed_owner": {
+            "inLoopProcessCpuMs": {
+              "control": 14671.1760745,
+              "treatment": 14372.1299545,
+              "difference": -299.04611999999906,
+              "percent": -2.038324115813539
+            },
+            "inLoopElapsedMs": {
+              "control": 14703.604299,
+              "treatment": 14433.2677265,
+              "difference": -270.33657250000033,
+              "percent": -1.8385735021336669
+            },
+            "sealCpuPerSealMs": {
+              "control": 182.02998435135135,
+              "treatment": 174.10332181456954,
+              "difference": -7.926662536781805,
+              "percent": -4.354591670722718
+            },
+            "sealWallPerSealMs": {
+              "control": 182.4331319054054,
+              "treatment": 174.869958410596,
+              "difference": -7.5631734948093765,
+              "percent": -4.145723649984268
+            },
+            "stateRootWallMs": {
+              "control": 13095.4271625,
+              "treatment": 12784.9658935,
+              "difference": -310.46126899999945,
+              "percent": -2.3707609163680754
+            },
+            "lateQueueMs": {
+              "control": 680.6688445,
+              "treatment": 710.853599,
+              "difference": 30.184754500000054,
+              "percent": 4.434572662448355
+            },
+            "lateReceiveToPrimaryPublicationMs": {
+              "control": 1284.7985125,
+              "treatment": 1260.6707235,
+              "difference": -24.12778900000012,
+              "percent": -1.8779434102123571
+            },
+            "lateAppendToPrimaryPublicationMs": {
+              "control": 598.2105335,
+              "treatment": 542.014157,
+              "difference": -56.19637650000004,
+              "percent": -9.3940800693039
+            },
+            "nodeReads": {
+              "control": 783714.5,
+              "treatment": 802478.5,
+              "difference": 18764.0,
+              "percent": 2.3942392286987246
+            },
+            "fallbackReads": {
+              "control": 160648,
+              "treatment": 160732,
+              "difference": 84,
+              "percent": 0.05228823265772675
+            },
+            "ownerReads": {
+              "control": 160648,
+              "treatment": 0,
+              "difference": -160648,
+              "percent": -100.0
+            },
+            "seals": {
+              "control": 74,
+              "treatment": 75.5,
+              "difference": 1.5,
+              "percent": 2.0270270270270174
+            },
+            "peakSealScratchBytes": {
+              "control": 42313884,
+              "treatment": 42313884,
+              "difference": 0,
+              "percent": 0.0
+            }
+          }
+        }
+      },
+      {
+        "block": 1,
+        "controlProcess": 1,
+        "treatmentProcess": 0,
+        "metrics": {
+          "fixed_work": {
+            "inLoopProcessCpuMs": {
+              "control": 20790.6842015,
+              "treatment": 20103.395109,
+              "difference": -687.2890924999992,
+              "percent": -3.3057550479767883
+            },
+            "inLoopElapsedMs": {
+              "control": 20860.6373375,
+              "treatment": 20167.4832685,
+              "difference": -693.1540690000002,
+              "percent": -3.322784715469629
+            },
+            "sealCpuPerSealMs": {
+              "control": 150.87568816538462,
+              "treatment": 144.89836541923077,
+              "difference": -5.977322746153845,
+              "percent": -3.961753426835546
+            },
+            "sealWallPerSealMs": {
+              "control": 151.38777111923076,
+              "treatment": 145.36501230384616,
+              "difference": -6.022758815384606,
+              "percent": -3.9783654722290396
+            },
+            "stateRootWallMs": {
+              "control": 19074.8298525,
+              "treatment": 18274.4952405,
+              "difference": -800.3346119999987,
+              "percent": -4.195762783672253
+            },
+            "lateQueueMs": {
+              "control": 762.6256935,
+              "treatment": 731.7243125,
+              "difference": -30.901381000000015,
+              "percent": -4.051972188109865
+            },
+            "lateReceiveToPrimaryPublicationMs": {
+              "control": 1331.687461,
+              "treatment": 1274.479936,
+              "difference": -57.20752500000003,
+              "percent": -4.295867211743609
+            },
+            "lateAppendToPrimaryPublicationMs": {
+              "control": 567.3931485,
+              "treatment": 541.3908835,
+              "difference": -26.00226500000008,
+              "percent": -4.582759779306722
+            },
+            "nodeReads": {
+              "control": 1244212,
+              "treatment": 1244212,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "fallbackReads": {
+              "control": 224148,
+              "treatment": 224148,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "ownerReads": {
+              "control": 224148,
+              "treatment": 0,
+              "difference": -224148,
+              "percent": -100.0
+            },
+            "seals": {
+              "control": 130,
+              "treatment": 130,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "peakSealScratchBytes": {
+              "control": 42313884,
+              "treatment": 42313884,
+              "difference": 0,
+              "percent": 0.0
+            }
+          },
+          "deployed_owner": {
+            "inLoopProcessCpuMs": {
+              "control": 14154.1433795,
+              "treatment": 13777.71937,
+              "difference": -376.42400949999865,
+              "percent": -2.6594616106912383
+            },
+            "inLoopElapsedMs": {
+              "control": 14185.5752625,
+              "treatment": 13816.579693,
+              "difference": -368.9955695000008,
+              "percent": -2.6012027194656784
+            },
+            "sealCpuPerSealMs": {
+              "control": 175.30493236486487,
+              "treatment": 172.3422499109589,
+              "difference": -2.9626824539059555,
+              "percent": -1.690016597901356
+            },
+            "sealWallPerSealMs": {
+              "control": 175.70386452702704,
+              "treatment": 172.8415160547945,
+              "difference": -2.862348472232526,
+              "percent": -1.6290754218398207
+            },
+            "stateRootWallMs": {
+              "control": 12614.47934,
+              "treatment": 12223.1788895,
+              "difference": -391.300450499999,
+              "percent": -3.1019944617072026
+            },
+            "lateQueueMs": {
+              "control": 542.505964,
+              "treatment": 656.543924,
+              "difference": 114.03796,
+              "percent": 21.020591028931058
+            },
+            "lateReceiveToPrimaryPublicationMs": {
+              "control": 1173.346154,
+              "treatment": 1178.339655,
+              "difference": 4.993500999999924,
+              "percent": 0.42557782142778056
+            },
+            "lateAppendToPrimaryPublicationMs": {
+              "control": 625.1520885,
+              "treatment": 520.4725975,
+              "difference": -104.67949099999998,
+              "percent": -16.744643891563992
+            },
+            "nodeReads": {
+              "control": 773297.5,
+              "treatment": 770718,
+              "difference": -2579.5,
+              "percent": -0.3335714909203813
+            },
+            "fallbackReads": {
+              "control": 156484,
+              "treatment": 158244.5,
+              "difference": 1760.5,
+              "percent": 1.125035147363307
+            },
+            "ownerReads": {
+              "control": 156484,
+              "treatment": 0,
+              "difference": -156484,
+              "percent": -100.0
+            },
+            "seals": {
+              "control": 74,
+              "treatment": 73,
+              "difference": -1,
+              "percent": -1.3513513513513487
+            },
+            "peakSealScratchBytes": {
+              "control": 42313884,
+              "treatment": 42313884,
+              "difference": 0,
+              "percent": 0.0
+            }
+          }
+        }
+      },
+      {
+        "block": 1,
+        "controlProcess": 2,
+        "treatmentProcess": 3,
+        "metrics": {
+          "fixed_work": {
+            "inLoopProcessCpuMs": {
+              "control": 21516.546745,
+              "treatment": 20337.0880565,
+              "difference": -1179.458688499999,
+              "percent": -5.48163561038939
+            },
+            "inLoopElapsedMs": {
+              "control": 21576.074337,
+              "treatment": 20398.340737,
+              "difference": -1177.7335999999996,
+              "percent": -5.458516603181829
+            },
+            "sealCpuPerSealMs": {
+              "control": 155.94243937307692,
+              "treatment": 146.85607127307694,
+              "difference": -9.086368099999987,
+              "percent": -5.826744878770141
+            },
+            "sealWallPerSealMs": {
+              "control": 156.37424915,
+              "treatment": 147.29994465000001,
+              "difference": -9.074304499999982,
+              "percent": -5.802940413351287
+            },
+            "stateRootWallMs": {
+              "control": 19706.02301,
+              "treatment": 18525.451285,
+              "difference": -1180.5717250000016,
+              "percent": -5.990918230435993
+            },
+            "lateQueueMs": {
+              "control": 784.6442975,
+              "treatment": 723.662119,
+              "difference": -60.98217850000003,
+              "percent": -7.771952041746665
+            },
+            "lateReceiveToPrimaryPublicationMs": {
+              "control": 1388.810056,
+              "treatment": 1289.8325975,
+              "difference": -98.97745850000001,
+              "percent": -7.126781525838832
+            },
+            "lateAppendToPrimaryPublicationMs": {
+              "control": 602.7895235,
+              "treatment": 564.710994,
+              "difference": -38.078529499999945,
+              "percent": -6.317052306898619
+            },
+            "nodeReads": {
+              "control": 1244212,
+              "treatment": 1244212,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "fallbackReads": {
+              "control": 224148,
+              "treatment": 224148,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "ownerReads": {
+              "control": 224148,
+              "treatment": 0,
+              "difference": -224148,
+              "percent": -100.0
+            },
+            "seals": {
+              "control": 130,
+              "treatment": 130,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "peakSealScratchBytes": {
+              "control": 42313884,
+              "treatment": 42313884,
+              "difference": 0,
+              "percent": 0.0
+            }
+          },
+          "deployed_owner": {
+            "inLoopProcessCpuMs": {
+              "control": 15040.237621,
+              "treatment": 13863.4667385,
+              "difference": -1176.7708825000009,
+              "percent": -7.82415086884618
+            },
+            "inLoopElapsedMs": {
+              "control": 15079.289639,
+              "treatment": 13897.4184145,
+              "difference": -1181.8712245000006,
+              "percent": -7.837711542082815
+            },
+            "sealCpuPerSealMs": {
+              "control": 185.5540655704698,
+              "treatment": 171.03535814864864,
+              "difference": -14.518707421821148,
+              "percent": -7.824515931345754
+            },
+            "sealWallPerSealMs": {
+              "control": 186.01909416107384,
+              "treatment": 171.4662347162162,
+              "difference": -14.552859444857631,
+              "percent": -7.823314864793563
+            },
+            "stateRootWallMs": {
+              "control": 13457.5670495,
+              "treatment": 12295.326244,
+              "difference": -1162.2408054999996,
+              "percent": -8.636336725836202
+            },
+            "lateQueueMs": {
+              "control": 723.4855145,
+              "treatment": 512.0290595,
+              "difference": -211.456455,
+              "percent": -29.227462162271113
+            },
+            "lateReceiveToPrimaryPublicationMs": {
+              "control": 1310.4756095,
+              "treatment": 1064.7383085,
+              "difference": -245.73730100000012,
+              "percent": -18.751764566893304
+            },
+            "lateAppendToPrimaryPublicationMs": {
+              "control": 580.9128315,
+              "treatment": 551.7971135,
+              "difference": -29.115718000000015,
+              "percent": -5.012063156673452
+            },
+            "nodeReads": {
+              "control": 784191,
+              "treatment": 775763,
+              "difference": -8428,
+              "percent": -1.0747381696550984
+            },
+            "fallbackReads": {
+              "control": 160840.5,
+              "treatment": 156878,
+              "difference": -3962.5,
+              "percent": -2.463620792026888
+            },
+            "ownerReads": {
+              "control": 160840.5,
+              "treatment": 0,
+              "difference": -160840.5,
+              "percent": -100.0
+            },
+            "seals": {
+              "control": 74.5,
+              "treatment": 74,
+              "difference": -0.5,
+              "percent": -0.6711409395973145
+            },
+            "peakSealScratchBytes": {
+              "control": 42313884,
+              "treatment": 42313884,
+              "difference": 0,
+              "percent": 0.0
+            }
+          }
+        }
+      },
+      {
+        "block": 2,
+        "controlProcess": 0,
+        "treatmentProcess": 1,
+        "metrics": {
+          "fixed_work": {
+            "inLoopProcessCpuMs": {
+              "control": 20744.308454,
+              "treatment": 19733.411027,
+              "difference": -1010.8974270000035,
+              "percent": -4.873131486844418
+            },
+            "inLoopElapsedMs": {
+              "control": 20806.0879095,
+              "treatment": 19779.095819,
+              "difference": -1026.9920905,
+              "percent": -4.936017260751258
+            },
+            "sealCpuPerSealMs": {
+              "control": 150.38153301923077,
+              "treatment": 142.5129000076923,
+              "difference": -7.8686330115384635,
+              "percent": -5.232446334040375
+            },
+            "sealWallPerSealMs": {
+              "control": 150.84124985,
+              "treatment": 142.8503299884615,
+              "difference": -7.990919861538487,
+              "percent": -5.297569378061262
+            },
+            "stateRootWallMs": {
+              "control": 18999.042886,
+              "treatment": 17956.30865,
+              "difference": -1042.7342360000002,
+              "percent": -5.488351398840042
+            },
+            "lateQueueMs": {
+              "control": 700.679825,
+              "treatment": 691.3335415,
+              "difference": -9.346283500000027,
+              "percent": -1.333887913784304
+            },
+            "lateReceiveToPrimaryPublicationMs": {
+              "control": 1256.667425,
+              "treatment": 1179.99713,
+              "difference": -76.67029500000012,
+              "percent": -6.101080801071945
+            },
+            "lateAppendToPrimaryPublicationMs": {
+              "control": 554.784756,
+              "treatment": 487.4407,
+              "difference": -67.34405600000002,
+              "percent": -12.138771887957212
+            },
+            "nodeReads": {
+              "control": 1244212,
+              "treatment": 1244212,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "fallbackReads": {
+              "control": 224148,
+              "treatment": 224148,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "ownerReads": {
+              "control": 224148,
+              "treatment": 0,
+              "difference": -224148,
+              "percent": -100.0
+            },
+            "seals": {
+              "control": 130,
+              "treatment": 130,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "peakSealScratchBytes": {
+              "control": 42313884,
+              "treatment": 42313884,
+              "difference": 0,
+              "percent": 0.0
+            }
+          },
+          "deployed_owner": {
+            "inLoopProcessCpuMs": {
+              "control": 13841.0746355,
+              "treatment": 13371.058425,
+              "difference": -470.01621049999994,
+              "percent": -3.3958072106228587
+            },
+            "inLoopElapsedMs": {
+              "control": 13878.8271565,
+              "treatment": 13406.2326705,
+              "difference": -472.59448599999996,
+              "percent": -3.405147140107334
+            },
+            "sealCpuPerSealMs": {
+              "control": 176.0447962222222,
+              "treatment": 168.04821984827586,
+              "difference": -7.99657637394634,
+              "percent": -4.54235316552738
+            },
+            "sealWallPerSealMs": {
+              "control": 176.5286386736111,
+              "treatment": 168.50222040689656,
+              "difference": -8.026418266714558,
+              "percent": -4.546808000686409
+            },
+            "stateRootWallMs": {
+              "control": 12331.480715,
+              "treatment": 11828.939916,
+              "difference": -502.54079900000033,
+              "percent": -4.075267282287598
+            },
+            "lateQueueMs": {
+              "control": 679.3436415,
+              "treatment": 619.2157405,
+              "difference": -60.12790099999995,
+              "percent": -8.850881546081268
+            },
+            "lateReceiveToPrimaryPublicationMs": {
+              "control": 1216.9604815,
+              "treatment": 1184.499617,
+              "difference": -32.46086450000007,
+              "percent": -2.6673721121978855
+            },
+            "lateAppendToPrimaryPublicationMs": {
+              "control": 536.411404,
+              "treatment": 559.2459075,
+              "difference": 22.834503500000096,
+              "percent": 4.256901201153451
+            },
+            "nodeReads": {
+              "control": 757907,
+              "treatment": 761235.5,
+              "difference": 3328.5,
+              "percent": 0.43916997731912044
+            },
+            "fallbackReads": {
+              "control": 154230.5,
+              "treatment": 153994,
+              "difference": -236.5,
+              "percent": -0.15334191356444205
+            },
+            "ownerReads": {
+              "control": 154230.5,
+              "treatment": 0,
+              "difference": -154230.5,
+              "percent": -100.0
+            },
+            "seals": {
+              "control": 72,
+              "treatment": 72.5,
+              "difference": 0.5,
+              "percent": 0.694444444444442
+            },
+            "peakSealScratchBytes": {
+              "control": 42313884,
+              "treatment": 42313884,
+              "difference": 0,
+              "percent": 0.0
+            }
+          }
+        }
+      },
+      {
+        "block": 2,
+        "controlProcess": 3,
+        "treatmentProcess": 2,
+        "metrics": {
+          "fixed_work": {
+            "inLoopProcessCpuMs": {
+              "control": 21183.8259425,
+              "treatment": 19785.315142,
+              "difference": -1398.5108005000002,
+              "percent": -6.6017857411405645
+            },
+            "inLoopElapsedMs": {
+              "control": 21230.6934305,
+              "treatment": 19838.919329,
+              "difference": -1391.7741014999992,
+              "percent": -6.555481129507424
+            },
+            "sealCpuPerSealMs": {
+              "control": 153.51938100769232,
+              "treatment": 142.78197751538463,
+              "difference": -10.737403492307692,
+              "percent": -6.9941680469449485
+            },
+            "sealWallPerSealMs": {
+              "control": 153.86357237307692,
+              "treatment": 143.17636282692308,
+              "difference": -10.687209546153838,
+              "percent": -6.945899787274068
+            },
+            "stateRootWallMs": {
+              "control": 19391.742894,
+              "treatment": 17996.059085,
+              "difference": -1395.6838089999983,
+              "percent": -7.197309786073102
+            },
+            "lateQueueMs": {
+              "control": 794.0444005,
+              "treatment": 694.731519,
+              "difference": -99.3128815,
+              "percent": -12.507220180315349
+            },
+            "lateReceiveToPrimaryPublicationMs": {
+              "control": 1415.769027,
+              "treatment": 1241.83452,
+              "difference": -173.93450699999994,
+              "percent": -12.285514351770033
+            },
+            "lateAppendToPrimaryPublicationMs": {
+              "control": 620.3253545,
+              "treatment": 545.740142,
+              "difference": -74.58521250000001,
+              "percent": -12.023563434726581
+            },
+            "nodeReads": {
+              "control": 1244212,
+              "treatment": 1244212,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "fallbackReads": {
+              "control": 224148,
+              "treatment": 224148,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "ownerReads": {
+              "control": 224148,
+              "treatment": 0,
+              "difference": -224148,
+              "percent": -100.0
+            },
+            "seals": {
+              "control": 130,
+              "treatment": 130,
+              "difference": 0,
+              "percent": 0.0
+            },
+            "peakSealScratchBytes": {
+              "control": 42313884,
+              "treatment": 42313884,
+              "difference": 0,
+              "percent": 0.0
+            }
+          },
+          "deployed_owner": {
+            "inLoopProcessCpuMs": {
+              "control": 13332.379875,
+              "treatment": 12925.8294045,
+              "difference": -406.5504705000003,
+              "percent": -3.0493465856184954
+            },
+            "inLoopElapsedMs": {
+              "control": 13408.5043885,
+              "treatment": 12958.7026875,
+              "difference": -449.8017010000003,
+              "percent": -3.354600095337845
+            },
+            "sealCpuPerSealMs": {
+              "control": 172.84221204964538,
+              "treatment": 166.8796994184397,
+              "difference": -5.962512631205669,
+              "percent": -3.449685444602535
+            },
+            "sealWallPerSealMs": {
+              "control": 173.90820769503546,
+              "treatment": 167.32385629078013,
+              "difference": -6.5843514042553295,
+              "percent": -3.7861073330142103
+            },
+            "stateRootWallMs": {
+              "control": 11890.0541405,
+              "treatment": 11426.2592395,
+              "difference": -463.7949010000011,
+              "percent": -3.9006962922079502
+            },
+            "lateQueueMs": {
+              "control": 578.1732395,
+              "treatment": 687.593804,
+              "difference": 109.42056449999995,
+              "percent": 18.925221200937294
+            },
+            "lateReceiveToPrimaryPublicationMs": {
+              "control": 1183.4340135,
+              "treatment": 1177.00497,
+              "difference": -6.429043500000034,
+              "percent": -0.5432532297247494
+            },
+            "lateAppendToPrimaryPublicationMs": {
+              "control": 604.268745,
+              "treatment": 483.3990145,
+              "difference": -120.86973049999995,
+              "percent": -20.00264476694057
+            },
+            "nodeReads": {
+              "control": 747622,
+              "treatment": 740006.5,
+              "difference": -7615.5,
+              "percent": -1.0186297353475426
+            },
+            "fallbackReads": {
+              "control": 150980.5,
+              "treatment": 150170.5,
+              "difference": -810.0,
+              "percent": -0.5364931232841319
+            },
+            "ownerReads": {
+              "control": 150980.5,
+              "treatment": 0,
+              "difference": -150980.5,
+              "percent": -100.0
+            },
+            "seals": {
+              "control": 70.5,
+              "treatment": 70.5,
+              "difference": 0.0,
+              "percent": 0.0
+            },
+            "peakSealScratchBytes": {
+              "control": 42313884,
+              "treatment": 42313884,
+              "difference": 0,
+              "percent": 0.0
+            }
+          }
+        }
+      }
+    ],
+    "summary": {
+      "fixed_work": {
+        "inLoopProcessCpuMs": {
+          "control": {
+            "n": 6,
+            "min": 20744.308454,
+            "median": 21214.5206475,
+            "max": 22172.867649,
+            "values": [
+              22172.867649,
+              21245.2153525,
+              20790.6842015,
+              21516.546745,
+              20744.308454,
+              21183.8259425
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 19733.411027,
+            "median": 19990.495119749998,
+            "max": 20337.0880565,
+            "values": [
+              20014.2588105,
+              19966.731429,
+              20103.395109,
+              20337.0880565,
+              19733.411027,
+              19785.315142
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -2158.6088385000003,
+            "median": -1228.9713059999995,
+            "max": -687.2890924999992,
+            "values": [
+              -2158.6088385000003,
+              -1278.4839235,
+              -687.2890924999992,
+              -1179.458688499999,
+              -1010.8974270000035,
+              -1398.5108005000002
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -9.73536158096968,
+            "median": -5.749692750182145,
+            "max": -3.3057550479767883,
+            "values": [
+              -9.73536158096968,
+              -6.017749889974899,
+              -3.3057550479767883,
+              -5.48163561038939,
+              -4.873131486844418,
+              -6.6017857411405645
+            ]
+          }
+        },
+        "inLoopElapsedMs": {
+          "control": {
+            "n": 6,
+            "min": 20806.0879095,
+            "median": 21286.631945499998,
+            "max": 22248.344348,
+            "values": [
+              22248.344348,
+              21342.5704605,
+              20860.6373375,
+              21576.074337,
+              20806.0879095,
+              21230.6934305
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 19779.095819,
+            "median": 20051.3251305,
+            "max": 20398.340737,
+            "values": [
+              20074.652692,
+              20027.997569,
+              20167.4832685,
+              20398.340737,
+              19779.095819,
+              19838.919329
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -2173.691655999999,
+            "median": -1246.1532457499998,
+            "max": -693.1540690000002,
+            "values": [
+              -2173.691655999999,
+              -1314.5728915,
+              -693.1540690000002,
+              -1177.7335999999996,
+              -1026.9920905,
+              -1391.7741014999992
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -9.770127709280096,
+            "median": -5.80895503711994,
+            "max": -3.322784715469629,
+            "values": [
+              -9.770127709280096,
+              -6.15939347105805,
+              -3.322784715469629,
+              -5.458516603181829,
+              -4.936017260751258,
+              -6.555481129507424
+            ]
+          }
+        },
+        "sealCpuPerSealMs": {
+          "control": {
+            "n": 6,
+            "min": 150.38153301923077,
+            "median": 153.63801337884615,
+            "max": 160.4559198730769,
+            "values": [
+              160.4559198730769,
+              153.75664575,
+              150.87568816538462,
+              155.94243937307692,
+              150.38153301923077,
+              153.51938100769232
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 142.5129000076923,
+            "median": 144.01795096153847,
+            "max": 146.85607127307694,
+            "values": [
+              144.1635123576923,
+              143.87238956538462,
+              144.89836541923077,
+              146.85607127307694,
+              142.5129000076923,
+              142.78197751538463
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -16.29240751538461,
+            "median": -9.485312142307677,
+            "max": -5.977322746153845,
+            "values": [
+              -16.29240751538461,
+              -9.884256184615367,
+              -5.977322746153845,
+              -9.086368099999987,
+              -7.8686330115384635,
+              -10.737403492307692
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -10.153821391116114,
+            "median": -6.127625760404648,
+            "max": -3.961753426835546,
+            "values": [
+              -10.153821391116114,
+              -6.428506642039156,
+              -3.961753426835546,
+              -5.826744878770141,
+              -5.232446334040375,
+              -6.9941680469449485
+            ]
+          }
+        },
+        "sealWallPerSealMs": {
+          "control": {
+            "n": 6,
+            "min": 150.84124985,
+            "median": 154.15643449423078,
+            "max": 160.9990305076923,
+            "values": [
+              160.9990305076923,
+              154.4492966153846,
+              151.38777111923076,
+              156.37424915,
+              150.84124985,
+              153.86357237307692
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 142.8503299884615,
+            "median": 144.44196689230768,
+            "max": 147.29994465000001,
+            "values": [
+              144.59059243461536,
+              144.29334135,
+              145.36501230384616,
+              147.29994465000001,
+              142.8503299884615,
+              143.17636282692308
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -16.40843807307695,
+            "median": -9.615129882692301,
+            "max": -6.022758815384606,
+            "values": [
+              -16.40843807307695,
+              -10.15595526538462,
+              -6.022758815384606,
+              -9.074304499999982,
+              -7.990919861538487,
+              -10.687209546153838
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -10.191637813802224,
+            "median": -6.189266100843865,
+            "max": -3.9783654722290396,
+            "values": [
+              -10.191637813802224,
+              -6.575591788336443,
+              -3.9783654722290396,
+              -5.802940413351287,
+              -5.297569378061262,
+              -6.945899787274068
+            ]
+          }
+        },
+        "stateRootWallMs": {
+          "control": {
+            "n": 6,
+            "min": 18999.042886,
+            "median": 19422.71366575,
+            "max": 20282.6162945,
+            "values": [
+              20282.6162945,
+              19453.6844375,
+              19074.8298525,
+              19706.02301,
+              18999.042886,
+              19391.742894
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 17956.30865,
+            "median": 18153.357877000002,
+            "max": 18525.451285,
+            "values": [
+              18176.847822,
+              18129.867932,
+              18274.4952405,
+              18525.451285,
+              17956.30865,
+              17996.059085
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -2105.7684725,
+            "median": -1252.1941152500003,
+            "max": -800.3346119999987,
+            "values": [
+              -2105.7684725,
+              -1323.816505499999,
+              -800.3346119999987,
+              -1180.5717250000016,
+              -1042.7342360000002,
+              -1395.6838089999983
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -10.382134345612092,
+            "median": -6.397941842212728,
+            "max": -4.195762783672253,
+            "values": [
+              -10.382134345612092,
+              -6.804965453989464,
+              -4.195762783672253,
+              -5.990918230435993,
+              -5.488351398840042,
+              -7.197309786073102
+            ]
+          }
+        },
+        "lateQueueMs": {
+          "control": {
+            "n": 6,
+            "min": 700.679825,
+            "median": 773.6349955000001,
+            "max": 820.712975,
+            "values": [
+              820.712975,
+              711.7164405,
+              762.6256935,
+              784.6442975,
+              700.679825,
+              794.0444005
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 681.704278,
+            "median": 693.03253025,
+            "max": 731.7243125,
+            "values": [
+              690.073602,
+              681.704278,
+              731.7243125,
+              723.662119,
+              691.3335415,
+              694.731519
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -130.63937299999998,
+            "median": -45.94177975000002,
+            "max": -9.346283500000027,
+            "values": [
+              -130.63937299999998,
+              -30.01216249999993,
+              -30.901381000000015,
+              -60.98217850000003,
+              -9.346283500000027,
+              -99.3128815
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -15.917790625888417,
+            "median": -5.994411402730998,
+            "max": -1.333887913784304,
+            "values": [
+              -15.917790625888417,
+              -4.21687076371533,
+              -4.051972188109865,
+              -7.771952041746665,
+              -1.333887913784304,
+              -12.507220180315349
+            ]
+          }
+        },
+        "lateReceiveToPrimaryPublicationMs": {
+          "control": {
+            "n": 6,
+            "min": 1256.667425,
+            "median": 1360.2487585,
+            "max": 1459.3837565,
+            "values": [
+              1459.3837565,
+              1318.144705,
+              1331.687461,
+              1388.810056,
+              1256.667425,
+              1415.769027
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 1179.99713,
+            "median": 1223.17982,
+            "max": 1289.8325975,
+            "values": [
+              1186.7890435,
+              1204.52512,
+              1274.479936,
+              1289.8325975,
+              1179.99713,
+              1241.83452
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -272.59471299999996,
+            "median": -106.29852174999996,
+            "max": -57.20752500000003,
+            "values": [
+              -272.59471299999996,
+              -113.61958499999992,
+              -57.20752500000003,
+              -98.97745850000001,
+              -76.67029500000012,
+              -173.93450699999994
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -18.678754767954686,
+            "median": -7.873220501984369,
+            "max": -4.295867211743609,
+            "values": [
+              -18.678754767954686,
+              -8.619659478129904,
+              -4.295867211743609,
+              -7.126781525838832,
+              -6.101080801071945,
+              -12.285514351770033
+            ]
+          }
+        },
+        "lateAppendToPrimaryPublicationMs": {
+          "control": {
+            "n": 6,
+            "min": 554.784756,
+            "median": 604.0000474999999,
+            "max": 637.4390075,
+            "values": [
+              637.4390075,
+              605.2105715,
+              567.3931485,
+              602.7895235,
+              554.784756,
+              620.3253545
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 487.4407,
+            "median": 531.4777557499999,
+            "max": 564.710994,
+            "values": [
+              495.525876,
+              521.564628,
+              541.3908835,
+              564.710994,
+              487.4407,
+              545.740142
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -141.91313150000002,
+            "median": -70.96463425000002,
+            "max": -26.00226500000008,
+            "values": [
+              -141.91313150000002,
+              -83.64594350000004,
+              -26.00226500000008,
+              -38.078529499999945,
+              -67.34405600000002,
+              -74.58521250000001
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -22.263013375440476,
+            "median": -12.081167661341897,
+            "max": -4.582759779306722,
+            "values": [
+              -22.263013375440476,
+              -13.82096536957138,
+              -4.582759779306722,
+              -6.317052306898619,
+              -12.138771887957212,
+              -12.023563434726581
+            ]
+          }
+        },
+        "nodeReads": {
+          "control": {
+            "n": 6,
+            "min": 1244212,
+            "median": 1244212.0,
+            "max": 1244212,
+            "values": [
+              1244212,
+              1244212,
+              1244212,
+              1244212,
+              1244212,
+              1244212
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 1244212,
+            "median": 1244212.0,
+            "max": 1244212,
+            "values": [
+              1244212,
+              1244212,
+              1244212,
+              1244212,
+              1244212,
+              1244212
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": 0,
+            "median": 0.0,
+            "max": 0,
+            "values": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": 0.0,
+            "median": 0.0,
+            "max": 0.0,
+            "values": [
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          }
+        },
+        "fallbackReads": {
+          "control": {
+            "n": 6,
+            "min": 224148,
+            "median": 224148.0,
+            "max": 224148,
+            "values": [
+              224148,
+              224148,
+              224148,
+              224148,
+              224148,
+              224148
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 224148,
+            "median": 224148.0,
+            "max": 224148,
+            "values": [
+              224148,
+              224148,
+              224148,
+              224148,
+              224148,
+              224148
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": 0,
+            "median": 0.0,
+            "max": 0,
+            "values": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": 0.0,
+            "median": 0.0,
+            "max": 0.0,
+            "values": [
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          }
+        },
+        "ownerReads": {
+          "control": {
+            "n": 6,
+            "min": 224148,
+            "median": 224148.0,
+            "max": 224148,
+            "values": [
+              224148,
+              224148,
+              224148,
+              224148,
+              224148,
+              224148
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 0,
+            "median": 0.0,
+            "max": 0,
+            "values": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -224148,
+            "median": -224148.0,
+            "max": -224148,
+            "values": [
+              -224148,
+              -224148,
+              -224148,
+              -224148,
+              -224148,
+              -224148
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -100.0,
+            "median": -100.0,
+            "max": -100.0,
+            "values": [
+              -100.0,
+              -100.0,
+              -100.0,
+              -100.0,
+              -100.0,
+              -100.0
+            ]
+          }
+        },
+        "seals": {
+          "control": {
+            "n": 6,
+            "min": 130,
+            "median": 130.0,
+            "max": 130,
+            "values": [
+              130,
+              130,
+              130,
+              130,
+              130,
+              130
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 130,
+            "median": 130.0,
+            "max": 130,
+            "values": [
+              130,
+              130,
+              130,
+              130,
+              130,
+              130
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": 0,
+            "median": 0.0,
+            "max": 0,
+            "values": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": 0.0,
+            "median": 0.0,
+            "max": 0.0,
+            "values": [
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          }
+        },
+        "peakSealScratchBytes": {
+          "control": {
+            "n": 6,
+            "min": 42313884,
+            "median": 42313884.0,
+            "max": 42313884,
+            "values": [
+              42313884,
+              42313884,
+              42313884,
+              42313884,
+              42313884,
+              42313884
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 42313884,
+            "median": 42313884.0,
+            "max": 42313884,
+            "values": [
+              42313884,
+              42313884,
+              42313884,
+              42313884,
+              42313884,
+              42313884
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": 0,
+            "median": 0.0,
+            "max": 0,
+            "values": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": 0.0,
+            "median": 0.0,
+            "max": 0.0,
+            "values": [
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          }
+        }
+      },
+      "deployed_owner": {
+        "inLoopProcessCpuMs": {
+          "control": {
+            "n": 6,
+            "min": 13332.379875,
+            "median": 14153.06251075,
+            "max": 15040.237621,
+            "values": [
+              14151.981642,
+              14671.1760745,
+              14154.1433795,
+              15040.237621,
+              13841.0746355,
+              13332.379875
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 12925.8294045,
+            "median": 13820.59305425,
+            "max": 14550.499424,
+            "values": [
+              14550.499424,
+              14372.1299545,
+              13777.71937,
+              13863.4667385,
+              13371.058425,
+              12925.8294045
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -1176.7708825000009,
+            "median": -391.4872399999995,
+            "max": 398.517781999999,
+            "values": [
+              398.517781999999,
+              -299.04611999999906,
+              -376.42400949999865,
+              -1176.7708825000009,
+              -470.01621049999994,
+              -406.5504705000003
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -7.82415086884618,
+            "median": -2.854404098154867,
+            "max": 2.8159857190408255,
+            "values": [
+              2.8159857190408255,
+              -2.038324115813539,
+              -2.6594616106912383,
+              -7.82415086884618,
+              -3.3958072106228587,
+              -3.0493465856184954
+            ]
+          }
+        },
+        "inLoopElapsedMs": {
+          "control": {
+            "n": 6,
+            "min": 13408.5043885,
+            "median": 14192.7020735,
+            "max": 15079.289639,
+            "values": [
+              14199.8288845,
+              14703.604299,
+              14185.5752625,
+              15079.289639,
+              13878.8271565,
+              13408.5043885
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 12958.7026875,
+            "median": 13856.99905375,
+            "max": 14593.9963555,
+            "values": [
+              14593.9963555,
+              14433.2677265,
+              13816.579693,
+              13897.4184145,
+              13406.2326705,
+              12958.7026875
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -1181.8712245000006,
+            "median": -409.39863525000055,
+            "max": 394.16747099999884,
+            "values": [
+              394.16747099999884,
+              -270.33657250000033,
+              -368.9955695000008,
+              -1181.8712245000006,
+              -472.59448599999996,
+              -449.8017010000003
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -7.837711542082815,
+            "median": -2.977901407401762,
+            "max": 2.775860710760103,
+            "values": [
+              2.775860710760103,
+              -1.8385735021336669,
+              -2.6012027194656784,
+              -7.837711542082815,
+              -3.405147140107334,
+              -3.354600095337845
+            ]
+          }
+        },
+        "sealCpuPerSealMs": {
+          "control": {
+            "n": 6,
+            "min": 172.34236202000002,
+            "median": 175.67486429354352,
+            "max": 185.5540655704698,
+            "values": [
+              172.34236202000002,
+              182.02998435135135,
+              175.30493236486487,
+              185.5540655704698,
+              176.0447962222222,
+              172.84221204964538
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 166.8796994184397,
+            "median": 171.68880402980378,
+            "max": 175.1933557368421,
+            "values": [
+              175.1933557368421,
+              174.10332181456954,
+              172.3422499109589,
+              171.03535814864864,
+              168.04821984827586,
+              166.8796994184397
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -14.518707421821148,
+            "median": -6.944587583993737,
+            "max": 2.8509937168420834,
+            "values": [
+              2.8509937168420834,
+              -7.926662536781805,
+              -2.9626824539059555,
+              -14.518707421821148,
+              -7.99657637394634,
+              -5.962512631205669
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -7.824515931345754,
+            "median": -3.9021385576626266,
+            "max": 1.6542617168675111,
+            "values": [
+              1.6542617168675111,
+              -4.354591670722718,
+              -1.690016597901356,
+              -7.824515931345754,
+              -4.54235316552738,
+              -3.449685444602535
+            ]
+          }
+        },
+        "sealWallPerSealMs": {
+          "control": {
+            "n": 6,
+            "min": 172.9062895733333,
+            "median": 176.11625160031906,
+            "max": 186.01909416107384,
+            "values": [
+              172.9062895733333,
+              182.4331319054054,
+              175.70386452702704,
+              186.01909416107384,
+              176.5286386736111,
+              173.90820769503546
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 167.32385629078013,
+            "median": 172.15387538550536,
+            "max": 175.7174482631579,
+            "values": [
+              175.7174482631579,
+              174.869958410596,
+              172.8415160547945,
+              171.4662347162162,
+              168.50222040689656,
+              167.32385629078013
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -14.552859444857631,
+            "median": -7.073762449532353,
+            "max": 2.8111586898245946,
+            "values": [
+              2.8111586898245946,
+              -7.5631734948093765,
+              -2.862348472232526,
+              -14.552859444857631,
+              -8.026418266714558,
+              -6.5843514042553295
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -7.823314864793563,
+            "median": -3.965915491499239,
+            "max": 1.6258278960016304,
+            "values": [
+              1.6258278960016304,
+              -4.145723649984268,
+              -1.6290754218398207,
+              -7.823314864793563,
+              -4.546808000686409,
+              -3.7861073330142103
+            ]
+          }
+        },
+        "stateRootWallMs": {
+          "control": {
+            "n": 6,
+            "min": 11890.0541405,
+            "median": 12594.383214,
+            "max": 13457.5670495,
+            "values": [
+              12574.287088,
+              13095.4271625,
+              12614.47934,
+              13457.5670495,
+              12331.480715,
+              11890.0541405
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 11426.2592395,
+            "median": 12259.252566750001,
+            "max": 12944.6805145,
+            "values": [
+              12944.6805145,
+              12784.9658935,
+              12223.1788895,
+              12295.326244,
+              11828.939916,
+              11426.2592395
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -1162.2408054999996,
+            "median": -427.54767575000005,
+            "max": 370.3934265000007,
+            "values": [
+              370.3934265000007,
+              -310.46126899999945,
+              -391.300450499999,
+              -1162.2408054999996,
+              -502.54079900000033,
+              -463.7949010000011
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -8.636336725836202,
+            "median": -3.5013453769575764,
+            "max": 2.9456415612896025,
+            "values": [
+              2.9456415612896025,
+              -2.3707609163680754,
+              -3.1019944617072026,
+              -8.636336725836202,
+              -4.075267282287598,
+              -3.9006962922079502
+            ]
+          }
+        },
+        "lateQueueMs": {
+          "control": {
+            "n": 6,
+            "min": 542.505964,
+            "median": 680.006243,
+            "max": 755.6428395,
+            "values": [
+              755.6428395,
+              680.6688445,
+              542.505964,
+              723.4855145,
+              679.3436415,
+              578.1732395
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 512.0290595,
+            "median": 637.8798322499999,
+            "max": 710.853599,
+            "values": [
+              590.230774,
+              710.853599,
+              656.543924,
+              512.0290595,
+              619.2157405,
+              687.593804
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -211.456455,
+            "median": -14.971573249999949,
+            "max": 114.03796,
+            "values": [
+              -165.41206550000004,
+              30.184754500000054,
+              114.03796,
+              -211.456455,
+              -60.12790099999995,
+              109.42056449999995
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -29.227462162271113,
+            "median": -2.2081544418164567,
+            "max": 21.020591028931058,
+            "values": [
+              -21.890244551175954,
+              4.434572662448355,
+              21.020591028931058,
+              -29.227462162271113,
+              -8.850881546081268,
+              18.925221200937294
+            ]
+          }
+        },
+        "lateReceiveToPrimaryPublicationMs": {
+          "control": {
+            "n": 6,
+            "min": 1173.346154,
+            "median": 1250.879497,
+            "max": 1346.2586225,
+            "values": [
+              1346.2586225,
+              1284.7985125,
+              1173.346154,
+              1310.4756095,
+              1216.9604815,
+              1183.4340135
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 1064.7383085,
+            "median": 1177.6723124999999,
+            "max": 1260.6707235,
+            "values": [
+              1119.76439,
+              1260.6707235,
+              1178.339655,
+              1064.7383085,
+              1184.499617,
+              1177.00497
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -245.73730100000012,
+            "median": -28.294326750000096,
+            "max": 4.993500999999924,
+            "values": [
+              -226.49423249999995,
+              -24.12778900000012,
+              4.993500999999924,
+              -245.73730100000012,
+              -32.46086450000007,
+              -6.429043500000034
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -18.751764566893304,
+            "median": -2.2726577612051213,
+            "max": 0.42557782142778056,
+            "values": [
+              -16.82397636788394,
+              -1.8779434102123571,
+              0.42557782142778056,
+              -18.751764566893304,
+              -2.6673721121978855,
+              -0.5432532297247494
+            ]
+          }
+        },
+        "lateAppendToPrimaryPublicationMs": {
+          "control": {
+            "n": 6,
+            "min": 536.411404,
+            "median": 591.333716,
+            "max": 625.1520885,
+            "values": [
+              584.4568985,
+              598.2105335,
+              625.1520885,
+              580.9128315,
+              536.411404,
+              604.268745
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 483.3990145,
+            "median": 535.2925192499999,
+            "max": 559.2459075,
+            "values": [
+              528.5708815,
+              542.014157,
+              520.4725975,
+              551.7971135,
+              559.2459075,
+              483.3990145
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -120.86973049999995,
+            "median": -56.04119674999998,
+            "max": 22.834503500000096,
+            "values": [
+              -55.886016999999924,
+              -56.19637650000004,
+              -104.67949099999998,
+              -29.115718000000015,
+              22.834503500000096,
+              -120.86973049999995
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -20.00264476694057,
+            "median": -9.478061282192234,
+            "max": 4.256901201153451,
+            "values": [
+              -9.562042495080568,
+              -9.3940800693039,
+              -16.744643891563992,
+              -5.012063156673452,
+              4.256901201153451,
+              -20.00264476694057
+            ]
+          }
+        },
+        "nodeReads": {
+          "control": {
+            "n": 6,
+            "min": 747622,
+            "median": 772405.75,
+            "max": 784191,
+            "values": [
+              771514,
+              783714.5,
+              773297.5,
+              784191,
+              757907,
+              747622
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 740006.5,
+            "median": 773240.5,
+            "max": 802478.5,
+            "values": [
+              800301.5,
+              802478.5,
+              770718,
+              775763,
+              761235.5,
+              740006.5
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -8428,
+            "median": 374.5,
+            "max": 28787.5,
+            "values": [
+              28787.5,
+              18764.0,
+              -2579.5,
+              -8428,
+              3328.5,
+              -7615.5
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -1.0747381696550984,
+            "median": 0.05279924319936957,
+            "max": 3.731299756064055,
+            "values": [
+              3.731299756064055,
+              2.3942392286987246,
+              -0.3335714909203813,
+              -1.0747381696550984,
+              0.43916997731912044,
+              -1.0186297353475426
+            ]
+          }
+        },
+        "fallbackReads": {
+          "control": {
+            "n": 6,
+            "min": 150980.5,
+            "median": 155357.25,
+            "max": 160840.5,
+            "values": [
+              154143.5,
+              160648,
+              156484,
+              160840.5,
+              154230.5,
+              150980.5
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 150170.5,
+            "median": 157561.25,
+            "max": 163744.5,
+            "values": [
+              163744.5,
+              160732,
+              158244.5,
+              156878,
+              153994,
+              150170.5
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -3962.5,
+            "median": -76.25,
+            "max": 9601.0,
+            "values": [
+              9601.0,
+              84,
+              1760.5,
+              -3962.5,
+              -236.5,
+              -810.0
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -2.463620792026888,
+            "median": -0.050526840453357647,
+            "max": 6.228611650831861,
+            "values": [
+              6.228611650831861,
+              0.05228823265772675,
+              1.125035147363307,
+              -2.463620792026888,
+              -0.15334191356444205,
+              -0.5364931232841319
+            ]
+          }
+        },
+        "ownerReads": {
+          "control": {
+            "n": 6,
+            "min": 150980.5,
+            "median": 155357.25,
+            "max": 160840.5,
+            "values": [
+              154143.5,
+              160648,
+              156484,
+              160840.5,
+              154230.5,
+              150980.5
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 0,
+            "median": 0.0,
+            "max": 0,
+            "values": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -160840.5,
+            "median": -155357.25,
+            "max": -150980.5,
+            "values": [
+              -154143.5,
+              -160648,
+              -156484,
+              -160840.5,
+              -154230.5,
+              -150980.5
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -100.0,
+            "median": -100.0,
+            "max": -100.0,
+            "values": [
+              -100.0,
+              -100.0,
+              -100.0,
+              -100.0,
+              -100.0,
+              -100.0
+            ]
+          }
+        },
+        "seals": {
+          "control": {
+            "n": 6,
+            "min": 70.5,
+            "median": 74.0,
+            "max": 75,
+            "values": [
+              75,
+              74,
+              74,
+              74.5,
+              72,
+              70.5
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 70.5,
+            "median": 73.5,
+            "max": 76,
+            "values": [
+              76,
+              75.5,
+              73,
+              74,
+              72.5,
+              70.5
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": -1,
+            "median": 0.25,
+            "max": 1.5,
+            "values": [
+              1,
+              1.5,
+              -1,
+              -0.5,
+              0.5,
+              0.0
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": -1.3513513513513487,
+            "median": 0.347222222222221,
+            "max": 2.0270270270270174,
+            "values": [
+              1.333333333333342,
+              2.0270270270270174,
+              -1.3513513513513487,
+              -0.6711409395973145,
+              0.694444444444442,
+              0.0
+            ]
+          }
+        },
+        "peakSealScratchBytes": {
+          "control": {
+            "n": 6,
+            "min": 42313884,
+            "median": 42313884.0,
+            "max": 42313884,
+            "values": [
+              42313884,
+              42313884,
+              42313884,
+              42313884,
+              42313884,
+              42313884
+            ]
+          },
+          "treatment": {
+            "n": 6,
+            "min": 42313884,
+            "median": 42313884.0,
+            "max": 42313884,
+            "values": [
+              42313884,
+              42313884,
+              42313884,
+              42313884,
+              42313884,
+              42313884
+            ]
+          },
+          "pairedDifference": {
+            "n": 6,
+            "min": 0,
+            "median": 0.0,
+            "max": 0,
+            "values": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "pairedPercent": {
+            "n": 6,
+            "min": 0.0,
+            "median": 0.0,
+            "max": 0.0,
+            "values": [
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0
+            ]
+          }
+        }
+      }
+    },
+    "independentUnit": "process; two measured observations per schedule inside each process",
+    "timingScope": "synthetic native owner loop, not publisher Prepared, gossip or live deadlines",
+    "qualified": true,
+    "binaries": {
+      "control": "4bdf0275190fa68504f6700728f5e831c3a94a91f2300afd00183119662f6d90",
+      "treatment": "04d95e25f60030787175abf5bf0b3c32cf157333cebec39892c83b2764e38698"
+    },
+    "fixtureSha256": "7912ff3f25bd2f05ca254d648d8e8bcb2b88c276f74e427d823c04affd8a3e0b",
+    "literalCompletePayloadAndSupplementalReceiptEquality": true,
+    "payloadArtifactSha256": {
+      "fixed_work": "09dc41d7dc6060964c44ef888750b73e60b5edd48a1456edd98e46a7c4c7356a",
+      "deployed_owner": "411c03d7a71307cf343ef6effb06bfa9207ae64d2c5dd264c0e3f36375c1835d"
+    },
+    "stateRoots": [
+      "e976e2310f2bad45c179a06c301d7eff511c2f24cc2b116ab2f401a3f83a432b",
+      "e976e2310f2bad45c179a06c301d7eff511c2f24cc2b116ab2f401a3f83a432b"
+    ],
+    "blockHashes": [
+      "06fa6524743a2147d8ec1d17149501dd0b4fafe45df1690d84fe12fb6815ccc9",
+      "bf2b1eb700f32c360383bcdbbce3f3c81e988379dff9d54c859d1983987e4ada"
+    ],
+    "fixedCacheStatisticsExceptOwnerReads": [
+      {
+        "enabled": true,
+        "requests": 622106,
+        "hits": 498276,
+        "authorized_reads": 11756,
+        "fallback_reads": 112074,
+        "entries": 32768,
+        "metadata_capacity_entries": 65536,
+        "retained_bytes": 1863409,
+        "capacity_misses": 206828
+      },
+      {
+        "enabled": true,
+        "requests": 622106,
+        "hits": 498276,
+        "authorized_reads": 11756,
+        "fallback_reads": 112074,
+        "entries": 32768,
+        "metadata_capacity_entries": 65536,
+        "retained_bytes": 1863409,
+        "capacity_misses": 206828
+      }
+    ],
+    "fixedNativeCounts": [
+      [
+        9,
+        8192,
+        1,
+        622106,
+        89298831,
+        65,
+        65,
+        65
+      ],
+      [
+        9,
+        8192,
+        1,
+        622106,
+        89298831,
+        65,
+        65,
+        65
+      ]
+    ]
+  },
+  "limits": [
+    "Six independent matched process pairs across ABBA/BAAB/ABBA; two measured observations per schedule in each process are not independent replicates.",
+    "Only fixed_work has equal intermediate sealing work. deployed_owner uses the existing 16-attempt/20ms/250ms scheduling and may seal different prefixes.",
+    "Runtime/Host/Intake use production-default SafeAllocator options. Fixture, Io and assertion allocations still use the test allocator.",
+    "Synthetic 65536-slot parent, 8192 writes, 65 transactions, two branches, 300M gas ceiling and 60s session allowance.",
+    "Runtime reserves worker512MiB/session128MiB/result16MiB/retained128MiB; these fixture reserves are not a qualification of deployed resource headroom.",
+    "Host load and CPU pressure are recorded; CPU affinity/governor and other user workloads were not controlled. Leaf cgroup counters did not expose a throttling count.",
+    "Allocation injection covers backing allocator/arena-refill failure points; not every logical scratch allocation site or reuse after every mid-read OOM.",
+    "Reconstructed receipt bytes supplement complete payload/header/root equality. Prior strong-poison allocator cohort separately covers retained ownership.",
+    "No live network, Prepared, gossip, proposer-delivery, deadline or bid-outcome claim. No live database was opened."
+  ]
+}
