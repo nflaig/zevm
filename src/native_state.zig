@@ -302,9 +302,17 @@ pub const Lease = struct {
 
     fn readNodeUncached(self: *const Lease, a: A, view: View, owner: ?u160, path: []const u8, expected_hash: Hash) ![]const u8 {
         if (owner) |address| {
-            if (self.node_cache) |cache| cache.stats.owner_reads += 1;
-            const account = try self.readAccount(a, address);
-            var storage_trie = try self.owner.eth.openStorageTrie(a, view.txn, types.keccakOfU160(address), account.storage_hash);
+            const storage_root = root: {
+                // A missing child edge still needs a complete storage-root walk.
+                // The owner root may already be authenticated in this exact,
+                // non-evicting lease even when its authorization map is full.
+                if (self.node_cache) |cache| {
+                    if (cache.entries.get(NodeCache.Key.init(address, &.{}))) |entry| break :root entry.hash;
+                    cache.stats.owner_reads += 1;
+                }
+                break :root (try self.readAccount(a, address)).storage_hash;
+            };
+            var storage_trie = try self.owner.eth.openStorageTrie(a, view.txn, types.keccakOfU160(address), storage_root);
             defer self.owner.eth.closeStorageTrie(&storage_trie);
             return storage_trie.inner.nodeAtPath(path, expected_hash);
         }

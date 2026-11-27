@@ -37,7 +37,7 @@ at most 64 nibbles and batches at most 16 nodes.
 The traversal cache is explicitly disabled by default. Enable it on a lease
 with `try lease.enableNodeCache(allocator, .{})`; that allocator must outlive the
 lease. The default permits 4,096 path entries and 4 MiB of retained RLP. Hard
-limits are 16,384 entries and 16 MiB of RLP per lease. Metadata is separately
+limits are 32,768 entries and 16 MiB of RLP per lease. Metadata is separately
 bounded by the reserved hash-table capacity; `nodeCacheStats()` reports both
 the occupied entries and reserved entry capacity, plus retained RLP bytes.
 
@@ -60,6 +60,15 @@ report hits, authorized reads, root-walk fallbacks, owner reads and capacity
 misses; they count attempted work, not just successful operations. These modes
 support matched measurements; enabling the cache alone is not evidence of a
 payload or bid improvement.
+
+When a child authorization is absent, the storage path still walks from its
+authenticated root and checks the requested hash. If this same lease already
+retains the owner's storage-root authorization, the fallback reuses that root
+instead of reading the owner account again. No root crosses a lease or parent,
+and a missing owner authorization retains the ordinary authenticated account
+read. The `owner_reads` counter counts attempted fallback account reads.
+Cache bounds, returned-byte ownership and immutable payload lifetimes do not
+change. Performance qualification must include saturated-cache workloads.
 
 `header` and `stamp` identify the leased state. `readAncestors` returns up to 256
 owned inline headers. Only ancestor lookup may open a fresh read transaction to

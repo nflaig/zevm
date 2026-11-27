@@ -1,0 +1,817 @@
+diff --git a/build.zig b/build.zig
+index 7b19e8d..f8a0701 100644
+--- a/build.zig
++++ b/build.zig
+@@ -252,6 +252,8 @@ fn addNativeQualification(
+     const host_cadence_benchmark_step = b.step("test-native-host-cadence-benchmark", "Compare native owner pacing with identical payloads");
+     const finalization_benchmark_step = b.step("test-native-finalization-benchmark", "Measure repeated authenticated native seals");
+     const node_cache_benchmark_step = b.step("test-native-node-cache-benchmark", "Compare bounded native node caches across repeated same-lease seals");
++    const owner_root_benchmark_build_step = b.step("build-native-owner-root-benchmark", "Build the standalone matched owner-root benchmark binary");
++    const owner_root_benchmark_step = b.step("test-native-owner-root-benchmark", "Measure saturated-cache owner-root reuse and late ordinary publication");
+     const node_cache_32k_step = b.step("test-native-node-cache32k", "Qualify isolated16K/32K authenticated cache pressure");
+     const node_cache_capacity_step = b.step("test-native-node-cache-capacity", "Measure native cache allocation and large-trie Host capacity");
+     const node_reseal_benchmark_step = b.step("test-native-node-reseal-benchmark", "Compare bounded alternate public resealing on identical storage workloads");
+@@ -273,6 +275,8 @@ fn addNativeQualification(
+         selection_bench_step.dependOn(&missing_path.step);
+         host_batch_benchmark_step.dependOn(&missing_path.step);
+         node_cache_benchmark_step.dependOn(&missing_path.step);
++        owner_root_benchmark_step.dependOn(&missing_path.step);
++        owner_root_benchmark_build_step.dependOn(&missing_path.step);
+         node_cache_capacity_step.dependOn(&missing_path.step);
+         node_cache_32k_step.dependOn(&missing_path.step);
+         node_reseal_benchmark_step.dependOn(&missing_path.step);
+@@ -361,8 +365,9 @@ fn addNativeQualification(
+     native_control_blobs.addImport("rlp", execution_rlp);
+     native_control.addImport("native_control_blobs", native_control_blobs);
+ 
+-    inline for (.{ .{ "test/native_runtime.zig", runtime_test_step }, .{ "test/native_intake.zig", intake_test_step }, .{ "test/native_intake_benchmark.zig", intake_bench_step }, .{ "test/native_host.zig", host_test_step }, .{ "test/native_host_selection_benchmark.zig", selection_bench_step }, .{ "test/native_host_batch_benchmark.zig", host_batch_benchmark_step }, .{ "test/native_host_cadence_benchmark.zig", host_cadence_benchmark_step }, .{ "test/native_finalization_benchmark.zig", finalization_benchmark_step }, .{ "test/native_node_cache_benchmark.zig", node_cache_benchmark_step }, .{ "test/native_node_cache_capacity.zig", node_cache_capacity_step }, .{ "test/native_node_cache32k.zig", node_cache_32k_step }, .{ "test/native_node_reseal_benchmark.zig", node_reseal_benchmark_step }, .{ "test/native_orders.zig", orders_test_step }, .{ "test/native_publication.zig", publication_test_step }, .{ "test/native_control.zig", control_test_step }, .{ "test/native_control_memory_benchmark.zig", control_memory_benchmark_step }, .{ "test/native_control_blobs.zig", control_blobs_test_step }, .{ "test/benchmark_native_orders.zig", orders_benchmark_step } }) |item| {
++    inline for (.{ .{ "test/native_runtime.zig", runtime_test_step }, .{ "test/native_intake.zig", intake_test_step }, .{ "test/native_intake_benchmark.zig", intake_bench_step }, .{ "test/native_host.zig", host_test_step }, .{ "test/native_host_selection_benchmark.zig", selection_bench_step }, .{ "test/native_host_batch_benchmark.zig", host_batch_benchmark_step }, .{ "test/native_host_cadence_benchmark.zig", host_cadence_benchmark_step }, .{ "test/native_finalization_benchmark.zig", finalization_benchmark_step }, .{ "test/native_node_cache_benchmark.zig", node_cache_benchmark_step }, .{ "test/native_owner_root_benchmark.zig", owner_root_benchmark_step }, .{ "test/native_node_cache_capacity.zig", node_cache_capacity_step }, .{ "test/native_node_cache32k.zig", node_cache_32k_step }, .{ "test/native_node_reseal_benchmark.zig", node_reseal_benchmark_step }, .{ "test/native_orders.zig", orders_test_step }, .{ "test/native_publication.zig", publication_test_step }, .{ "test/native_control.zig", control_test_step }, .{ "test/native_control_memory_benchmark.zig", control_memory_benchmark_step }, .{ "test/native_control_blobs.zig", control_blobs_test_step }, .{ "test/benchmark_native_orders.zig", orders_benchmark_step } }) |item| {
+         const tests = b.addTest(.{
++            .name = if (item[1] == owner_root_benchmark_step) "native-owner-root-benchmark" else "test",
+             .filters = if (test_filter) |filter| &.{filter} else &.{},
+             .root_module = b.createModule(.{
+                 .root_source_file = b.path(item[0]),
+@@ -392,11 +397,13 @@ fn addNativeQualification(
+             b.step("build-native-finalization-benchmark", "Build isolated native finalization qualification executable")
+                 .dependOn(&b.addInstallArtifact(tests, .{ .dest_sub_path = "native-finalization-test" }).step);
+         }
++        if (item[1] == owner_root_benchmark_step)
++            owner_root_benchmark_build_step.dependOn(&b.addInstallArtifact(tests, .{}).step);
+         const run = b.addRunArtifact(tests);
+         // Measurements need fresh samples. Control tests may use Python and
+         // external gateway/publisher checkouts that Zig's result cache cannot
+         // track. Ordinary self-contained regressions can retain that cache.
+-        if (item[1] == selection_bench_step or item[1] == intake_bench_step or item[1] == orders_benchmark_step or item[1] == host_batch_benchmark_step or item[1] == host_cadence_benchmark_step or item[1] == node_cache_benchmark_step or item[1] == node_cache_capacity_step or item[1] == node_cache_32k_step or item[1] == node_reseal_benchmark_step or item[1] == control_test_step or item[1] == control_memory_benchmark_step) run.has_side_effects = true;
++        if (item[1] == owner_root_benchmark_step or item[1] == selection_bench_step or item[1] == intake_bench_step or item[1] == orders_benchmark_step or item[1] == host_batch_benchmark_step or item[1] == host_cadence_benchmark_step or item[1] == node_cache_benchmark_step or item[1] == node_cache_capacity_step or item[1] == node_cache_32k_step or item[1] == node_reseal_benchmark_step or item[1] == control_test_step or item[1] == control_memory_benchmark_step) run.has_side_effects = true;
+         item[1].dependOn(&run.step);
+     }
+     const runtime_bench = b.addExecutable(.{
+diff --git a/docs/qualification/native-owner-root-benchmark.md b/docs/qualification/native-owner-root-benchmark.md
+new file mode 100644
+index 0000000..42abf0e
+--- /dev/null
++++ b/docs/qualification/native-owner-root-benchmark.md
+@@ -0,0 +1,91 @@
++# Matched authenticated owner-root experiment
++
++This opt-in fixture compares two frozen native-state producer checkouts. It does
++not change any consumer runtime source, cache bound, or production schedule.
++The initial control is producer `1fe7a0efb10bb8534346b5eb4c8aab3cdf9b0dd2` and
++the consumer base is `6c64b11ec8d277de1cb5b236c5320aa2b9309d13`.
++
++Use the pinned Zig 0.17 toolchain and separate cache/install directories:
++
++```sh
++zig build build-native-owner-root-benchmark \
++  -Dnative-state-path="$OWNER_CONTROL" -Doptimize=safe \
++  -Dtarget=x86_64-linux-gnu.2.35 -Dcpu=baseline+cx16 -j2 \
++  --cache-dir "$OWNER_CONTROL_CACHE" --prefix "$OWNER_CONTROL_BIN"
++zig build build-native-owner-root-benchmark \
++  -Dnative-state-path="$OWNER_TREATMENT" -Doptimize=safe \
++  -Dtarget=x86_64-linux-gnu.2.35 -Dcpu=baseline+cx16 -j2 \
++  --cache-dir "$OWNER_TREATMENT_CACHE" --prefix "$OWNER_TREATMENT_BIN"
++python3 scripts/native_owner_root_benchmark.py \
++  --control "$OWNER_CONTROL_BIN/bin/native-owner-root-benchmark" \
++  --treatment "$OWNER_TREATMENT_BIN/bin/native-owner-root-benchmark" \
++  --output "$OWNER_NEW_EVIDENCE_DIRECTORY"
++```
++
++The Linux driver requires `/usr/bin/time` and an unused output directory. It
++records binary hashes, all process outputs, whole serialized payload/receipt
++bytes, process usage, and host load/pressure every two seconds. Coordinate other
++local builds first. The driver cannot control other users, CPU frequency, or
++unrelated system activity; retain those limitations with any result.
++
++The [fixture](../../test/native_owner_root_benchmark.zig) creates temporary MDBX
++state with 65,536 storage slots. Two distinct-attribute branches execute 64
++transactions writing 128 slots each, followed by one ordinary 21,000-gas
++transaction. Every storage effect and successful record is checked. Both
++branches must reach the unchanged 32,768-entry cap within the 4 MiB RLP
++budget, with actual capacity misses and path fallbacks. Node and provider scratch continue
++through the normal Runtime, Session, and native finalizer.
++
++The ordinary transaction arrives from another task after the primary's last
++bulk append, after that tick's drain phase and before sealing. The rendezvous is
++bounded at five seconds. It deliberately exercises a costly queue phase rather
++than a random arrival distribution. Its nonce is already executable on the
++primary. The primary's physical branch position alternates between the two
++measured observations in every process.
++
++Two schedules are reported separately:
++
++| Schedule | Attempts per turn | Append work allowance | Secondary deferral |
++| --- | ---: | ---: | ---: |
++| Fixed work | 2 | 1 second | 0 |
++| Deployed Sepolia owner settings | 16 | 20 milliseconds | 250 milliseconds |
++
++Both use ten-millisecond start-to-start pacing. Fixed work must produce exactly
++65 turns and 65 public seals per branch. The driver requires identical native
++read/append/seal counts and all cache statistics except `owner_reads` across
++every fixed-work run. In this fixture the control must count one owner read per
++fallback, while treatment must reuse the authenticated owner and count zero.
++Elapsed-time scheduling can change intermediate seals in the other schedule;
++do not describe its CPU comparison as identical sealing work.
++
++Runtime, Host, and Intake use `SafeAllocator` default options, matching the
++pinned Zig Safe executable's `main(init).gpa`. Test setup and assertion scratch
++still use the test allocator. A separate earlier run with the test runner's
++extra write-after-free checks is ownership evidence, not the same allocator
++performance cohort. Initial inputs are verified and workers initialized before
++each measured Host run; verification of the late transaction is included.
++
++Every complete serialized payload must match byte-for-byte across binaries,
++including state, transaction and receipt roots, block hash, BAL and transaction
++bytes. Reconstructed receipt bytes supplement that authoritative payload
++comparison. An early result remains retained across later revisions; final
++results remain valid after Host stop, Runtime destruction and MDBX teardown.
++The production allocator must be leak-free after all retained results release.
++
++Use three blocks in ABBA, BAAB, ABBA order (`--order`), each with a new evidence
++directory and the same frozen binaries. Each block launches two processes per
++arm. Each process records one warmup
++and two measured observations for each schedule. Excluding warmups gives four
++observations per arm/schedule/block, two per physical primary. Across three
++blocks the independent units are six processes per arm; the two observations
++inside each process are not independent replications. Report adjacent matched
++process differences (T1−C0 and T2−C3 in ABBA, T0−C1 and T3−C2 in BAAB),
++ranges and raw values, not population tail percentiles. Process CPU and seal
++thread CPU are distinct from wall time. State-read time overlaps state-root
++time and must not be added to it.
++
++This is a synthetic saturation stress test: the gas ceiling is 300 million and
++session allowance is 60 seconds. It does not qualify live deadlines, network
++arrival distributions, publisher Prepared time, gossip, proposer receipt, or
++bid outcomes. A local improvement is a reason for subsequent consumer and
++bounded deployment qualification, not evidence of live improvement.
+diff --git a/scripts/native_owner_root_benchmark.py b/scripts/native_owner_root_benchmark.py
+new file mode 100644
+index 0000000..19beb68
+--- /dev/null
++++ b/scripts/native_owner_root_benchmark.py
+@@ -0,0 +1,149 @@
++#!/usr/bin/env python3
++"""Run already-built matched native-owner test binaries in a recorded ABBA order.
++
++The fixture itself asserts successful execution, cache saturation and retained
++payload ownership. This driver additionally compares complete emitted payload
++and receipt bytes across both binaries, and separates a fixed-work schedule from
++the deployed owner's elapsed-time-dependent schedule. It never opens a live DB.
++"""
++import argparse
++import datetime
++import hashlib
++import json
++import os
++from pathlib import Path
++import signal
++import subprocess
++import time
++
++
++def sha(path):
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def now():
++    return datetime.datetime.now(datetime.timezone.utc).isoformat()
++
++
++def environment():
++    result = {"utc": now(), "loadAverage": os.getloadavg(), "cpuCount": os.cpu_count()}
++    files = [Path("/proc/loadavg"), Path("/proc/self/cgroup")]
++    files += [Path("/proc/pressure") / item for item in ("cpu", "io", "memory")]
++    try:
++        group = next(line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines() if line.startswith("0::"))
++        base = Path("/sys/fs/cgroup") / group.lstrip("/")
++        files += [base / item for item in ("cpu.stat", "cpu.max", "memory.current", "memory.max")]
++    except (OSError, StopIteration):
++        pass
++    result["files"] = {}
++    for path in files:
++        try:
++            result["files"][str(path)] = path.read_text()
++        except OSError as exc:
++            result["files"][str(path)] = {"unavailable": str(exc)}
++    return result
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--control", required=True, type=Path)
++    parser.add_argument("--treatment", required=True, type=Path)
++    parser.add_argument("--output", required=True, type=Path)
++    parser.add_argument("--timeout", type=float, default=900)
++    parser.add_argument("--order", choices=("ABBA", "BAAB"), default="ABBA", help="A=control, B=treatment")
++    args = parser.parse_args()
++    binaries = {arm: getattr(args, arm).resolve(strict=True) for arm in ("control", "treatment")}
++    output = args.output.resolve()
++    output.mkdir(parents=True, exist_ok=False)
++    record = {"startedUtc": now(), "orderName": args.order, "order": [{"A": "control", "B": "treatment"}[letter] for letter in args.order],
++              "binaries": {arm: {"path": str(path), "sha256": sha(path)} for arm, path in binaries.items()},
++              "driverSha256": sha(Path(__file__)), "runs": [], "qualified": False}
++    (output / "manifest.json").write_text(json.dumps(record, indent=2) + "\n")
++    payloads = {}
++    workload = None
++    fixed_counts = None
++    fixed_cache_stats = None
++    for index, arm in enumerate(record["order"]):
++        name = f"{index}-{arm}"
++        log = output / (name + ".log")
++        usage = output / (name + ".usage.json")
++        command = ["/usr/bin/time", "-f", '{"maxRssKiB":%M,"userSeconds":%U,"systemSeconds":%S,"elapsedSeconds":%e,"exitCode":%x}',
++                   "-o", str(usage), str(binaries[arm])]
++        started = time.monotonic()
++        run = {"arm": arm, "index": index, "command": command, "startedUtc": now(), "before": environment()}
++        with log.open("xb") as stream, (output / (name + ".noise.jsonl")).open("x") as noise:
++            child = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
++            while child.poll() is None:
++                noise.write(json.dumps(environment()) + "\n")
++                noise.flush()
++                if time.monotonic() - started > args.timeout:
++                    os.killpg(child.pid, signal.SIGTERM)
++                    try:
++                        child.wait(timeout=10)
++                    except subprocess.TimeoutExpired:
++                        os.killpg(child.pid, signal.SIGKILL)
++                        child.wait()
++                    run["timedOut"] = True
++                    break
++                try:
++                    child.wait(timeout=2)
++                except subprocess.TimeoutExpired:
++                    pass
++        run.update(exitCode=child.returncode, finishedUtc=now(), elapsedSeconds=time.monotonic() - started,
++                   logSha256=sha(log), after=environment())
++        if usage.exists():
++            run["processUsage"] = json.loads(usage.read_text().splitlines()[-1])
++        run["samples"] = []
++        for line in log.read_bytes().splitlines():
++            marker = b"native_cache_capacity "
++            if marker not in line:
++                continue
++            raw = line.split(marker, 1)[1]
++            item = json.loads(raw)
++            if item["kind"] == "owner_root_payload":
++                key = item["schedule"]
++                artifact = output / (name + "-" + key + "-payload.json")
++                artifact.write_bytes(raw + b"\n")
++                if key in payloads:
++                    assert raw == payloads[key], f"complete payload/receipt byte mismatch: {name}/{key}"
++                else:
++                    payloads[key] = raw
++                run.setdefault("payloads", {})[key] = {"path": artifact.name, "sha256": sha(artifact)}
++            elif item["kind"] == "owner_root":
++                identity = [item[k] for k in ("parent", "rawHash", "payloadHashes", "bulkTransactions", "transactions", "writesPerTransaction")]
++                if workload is None:
++                    workload = identity
++                assert identity == workload, f"different input/final payload: {name}"
++                if item["schedule"] == "fixed_work":
++                    counts = [item["ticks"], item["attempts"], item["sealsByBranch"],
++                              [{k: m["native"][k] for k in ("account_reads", "storage_reads", "code_reads", "node_reads", "node_bytes", "seal_calls", "append_calls", "transaction_attempts")} for m in item["finalMetrics"]]]
++                    if fixed_counts is None:
++                        fixed_counts = counts
++                    assert counts == fixed_counts, f"fixed work changed: {name}"
++                    stats = [m["node_cache"] for m in item["finalMetrics"]]
++                    comparable = [{k: value for k, value in stat.items() if k != "owner_reads"} for stat in stats]
++                    if fixed_cache_stats is None:
++                        fixed_cache_stats = comparable
++                    assert comparable == fixed_cache_stats, f"cache semantics changed: {name}"
++                    for stat in stats:
++                        if arm == "control":
++                            assert stat["owner_reads"] == stat["fallback_reads"] > 0, f"control fallback path not exercised: {name}"
++                        else:
++                            assert stat["owner_reads"] == 0 and stat["fallback_reads"] > 0, f"treatment owner-root reuse not exercised: {name}"
++                run["samples"].append(item)
++        record["runs"].append(run)
++        (output / "manifest.json").write_text(json.dumps(record, indent=2) + "\n")
++        assert child.returncode == 0, f"test failed: {log}"
++        assert len(run["samples"]) == 6 and len(run.get("payloads", {})) == 2, f"incomplete fixture output: {name}"
++        assert sha(binaries[arm]) == record["binaries"][arm]["sha256"], "binary changed while running"
++        print(json.dumps({"run": name, "exitCode": child.returncode, "elapsedSeconds": run["elapsedSeconds"]}), flush=True)
++    assert json.loads(payloads["fixed_work"])["primary"] == json.loads(payloads["deployed_owner"])["primary"]
++    assert json.loads(payloads["fixed_work"])["secondary"] == json.loads(payloads["deployed_owner"])["secondary"]
++    record.update(qualified=True, finishedUtc=now(), literalPayloadAndReceiptEquality=True, fixedWorkEqual=True,
++                  limits="Synthetic local matched workload only; no live or Prepared/gossip latency claim. The deployed-owner schedule has variable intermediate seals; fixed-work isolates equal sealing work. Warmups remain recorded and must be excluded from summary estimates.")
++    (output / "manifest.json").write_text(json.dumps(record, indent=2) + "\n")
++    print(json.dumps({"qualified": True, "output": str(output)}), flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/test/native_owner_root_benchmark.zig b/test/native_owner_root_benchmark.zig
+new file mode 100644
+index 0000000..418c1a8
+--- /dev/null
++++ b/test/native_owner_root_benchmark.zig
+@@ -0,0 +1,511 @@
++//! Matched owner-root reuse experiment with real authenticated temporary MDBX.
++//! Same 32768-entry cache, two branches and a synchronized late ordinary arrival.
++//! Source builds, payload digests and ownership checks qualify this synthetic workload only.
++const std = @import("std");
++const z = @import("zbuilder");
++const n = @import("native_state");
++const Runtime = @import("native_runtime");
++const Host = @import("native_host");
++const Fixture = @import("native_fixture.zig");
++const f = @import("fixtures");
++const a = std.testing.allocator;
++const io = std.testing.io;
++const slots = 65536;
++const bulk_count = 64;
++const tx_count = bulk_count + 1;
++const writes_per_tx = 128;
++const block_gas = 300_000_000;
++const rlp_bytes = 4 << 20;
++const publication_cutoffs_ms = [_]i96{ 100, 250, 500, 1000 };
++const bulk_code = program();
++fn program() [writes_per_tx * 8 + 1]u8 {
++    var result: [writes_per_tx * 8 + 1]u8 = undefined;
++    for (0..writes_per_tx) |i| {
++        // SSTORE(start+i, 42). Each transaction supplies its first slot in calldata.
++        const instruction = [_]u8{ 0x60, 42, 0x60, @intCast(i), 0x5f, 0x35, 0x01, 0x55 };
++        @memcpy(result[i * 8 ..][0..8], &instruction);
++    }
++    result[result.len - 1] = 0;
++    return result;
++}
++fn clock() i96 {
++    return std.Io.Clock.awake.now(io).toNanoseconds();
++}
++fn cpu() i96 {
++    return std.Io.Clock.cpu_process.now(io).toNanoseconds();
++}
++fn millis() i64 {
++    return @intCast(@divFloor(clock(), std.time.ns_per_ms));
++}
++fn emit(value: anytype) !void {
++    const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
++    defer a.free(bytes);
++    std.debug.print("native_cache_capacity {s}\n", .{bytes});
++}
++fn digest(output: z.payload.Output) ![32]u8 {
++    const bytes = try std.json.Stringify.valueAlloc(a, output, .{});
++    defer a.free(bytes);
++    return z.zevm.crypto.hash.keccak256(bytes);
++}
++const Env = struct {
++    fixture: Fixture,
++    eth: n.Eth,
++    snapshots: n.Snapshots,
++    reader: n.Reader,
++    prepare_ns: i96,
++    fn create() !*Env {
++        const started = clock();
++        const self = try a.create(Env);
++        errdefer a.destroy(self);
++        self.fixture = try Fixture.init();
++        errdefer self.fixture.deinit();
++        try self.fixture.write(0);
++        self.eth = n.Eth.init(&self.fixture.store);
++        {
++            var arena: std.heap.ArenaAllocator = .init(a);
++            defer arena.deinit();
++            const alloc = arena.allocator();
++            const txn = try self.fixture.store.transaction_rw();
++            errdefer txn.abort() catch unreachable;
++            const keys = try alloc.alloc([32]u8, slots);
++            const values = try alloc.alloc(u256, slots);
++            for (keys, values, 0..) |*key, *value, i| {
++                key.* = n.types.keccakOfU256(i);
++                value.* = 17;
++            }
++            // A fresh trie hashes completed elder siblings during insertion;
++            // use its sorted-key bulk contract before any resolver exists.
++            std.mem.sortUnstable([32]u8, keys, {}, struct {
++                fn less(_: void, left: [32]u8, right: [32]u8) bool {
++                    return std.mem.order(u8, &left, &right) == .lt;
++                }
++            }.less);
++            var storage_nodes = try n.trie.NodeCollector.init(alloc, 262144);
++            var storage = n.StorageTrie.init(alloc).withCollector(&storage_nodes);
++            try storage.update(keys, values);
++            const writer_hash = n.types.keccakOfU160(f.writer);
++            var account = (try self.eth.readAccount(txn, writer_hash)).?;
++            account.storage_hash = try storage.rootHash();
++            account.code_hash = try self.eth.writeCode(txn, &bulk_code);
++            try self.eth.commitStorageTrieNodes(txn, writer_hash, &storage_nodes);
++            for (keys, values) |key, value| try self.eth.writeStorage(txn, writer_hash, key, value);
++            var account_nodes = try n.trie.NodeCollector.init(alloc, 1024);
++            {
++                var accounts = try self.eth.openAccountTrie(alloc, txn, self.fixture.header.state_root);
++                defer self.eth.closeAccountTrie(&accounts);
++                accounts.inner = accounts.inner.withCollector(&account_nodes);
++                // Resolve the old account leaf before replacing the flat account.
++                try accounts.updateNoDeletions(&.{writer_hash}, &.{account});
++                self.fixture.header.state_root = try accounts.rootHash();
++            }
++            try self.eth.commitAccountTrieNodes(txn, &account_nodes);
++            try self.eth.writeAccount(alloc, txn, writer_hash, account);
++            self.fixture.header.gas_limit = block_gas;
++            try n.snapshot.writeCheckpoint(&self.fixture.store, txn, alloc, self.fixture.header);
++            try txn.commit();
++        }
++        self.fixture.input.attributes.target_gas_limit = block_gas;
++        self.snapshots = .{ .io = io, .store = &self.fixture.store };
++        errdefer self.snapshots.deinit();
++        try self.snapshots.publish(a);
++        self.reader = .{ .eth = &self.eth, .snapshots = &self.snapshots };
++        self.prepare_ns = clock() - started;
++        return self;
++    }
++    fn request(self: *Env) Runtime.Begin {
++        return .{ .parent = self.fixture.parent(), .chain = self.fixture.input.chain, .attributes = self.fixture.input.attributes, .deadline_ns = clock() + 60 * std.time.ns_per_s };
++    }
++    fn deinit(self: *Env) void {
++        self.reader.deinit();
++        self.snapshots.deinit();
++        self.fixture.deinit();
++        a.destroy(self);
++    }
++};
++fn assertEffects(runtime: *Runtime) ![2][]const u8 {
++    var result: [2]?[]const u8 = @splat(null);
++    errdefer for (result) |bytes| if (bytes) |owned| a.free(owned);
++    for (runtime.slots, 0..) |*slot, index| {
++        slot.operation.lockUncancelable(io);
++        defer slot.operation.unlock(io);
++        const candidate = &slot.session.?.session.?.candidate;
++        const records = try candidate.records(a);
++        defer a.free(records);
++        try std.testing.expectEqual(@as(usize, tx_count), records.len);
++        var receipts: std.array_list.Managed(u8) = .init(a);
++        defer receipts.deinit();
++        var cumulative: u64 = 0;
++        for (records) |record| {
++            try std.testing.expect(record.success);
++            try std.testing.expectEqual(@as(usize, 0), record.logs.len);
++            try std.testing.expectEqual(@as(u8, 2), record.raw[0]);
++            cumulative += record.charged_gas;
++            const ReceiptLog = struct { address: [20]u8, topics: [][32]u8, data: []const u8 };
++            const Receipt = struct { status: u8, cumulative_gas: u64, bloom: [256]u8, logs: []ReceiptLog };
++            var encoded: std.array_list.Managed(u8) = .init(a);
++            defer encoded.deinit();
++            try encoded.append(record.raw[0]);
++            try @import("rlp").serialize(Receipt, a, .{ .status = 1, .cumulative_gas = cumulative, .bloom = @splat(0), .logs = &.{} }, &encoded);
++            var length: [4]u8 = undefined;
++            std.mem.writeInt(u32, &length, @intCast(encoded.items.len), .big);
++            try receipts.appendSlice(&length);
++            try receipts.appendSlice(encoded.items);
++        }
++        result[index] = try receipts.toOwnedSlice();
++        for (0..bulk_count * writes_per_tx) |key| try std.testing.expectEqual(@as(u256, 42), try candidate.storage(.{ .address = f.writer, .slot = key }));
++    }
++    return .{ result[0].?, result[1].? };
++}
++fn assertBal(output: z.payload.Output) !void {
++    var scratch: std.heap.ArenaAllocator = .init(a);
++    defer scratch.deinit();
++    var bal: z.zevm.types.BlockAccessLists = undefined;
++    const used = try @import("rlp").deserialize(z.zevm.types.BlockAccessLists, scratch.allocator(), output.block_access_list, &bal);
++    try std.testing.expectEqual(output.block_access_list.len, used);
++    var found = false;
++    for (bal) |entry| if (entry.addr == f.writer) {
++        try std.testing.expect(!found);
++        found = true;
++        try std.testing.expectEqual(@as(usize, bulk_count * writes_per_tx), entry.storage_changes.len);
++        for (entry.storage_changes, 0..) |change, key| {
++            try std.testing.expectEqual(@as(u256, key), change.key);
++            try std.testing.expectEqual(@as(usize, 1), change.changes.len);
++            try std.testing.expectEqual(@as(u32, @intCast(key / writes_per_tx + 1)), change.changes[0].index);
++            try std.testing.expectEqual(@as(u256, 42), change.changes[0].value);
++        }
++    };
++    try std.testing.expect(found);
++}
++const Arrival = struct {
++    intake: *z.NativeIntake,
++    raw: []const u8,
++    hash: [32]u8,
++    trigger: std.Io.Event = .unset,
++    admitted: std.Io.Event = .unset,
++    received_ns: i96 = 0,
++    fn run(self: *@This()) !void {
++        try self.trigger.wait(io);
++        defer self.admitted.set(io);
++        self.received_ns = clock();
++        const now: i64 = @intCast(@divFloor(self.received_ns, std.time.ns_per_ms));
++        const offered = try self.intake.offer(.{ .hash = self.hash, .bytes = self.raw, .peer = .{ .index = 2, .epoch = 1 }, .announced_at_ms = now, .received_at_ms = now });
++        try std.testing.expectEqual(z.NativeIntake.Admission.queued, offered);
++    }
++};
++const Events = struct {
++    arrival: *Arrival,
++    final_bulk_hash: [32]u8,
++    injection_triggered: bool = false,
++    late_enqueued_ns: i96 = 0,
++    late_drain_ns: i96 = 0,
++    late_verified_ns: i96 = 0,
++    late_appended_ns: [2]i96 = @splat(0),
++    late_published_ns: [2]i96 = @splat(0),
++    primary_id: u64 = 1,
++    began_ns: [2]i96 = @splat(0),
++    first_ready_ns: [2]i96 = @splat(0),
++    final_ready_ns: [2]i96 = @splat(0),
++    latest_ready_ns: [2]i96 = @splat(0),
++    seals: usize = 0,
++    seal_ns: i96 = 0,
++    seals_by_branch: [2]usize = @splat(0),
++    seal_ns_by_branch: [2]i96 = @splat(0),
++    ready_transactions: [2]usize = @splat(0),
++    errors: usize = 0,
++    stopping: bool = false,
++    stopped_retirements: usize = 0,
++    fn branchIndex(self: *const Events, id: u64) usize {
++        std.debug.assert(id == 1 or id == 2);
++        return if (id == self.primary_id) 0 else 1;
++    }
++    fn record(ctx: *anyopaque, event: Host.Event) void {
++        const self: *Events = @ptrCast(@alignCast(ctx));
++        const previous_errors = self.errors;
++        switch (event.kind) {
++            .began => self.began_ns[self.branchIndex(event.request_id)] = event.finished_ns - event.started_ns,
++            .sealed => {
++                const index = self.branchIndex(event.request_id);
++                self.seals += 1;
++                self.seal_ns += event.finished_ns - event.started_ns;
++                self.seals_by_branch[index] += 1;
++                self.seal_ns_by_branch[index] += event.finished_ns - event.started_ns;
++                self.latest_ready_ns[index] = event.finished_ns;
++                if (event.transactions > 0 and self.first_ready_ns[index] == 0)
++                    self.first_ready_ns[index] = event.finished_ns;
++                if (event.transactions == tx_count and self.final_ready_ns[index] == 0)
++                    self.final_ready_ns[index] = event.finished_ns;
++            },
++            .rejected, .intake_rejected, .begin_failed => self.errors += 1,
++            .retired => {
++                if (self.stopping and event.reason != null and event.reason.? == error.NativeHostStopped)
++                    self.stopped_retirements += 1
++                else
++                    self.errors += 1;
++            },
++            .transaction_ready => {
++                const index = self.branchIndex(event.request_id);
++                self.ready_transactions[index] += 1;
++                if (event.hash) |hash| if (std.meta.eql(hash, self.arrival.hash)) {
++                    self.late_published_ns[index] = event.finished_ns;
++                };
++            },
++            .appended => if (event.hash) |hash| {
++                const index = self.branchIndex(event.request_id);
++                if (std.meta.eql(hash, self.arrival.hash)) self.late_appended_ns[index] = event.finished_ns;
++                if (index == 0 and !self.injection_triggered and std.meta.eql(hash, self.final_bulk_hash)) {
++                    self.injection_triggered = true;
++                    // Test-only bounded rendezvous: another task copies ingress
++                    // after this tick's drain phase, before its full-prefix seal.
++                    // This callback does not mutate Intake or Runtime directly.
++                    self.arrival.trigger.set(io);
++                    self.arrival.admitted.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } }) catch {
++                        self.errors += 1;
++                    };
++                }
++            },
++            .intake_ready => if (event.hash) |hash| {
++                if (std.meta.eql(hash, self.arrival.hash)) {
++                    const timing = event.intake_timing.?;
++                    self.late_enqueued_ns = timing.enqueued_ns;
++                    self.late_drain_ns = timing.started_ns;
++                    self.late_verified_ns = timing.finished_ns;
++                }
++            },
++        }
++        if (self.errors > previous_errors and self.errors <= 8)
++            std.debug.print("native_cache_capacity_failure kind={s} request={d} reason={s} transactions={d} started_ns={d} finished_ns={d}\n", .{ @tagName(event.kind), event.request_id, if (event.reason) |reason| @errorName(reason) else "none", event.transactions, event.started_ns, event.finished_ns });
++    }
++};
++const Sample = struct {
++    late_received_ns: i96,
++    late_enqueued_ns: i96,
++    late_drain_ns: i96,
++    late_verified_ns: i96,
++    late_appended_ns: [2]i96,
++    late_published_ns: [2]i96,
++    cap: u32,
++    output: [2]*Runtime.Result,
++    old: [2]*Runtime.Result,
++    hashes: [2][32]u8,
++    old_hashes: [2][32]u8,
++    receipts: [2][]const u8,
++    cpu_ns: i96,
++    elapsed_ns: i96,
++    tick_ns: i96,
++    ticks: usize,
++    attempts: usize,
++    began_ns: [2]i96,
++    first_ready_ns: [2]i96,
++    seal_ns: i96,
++    seals: usize,
++    seals_by_branch: [2]usize,
++    seal_ns_by_branch: [2]i96,
++    complete_ns: [2]i96,
++    deferred_seals: usize,
++    deferred_episodes: usize,
++    deferred_publications: usize,
++    episodes_before_primary_complete: usize,
++    max_deferred_dirty_age_ns: i96,
++    max_deferred_ready_age_ns: i96,
++    cutoff_available: [2][publication_cutoffs_ms.len]bool,
++    cutoff_value: [2][publication_cutoffs_ms.len]u256,
++    cutoff_transactions: [2][publication_cutoffs_ms.len]usize,
++    fn verify(self: *const Sample) !void {
++        for (self.output, self.hashes, self.old, self.old_hashes) |out, hash, old, old_hash| {
++            try std.testing.expectEqual(hash, try digest(out.output));
++            try std.testing.expectEqual(old_hash, try digest(old.output));
++        }
++    }
++    fn deinit(self: *const Sample) void {
++        for (self.output) |result| result.release();
++        for (self.old) |result| result.release();
++        for (self.receipts) |bytes| a.free(bytes);
++    }
++};
++const Schedule = enum { fixed_work, deployed_owner };
++fn runHost(env: *Env, raw: []const []const u8, schedule: Schedule, primary_id: u64, runtime_allocator: std.mem.Allocator) !Sample {
++    const cap = 32768;
++    // Fixed-work isolates the state change: exactly one append per branch and
++    // a seal of each branch per turn. The deployed-owner arm keeps the actual
++    // 16-attempt/20 ms/250 ms settings, where intermediate seal counts vary.
++    const interval_ns: i96 = if (schedule == .fixed_work) 0 else 250 * std.time.ns_per_ms;
++    std.debug.assert(primary_id == 1 or primary_id == 2);
++    const runtime = try Runtime.create(runtime_allocator, io, &env.reader, .{ .workers = 2, .worker_limits = .{ .max_block_gas = block_gas }, .worker_bytes = 512 << 20, .session_bytes = 128 << 20, .max_session_ns = 60 * std.time.ns_per_s, .result_bytes = 16 << 20, .retained_bytes = 128 << 20, .node_cache = .{ .max_entries = cap, .max_bytes = rlp_bytes } });
++    defer runtime.deinit();
++    const warm1 = try runtime.begin(env.request());
++    const warm2 = try runtime.begin(env.request());
++    try runtime.cancel(warm1);
++    try runtime.cancel(warm2);
++    // Prepare already-verified resident input outside the measured Host work.
++    // The 10 s bounded fixture allowance avoids treating an overloaded local
++    // Debug signature check as a peer-intake or 1.5 s deadline qualification.
++    var intake: z.NativeIntake = .{ .allocator = runtime_allocator, .io = io, .chain_id = 1, .limits = .{ .job_lifetime_ms = 10000 } };
++    defer intake.deinit();
++    for (raw[0..bulk_count]) |bytes| {
++        const now = millis();
++        _ = try intake.offer(.{ .hash = z.zevm.crypto.hash.keccak256(bytes), .bytes = bytes, .peer = .{ .index = 1, .epoch = 1 }, .announced_at_ms = now, .received_at_ms = now });
++        try std.testing.expect(try intake.drainOne(millis()) != null);
++    }
++    var generation: z.runtime.OrderGeneration = .{};
++    try generation.advance(io, @splat(0x77), 0);
++    var arrival: Arrival = .{ .intake = &intake, .raw = raw[bulk_count], .hash = z.zevm.crypto.hash.keccak256(raw[bulk_count]) };
++    var producer = try io.concurrent(Arrival.run, .{&arrival});
++    defer producer.cancel(io) catch {};
++    var events: Events = .{ .primary_id = primary_id, .arrival = &arrival, .final_bulk_hash = z.zevm.crypto.hash.keccak256(raw[bulk_count - 1]) };
++    const host = try Host.create(runtime_allocator, io, runtime, &intake, .{ .branches = 2, .attempts_per_tick = if (schedule == .fixed_work) 2 else 16, .work_ns = if (schedule == .fixed_work) std.time.ns_per_s else 20 * std.time.ns_per_ms, .drain_per_tick = 4, .events = .{ .context = &events, .emit = Events.record }, .order_generation = &generation, .private_orders = .{}, .public_secondary_seal_interval_ns = interval_ns });
++    defer host.deinit();
++    const one = env.request();
++    var two = one;
++    two.attributes.prev_randao = @splat(0x42);
++    try std.testing.expect(!std.meta.eql(one.attributes.prev_randao, two.attributes.prev_randao));
++    try host.enqueueBegin(1, if (primary_id == 1) one else two);
++    try host.enqueueBegin(2, if (primary_id == 1) two else one);
++    var old: [2]?*Runtime.Result = @splat(null);
++    defer for (old) |v| if (v) |result| result.release();
++    var final: [2]?*Runtime.Result = @splat(null);
++    errdefer for (final) |v| if (v) |result| result.release();
++    var ticks: usize = 0;
++    var tick_ns: i96 = 0;
++    var attempts: usize = 0;
++    var deferred_seals: usize = 0;
++    var deferred_episodes: usize = 0;
++    var deferred_publications: usize = 0;
++    var episodes_before_primary_complete: usize = 0;
++    var max_deferred_dirty_age_ns: i96 = 0;
++    var max_deferred_ready_age_ns: i96 = 0;
++    var complete_ns: [2]i96 = @splat(0);
++    var cutoff_available: [2][publication_cutoffs_ms.len]bool = @splat(@splat(false));
++    var cutoff_value: [2][publication_cutoffs_ms.len]u256 = @splat(@splat(0));
++    var cutoff_transactions: [2][publication_cutoffs_ms.len]usize = @splat(@splat(0));
++    const start = clock();
++    const cpu_start = cpu();
++    while (ticks < 512 and clock() - start < 60 * std.time.ns_per_s) {
++        const before = clock();
++        const tick = try host.tickWithPreference(primary_id);
++        tick_ns += clock() - before;
++        ticks += 1;
++        attempts += tick.attempts;
++        deferred_seals += tick.deferred_seals;
++        deferred_episodes += tick.deferred_episodes;
++        deferred_publications += tick.deferred_publications;
++        // Conservative: exclude the final primary tick, including any episode
++        // that began earlier in that tick when physical branch order reverses.
++        if (events.final_ready_ns[0] == 0) episodes_before_primary_complete += tick.deferred_episodes;
++        max_deferred_dirty_age_ns = @max(max_deferred_dirty_age_ns, tick.max_deferred_dirty_age_ns);
++        max_deferred_ready_age_ns = @max(max_deferred_ready_age_ns, tick.max_deferred_ready_age_ns);
++        try std.testing.expectEqual(@as(usize, 0), tick.retired);
++        for (0..2) |i| {
++            const latest = host.latest(if (i == 0) primary_id else 3 - primary_id) catch |err| switch (err) {
++                error.PayloadNotReady => continue,
++                else => return err,
++            };
++            defer latest.release();
++            // At most one ordinary seal per branch occurs in this fixture's
++            // public-only turn. Join the observed result to its actual event,
++            // rather than charging it the subsequent other-branch seal time.
++            const published_ns = events.latest_ready_ns[i];
++            try std.testing.expect(published_ns >= start);
++            for (publication_cutoffs_ms, 0..) |cutoff_ms, c| {
++                if (published_ns - start > cutoff_ms * std.time.ns_per_ms) continue;
++                cutoff_available[i][c] = true;
++                cutoff_value[i][c] = latest.output.block_value;
++                cutoff_transactions[i][c] = latest.output.transactions.len;
++            }
++            if (old[i] == null and latest.output.transactions.len > 0 and latest.output.transactions.len < raw.len) old[i] = try latest.retain();
++            if (latest.output.transactions.len == raw.len and final[i] == null) {
++                final[i] = try latest.retain();
++                complete_ns[i] = events.final_ready_ns[i] - start;
++            }
++        }
++        if (final[0] != null and final[1] != null) break;
++        const remaining = z.NativePacing.remaining(before, clock(), 10 * std.time.ns_per_ms);
++        if (remaining > 0) try io.sleep(.fromNanoseconds(remaining), .awake);
++    }
++    const cpu_ns = cpu() - cpu_start;
++    try producer.await(io);
++    try std.testing.expect(events.injection_triggered);
++    try std.testing.expect(events.late_drain_ns >= events.late_enqueued_ns and events.late_enqueued_ns >= arrival.received_ns);
++    for (events.late_published_ns, events.late_appended_ns) |published, appended| try std.testing.expect(published >= appended and appended >= events.late_verified_ns);
++    const elapsed = clock() - start;
++    try std.testing.expectEqual(@as(usize, 0), events.errors);
++    for (events.first_ready_ns) |ready| try std.testing.expect(ready > start);
++    try std.testing.expectEqual(raw.len * 2, attempts);
++    if (schedule == .fixed_work) {
++        try std.testing.expectEqual(@as(usize, tx_count), ticks);
++        for (events.seals_by_branch) |count| try std.testing.expectEqual(@as(usize, tx_count), count);
++    }
++    for (events.ready_transactions) |count| try std.testing.expectEqual(raw.len, count);
++    try std.testing.expect(old[0] != null and old[1] != null and final[0] != null and final[1] != null);
++    try std.testing.expectEqual(@as(u64, 0), intake.stats.expired + intake.stats.rejected + intake.stats.pressure);
++    const receipts = try assertEffects(runtime);
++    errdefer for (receipts) |bytes| a.free(bytes);
++    var result: Sample = .{ .late_received_ns = arrival.received_ns, .late_enqueued_ns = events.late_enqueued_ns, .late_drain_ns = events.late_drain_ns, .late_verified_ns = events.late_verified_ns, .late_appended_ns = events.late_appended_ns, .late_published_ns = events.late_published_ns, .cap = cap, .output = .{ final[0].?, final[1].? }, .old = .{ old[0].?, old[1].? }, .hashes = undefined, .old_hashes = undefined, .receipts = receipts, .cpu_ns = cpu_ns, .elapsed_ns = elapsed, .tick_ns = tick_ns, .ticks = ticks, .attempts = attempts, .began_ns = events.began_ns, .first_ready_ns = .{ events.first_ready_ns[0] - start, events.first_ready_ns[1] - start }, .seal_ns = events.seal_ns, .seals = events.seals, .seals_by_branch = events.seals_by_branch, .seal_ns_by_branch = events.seal_ns_by_branch, .complete_ns = complete_ns, .deferred_seals = deferred_seals, .deferred_episodes = deferred_episodes, .deferred_publications = deferred_publications, .episodes_before_primary_complete = episodes_before_primary_complete, .max_deferred_dirty_age_ns = max_deferred_dirty_age_ns, .max_deferred_ready_age_ns = max_deferred_ready_age_ns, .cutoff_available = cutoff_available, .cutoff_value = cutoff_value, .cutoff_transactions = cutoff_transactions };
++    for (result.output, result.old, 0..) |out, previous, i| {
++        try std.testing.expect(out.ready);
++        try assertBal(out.output);
++        try std.testing.expectEqualDeep(raw, out.output.transactions);
++        try std.testing.expectEqual(@as(u64, raw.len), out.metrics.native.transaction_attempts);
++        try std.testing.expectEqual(@as(usize, 0), out.metrics.code_bytes);
++        const stats = out.metrics.node_cache.?;
++        try std.testing.expect(stats.enabled and stats.entries <= cap and stats.retained_bytes <= rlp_bytes);
++        try std.testing.expectEqual(@as(usize, 32768), stats.entries);
++        try std.testing.expect(stats.capacity_misses > 0 and stats.fallback_reads > 0);
++        result.hashes[i] = try digest(out.output);
++        result.old_hashes[i] = try digest(previous.output);
++    }
++    events.stopping = true;
++    host.requestStop();
++    const stopped = try host.tick();
++    try std.testing.expect(stopped.stopped and stopped.active == 0 and stopped.attempts == 0);
++    try std.testing.expectEqual(@as(usize, 2), events.stopped_retirements);
++    try std.testing.expectEqual(@as(usize, 0), events.errors);
++    try std.testing.expectEqual(@as(usize, 0), env.reader.active_leases);
++    intake.close();
++    old = @splat(null);
++    return result;
++}
++test "native owner root reuse saturated cache late ordinary publication" {
++    // Match std.start's deployed Safe main(init).gpa defaults. The test runner
++    // additionally enables write-after-free checking; that is valuable for the
++    // separate ownership run but must not inflate allocation-cost estimates.
++    var production_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
++    defer std.testing.expectEqual(@as(usize, 0), production_allocator.deinit()) catch @panic("Runtime allocator leaked");
++    var env: ?*Env = try Env.create();
++    defer if (env) |live| live.deinit();
++    var arena: std.heap.ArenaAllocator = .init(a);
++    defer arena.deinit();
++    const alloc = arena.allocator();
++    const raw = try alloc.alloc([]const u8, tx_count);
++    var input_hash = std.crypto.hash.sha3.Keccak256.init(.{});
++    for (raw[0..bulk_count], 0..) |*bytes, i| {
++        var data: [32]u8 = @splat(0);
++        std.mem.writeInt(u256, &data, i * writes_per_tx, .big);
++        bytes.* = try f.signed(alloc, .{ .nonce = i, .to = f.writer, .gas_limit = 2400000, .data = &data });
++        input_hash.update(bytes.*);
++    }
++    raw[bulk_count] = try f.signed(alloc, .{ .nonce = bulk_count, .to = 0xbeef, .gas_limit = 21000 });
++    input_hash.update(raw[bulk_count]);
++    var raw_hash: [32]u8 = undefined;
++    input_hash.final(&raw_hash);
++    var retained: ?*Runtime.Result = null;
++    defer if (retained) |value| value.release();
++    var retained_hash: [32]u8 = undefined;
++    for ([_]Schedule{ .fixed_work, .deployed_owner }) |schedule| for (0..3) |iteration| {
++        const primary_id: u64 = if (iteration == 2) 2 else 1;
++        const sample = try runHost(env.?, raw, schedule, primary_id, production_allocator.allocator());
++        defer sample.deinit();
++        try sample.verify();
++        try emit(.{ .kind = "owner_root", .runtimeAllocator = "SafeAllocator default options as deployed", .schedule = schedule, .iteration = iteration, .warmup = iteration == 0, .primaryId = primary_id, .configuredEntries = sample.cap, .rlpLimitBytes = rlp_bytes, .parent = env.?.fixture.parent(), .rawHash = raw_hash, .payloadHashes = sample.hashes, .bulkTransactions = bulk_count, .transactions = tx_count, .writesPerTransaction = writes_per_tx, .cpuNs = sample.cpu_ns, .elapsedNs = sample.elapsed_ns, .tickNs = sample.tick_ns, .ticks = sample.ticks, .attempts = sample.attempts, .sealsByBranch = sample.seals_by_branch, .completePublicationNs = sample.complete_ns, .lateQueueNs = sample.late_drain_ns - sample.late_enqueued_ns, .lateVerifyNs = sample.late_verified_ns - sample.late_drain_ns, .lateToAppendNs = .{ sample.late_appended_ns[0] - sample.late_received_ns, sample.late_appended_ns[1] - sample.late_received_ns }, .lateToPublicationNs = .{ sample.late_published_ns[0] - sample.late_received_ns, sample.late_published_ns[1] - sample.late_received_ns }, .finalMetrics = .{ sample.output[0].metrics, sample.output[1].metrics }, .allReceiptsSuccessful = true, .verifiedStorageWrites = bulk_count * writes_per_tx, .retainedAfterRuntimeTeardown = true });
++        if (iteration == 2) {
++            // Exact complete serialized payload and receipt bytes are retained
++            // in the evidence log for control/treatment byte comparison.
++            try emit(.{ .kind = "owner_root_payload", .schedule = schedule, .primary = sample.output[0].output, .secondary = sample.output[1].output, .receipts = sample.receipts });
++            if (retained) |value| value.release();
++            retained = try sample.output[0].retain();
++            retained_hash = sample.hashes[0];
++        }
++    };
++    env.?.deinit();
++    env = null;
++    try std.testing.expectEqual(retained_hash, try digest(retained.?.output));
++}
