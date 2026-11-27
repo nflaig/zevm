@@ -354,6 +354,9 @@ pub const Tracker = struct {
         if (self.latest_hash) |previous| if (std.meta.eql(previous, sync_head.hash) and
             self.published_anchor != null and std.meta.eql(self.published_anchor.?, self.anchor.?)) return;
         try self.updates.putOne(self.io, .{ .anchor = self.anchor.?, .head = sync_head, .observed_at_ms = observed_at_ms });
+        log.info("consensus head queued: kind={t} target={x} slot={} branch={x} anchor_slot={} observed_wall_ms={}", .{
+            kind, sync_head.hash, sync_head.slot, head.hash, self.anchor.?.slot, observed_at_ms,
+        });
         self.latest_hash = sync_head.hash;
         self.published_anchor = self.anchor;
     }
@@ -867,6 +870,41 @@ test "branch attributes cannot supersede the verified FULL sync target" {
     try std.testing.expectEqual(@as([32]u8, @splat(0x33)), (try queue.getOne(io)).head.hash);
     try std.testing.expectEqual(@as([32]u8, @splat(0x33)), tracker.latest_hash.?);
     try std.testing.expectError(error.Closed, queue.getOne(io));
+}
+
+test "consensus same beacon root EMPTY then FULL publishes the new execution target once" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var buffer: [2]Update = undefined;
+    var queue: std.Io.Queue(Update) = .init(&buffer);
+    var tracker = try Tracker.init(io, a, "http://localhost:9596", &queue);
+    defer tracker.deinit();
+    tracker.anchor = test_anchor;
+    var sink: AttributesTestSink = .{};
+    tracker.attributes_sink = sink.sink();
+    const full_graph = try testForkChoice(a, "empty");
+    defer a.free(full_graph);
+    // Keep the selected beacon root/status fixed while the previously pending
+    // FULL becomes execution-verified in the fork-choice graph.
+    const empty_graph = try std.mem.replaceOwned(u8, a, full_graph, "\"payload_status\":\"full\",\"validity\":\"valid\"", "\"payload_status\":\"full\",\"validity\":\"invalid\"");
+    defer a.free(empty_graph);
+    try tracker.publishForkChoice(a, .payload_attributes, test_attributes, empty_graph, 100, 10);
+    const full_attrs = try std.mem.replaceOwned(u8, a, test_attributes, test_parent, test_payload);
+    defer a.free(full_attrs);
+    try tracker.publishForkChoice(a, .payload_attributes, full_attrs, full_graph, 101, 11);
+    queue.close(io);
+    try tracker.publishForkChoice(a, .head, "", full_graph, 102, 12);
+    try tracker.publishForkChoice(a, .payload_attributes, test_attributes, full_graph, 103, 13);
+    const empty = try queue.getOne(io);
+    const full = try queue.getOne(io);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x22)), empty.head.hash);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x33)), full.head.hash);
+    try std.testing.expectEqual(empty.head.slot, full.head.slot);
+    try std.testing.expectEqual(empty.anchor, full.anchor);
+    try std.testing.expectEqual(@as(usize, 3), sink.count);
+    try std.testing.expectEqual(empty.head.hash, sink.copies[2].parent.hash);
+    try std.testing.expectError(error.Closed, queue.getOne(io));
+    try std.testing.expectEqual(full.head.hash, tracker.latest_hash.?);
 }
 
 fn testReorgForkChoice(a: std.mem.Allocator, optimistic: bool) ![]u8 {
