@@ -1,0 +1,11 @@
+--- a/src/node/downloader.zig
++++ b/src/node/downloader.zig
+@@ -1320,7 +1320,7 @@
+     }
+ 
+     fn checkEthRequestTimeouts(self: *Self) !void {
+-        self.hedgeConsensusHeader(self.eth_provider, std.Io.Clock.now(.real, self.io), std.Io.Clock.now(.awake, self.io));
++        // Negative control only: do not dispatch the new header hedge.
+         self.retryNearHeadBal(self.eth_provider, std.Io.Clock.now(.real, self.io));
+         self.checkRequestTimeouts(eth.Message, &self.inflight_eth_requests, &self.pending_eth_requests, self.eth_provider);
+         self.drainPendingEthRequests();

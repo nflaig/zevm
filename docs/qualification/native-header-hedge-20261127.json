@@ -1,0 +1,201 @@
+{
+  "schemaVersion": 1,
+  "producerBase": "f0fd8e8ced126e4f66303647e9c9106a79be1306",
+  "runtimeSourceSha256": {
+    "src/node/downloader.zig": "0fa021323f99f94767f7e8cb82ba1f019b046075783bbfed803d9ac0efc023f5",
+    "src/node/consensus.zig": "92f3aae1c25d833065b55f9cbee178a3dc71c4d3e681dffdf6e64e1bbee56703",
+    "src/devp2p/proto.zig": "c413adfbcf3f3060dce537ba3e92084af1db043787c1481eef2ef5332c9d8fa9",
+    "src/devp2p/eth.zig": "e8c4f7a64e7db074e7d3f148adf26fa0712b1e09f86664f8d453a3b870759aaf",
+    "src/types.zig": "e3465e88d9662dd21f76cf995fdc500e929daf56e34708e1ea0b2b4f59e9b105",
+    "src/free_list.zig": "cda285e80f2fb005a3333b118b634a2abc2890b2d5e91c499957fa6756609148"
+  },
+  "compilerVersion": "0.17.0",
+  "compilerSha256": "7c61539af19fa4082c94848f1c2b57b89e76dc6cfd5bd4c57764c3caf8f82272",
+  "contract": {
+    "thresholdMs": 1000,
+    "minimumExtraAttemptIntervalAwakeMs": 1000,
+    "burst": 1,
+    "extraAttemptsPerActiveProbe": 1,
+    "primaryDeadlineUnchanged": true,
+    "peerSelectionUnchanged": true,
+    "mandatoryForkAndStateAuthenticationUnchanged": true
+  },
+  "tests": [
+    {
+      "suite": "downloader",
+      "mode": "debug",
+      "passed": 39,
+      "total": 39,
+      "exitCode": 0,
+      "elapsedSeconds": 50.270551313995384,
+      "sourceUnchanged": true,
+      "logFile": "downloader-debug-final-r1.log",
+      "logSha256": "8aac1cdc8434a2b4bd9526093446b916fe78eee47b4c74b44f6a663535614bdb",
+      "recordSha256": "8c368089484dd02cc83a23e34c6993ead65a0e16ada4f6b1641428a76acb7959",
+      "command": [
+        "zig",
+        "build",
+        "test",
+        "-Doptimize=debug",
+        "-Dtest-filter=downloader",
+        "-j2",
+        "--cache-dir",
+        "<isolated cache>",
+        "--summary",
+        "all"
+      ]
+    },
+    {
+      "suite": "downloader",
+      "mode": "safe",
+      "passed": 39,
+      "total": 39,
+      "exitCode": 0,
+      "elapsedSeconds": 78.64668813091703,
+      "sourceUnchanged": true,
+      "logFile": "downloader-safe-final-r1.log",
+      "logSha256": "212eeed55d87c41a9bb4410057ac51ff47d73834951ceb299860437c5bb46668",
+      "recordSha256": "b9815361e679e97e1387538d4229580eb85c05c14252a4dcbcb38edbf966b215",
+      "command": [
+        "zig",
+        "build",
+        "test",
+        "-Doptimize=safe",
+        "-Dtest-filter=downloader",
+        "-j2",
+        "--cache-dir",
+        "<isolated cache>",
+        "--summary",
+        "all"
+      ]
+    },
+    {
+      "suite": "consensus",
+      "mode": "debug",
+      "passed": 21,
+      "total": 21,
+      "exitCode": 0,
+      "elapsedSeconds": 13.34923756797798,
+      "sourceUnchanged": true,
+      "logFile": "consensus-debug-final-r1.log",
+      "logSha256": "69fc0e33ecc417c384d85fc928bf746eeea14877a55d700039c8d0a5767e4842",
+      "recordSha256": "10358a2e1fc47084b7be9a33748abae27b146949ba38f99776dac2217872bc0c",
+      "command": [
+        "zig",
+        "build",
+        "test",
+        "-Doptimize=debug",
+        "-Dtest-filter=consensus",
+        "-j2",
+        "--cache-dir",
+        "<isolated cache>",
+        "--summary",
+        "all"
+      ]
+    },
+    {
+      "suite": "consensus",
+      "mode": "safe",
+      "passed": 21,
+      "total": 21,
+      "exitCode": 0,
+      "elapsedSeconds": 72.91297040798236,
+      "sourceUnchanged": true,
+      "logFile": "consensus-safe-final-r1.log",
+      "logSha256": "a569dad9e82758bd6936b0f4de0e4bbeb815e0cc7041da6c8fb9f4a03870b332",
+      "recordSha256": "308c8a857a481e1f0ae082a53917c61a4dcecae98f4295f085c5ca438124f452",
+      "command": [
+        "zig",
+        "build",
+        "test",
+        "-Doptimize=safe",
+        "-Dtest-filter=consensus",
+        "-j2",
+        "--cache-dir",
+        "<isolated cache>",
+        "--summary",
+        "all"
+      ]
+    }
+  ],
+  "negativeControlPatchSha256": "276cc8f11e3702a979dba7b5ef25a824e42f70a614a1531022d01e5d818a4031",
+  "newHeaderRegressionNames": [
+    "current head header hedge real owner avoids silent fifteen second probe with exact state",
+    "current head header hedge renewable allowance bounds long running load and clock regressions",
+    "current head header hedge exact threshold no alternate and failed send preserve primary",
+    "current head header hedge empty either peer preserves the other exact response",
+    "current head header hedge both validating invalid first cannot consume valid second",
+    "current head header hedge both valid completions elect exactly one winner",
+    "current head header hedge supersession and EMPTY reanchoring preserve global pacing and worker ownership",
+    "current head header hedge wrong wire identity and timeout retain ordinary primary retry",
+    "current head header hedge excludes scope and pool pressure without spending",
+    "current head header hedge post decode rejection releases real worker arena and frame",
+    "current head header hedge stale header metadata cannot change reused BAL timeout",
+    "current head header hedge cancellation joins workers before stale result disposal",
+    "current head header hedge sustained head changes do not stall or mint allowance"
+  ],
+  "limits": [
+    "No live performance or historical-gap attribution is claimed.",
+    "A silent primary with failed, empty or unavailable alternate may still wait its normal deadline.",
+    "A global awake-time allowance bounds extra sends; primary retry policy is unchanged.",
+    "The deterministic tests use controlled request timestamps, not a real-time slot benchmark."
+  ],
+  "negativeControl": [
+    {
+      "mode": "debug",
+      "exitCode": 1,
+      "compiledSuccessfully": true,
+      "passed": 0,
+      "failed": 1,
+      "failedTest": "current head header hedge real owner avoids silent fifteen second probe with exact state",
+      "assertion": "self.request(true) != null",
+      "logSha256": "4ade2e28a4c623fb4972dac58427f320981d30050ba42b0c93a588abac05ebd4",
+      "recordSha256": "fc6552c6fb6f0ebf34a2bffad90be0fd599cefb2436b118727f7ee1021abe219",
+      "negativeDownloaderSha256": "071cfc20a01ae3dec826ba748bb241b00f585f9e47202b3337947a4bf1759abe"
+    },
+    {
+      "mode": "safe",
+      "exitCode": 1,
+      "compiledSuccessfully": true,
+      "passed": 0,
+      "failed": 1,
+      "failedTest": "current head header hedge real owner avoids silent fifteen second probe with exact state",
+      "assertion": "same test; Safe does not emit an error trace",
+      "logSha256": "c08a8fde7405a87c43e8aca3aa948d89793462a5a6127cb204f4185bbaaca585",
+      "recordSha256": "0077ec72047c1df56f5b839a0bf58fa07b6ece372d439de7fe55a9b3896c349f",
+      "negativeDownloaderSha256": "071cfc20a01ae3dec826ba748bb241b00f585f9e47202b3337947a4bf1759abe"
+    }
+  ],
+  "reviews": [
+    {
+      "model": "claude-opus-5-5",
+      "effort": "xhigh",
+      "tools": [],
+      "exitCode": 0,
+      "isError": false,
+      "timedOut": false,
+      "elapsedSeconds": 630.3361647370039,
+      "packetSha256": "92562a83c7170ac3f06da6ffea7696bdd9586831c0f319e016550ac1a888661a",
+      "name": "opus-header-design",
+      "resultSha256": "26b12aefa974b107a9af1b606a4746f574877e5aa7a9ab95ca0c2cf14dfa7367",
+      "processSha256": "31c834923350b075b98eae0c52c553e1dbeedbc599223eeb517cecedc056e096"
+    },
+    {
+      "model": "claude-opus-5-5",
+      "effort": "xhigh",
+      "tools": [],
+      "exitCode": 0,
+      "isError": false,
+      "timedOut": false,
+      "elapsedSeconds": 465.7983625610359,
+      "packetSha256": "c5c207e82032f56ef56ba5f731fa3ba13f02c8c0665d66931479e5a77c3f7028",
+      "name": "opus-header-final",
+      "resultSha256": "5df0ffb52cda3fe9704b1377d6c7a1924b1df3851957d6b6a4f2f8c9cd36e794",
+      "processSha256": "dbfa627bb6f8d6ab506f5243de705072103fbfa800f7bdc28a5fbf2308df75b9"
+    }
+  ],
+  "reviewRecordSha256": "c8591db793748316240034890de1bf26453bb2ee72f3e10ab634ea201db9f4c0",
+  "finalReviewVerdict": "NO BLOCKERS",
+  "packageContentHash": "zevm-0.0.1-RVToGGJnGgBjhRfxRAeB8bar-bwzrhPEziQmjFWgmkm3",
+  "qualificationStatus": "affected suites and compiled negative controls passed; static review has no blockers; consumer and live qualification separate"
+}

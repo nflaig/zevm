@@ -43,6 +43,11 @@ const state_unavailable_backoff_ms = 10_000;
 // lower bound on peer progress, not proof it cannot serve a newer block.
 const bal_announced_height_gap = 32;
 const near_head_bal_retry_after: std.Io.Duration = .fromSeconds(1);
+const near_head_header_hedge_after: std.Io.Duration = .fromSeconds(1);
+// At most one additional single-header send per awake second, burst one.
+// A new FULL/reorg target can recover after its own one-second age threshold
+// rather than waiting another slot behind the previous target's allowance.
+const header_hedge_interval: std.Io.Duration = .fromSeconds(1);
 
 const log = std.log.scoped(.downloader);
 
@@ -61,6 +66,11 @@ pub const Downloader = struct {
     consensus_anchor: ?consensus.Anchor = null,
     bootstrap_target: ?consensus.Anchor = null,
     consensus_probe: ?[32]u8 = null,
+    consensus_probe_generation: u64 = 0,
+    consensus_probe_hedge_attempted: bool = false,
+    consensus_probe_notice: ?HeaderHedgeNotice = null,
+    consensus_probe_logged: u8 = 0,
+    consensus_header_budget: HeaderHedgeBudget = .{},
     consensus_reported: ?[32]u8 = null,
     ancestor_probe: ?[32]u8 = null,
     ancestors_ready: ?[32]u8 = null,
@@ -256,6 +266,7 @@ pub const Downloader = struct {
                 .target => |res| {
                     defer select.concurrent(.target, std.Io.Queue(consensus.Update).getOne, .{ self.consensus_updates.?, self.io }) catch |e| std.debug.panic("downloader: target task: {}", .{e});
                     self.consensus_update = try res;
+                    log.info("consensus head received: slot {} target {x} anchor_slot {}", .{ self.consensus_update.?.head.slot, self.consensus_update.?.head.hash, self.consensus_update.?.anchor.slot });
                     try self.advanceConsensusTarget();
                     self.observeHandle("consensus_target", busy_start);
                 },
@@ -331,6 +342,8 @@ pub const Downloader = struct {
             else => {},
         }
         if (matched) |req| {
+            if (received.msg == .block_headers and req.header_purpose == .consensus)
+                self.logConsensusHeader(req, "response", if (received.msg.block_headers.rlps.len == 0) "empty" else "received");
             self.validating_eth_requests.push(req);
             try self.startValidation(&self.eth_arena, .{ .eth = .{ .msg = received, .req = req } });
         }
@@ -369,7 +382,7 @@ pub const Downloader = struct {
         const allocator = gpa.allocator();
         const outcome = switch (response) {
             .eth => |*resp| switch (resp.msg.msg) {
-                .block_headers => |headers| validateHeaders(allocator, resp.req.msg.get_block_headers, headers),
+                .block_headers => |headers| validateHeaderResponse(allocator, resp.req, headers),
                 .block_access_list => |access_lists| validateBal(allocator, access_lists),
                 else => unreachable,
             },
@@ -386,6 +399,32 @@ pub const Downloader = struct {
     }
 
     fn handleValidated(self: *Self, validated: ValidatedResponse) !void {
+        // Superseded workers retain their request/frame until completion. They
+        // may neither change the new target nor penalize a reused connection.
+        if (validated.resp == .eth and validated.resp.eth.msg.msg == .block_headers) {
+            const req = validated.resp.eth.req;
+            if (req.header_purpose == .consensus and !self.currentConsensusRequest(req)) {
+                defer validated.deinit(self.allocator);
+                self.validating_eth_requests.remove(req);
+                self.logConsensusHeader(req, "validation", "stale");
+                self.free_eth_requests.push(req);
+                return;
+            }
+            if (req.header_purpose == .consensus) if (validated.outcome) |_| {} else |err| switch (err) {
+                // Raw bytes already matched the authenticated CL hash. A
+                // local codec/fork mismatch cannot be repaired by another peer.
+                // Preserve the pre-hedge fail-stop disposition, without peer
+                // punishment or a retry loop, and release worker ownership.
+                error.ConsensusHeaderHashMismatch, error.PostGloasRequired => {
+                    defer validated.deinit(self.allocator);
+                    self.validating_eth_requests.remove(req);
+                    self.logConsensusHeader(req, "local_rejection", @errorName(err));
+                    self.free_eth_requests.push(req);
+                    return err;
+                },
+                else => {},
+            };
+        }
         if (validated.outcome) |_| {} else |err| switch (validated.resp) {
             inline else => |resp, proto| {
                 if (proto == .snap and (err == error.EmptyAccountRange or err == error.EmptyStorageRanges)) {
@@ -523,6 +562,20 @@ pub const Downloader = struct {
         }
 
         return .{ .headers = .{ .hashes = hashes, .headers = headers } };
+    }
+
+    fn validateHeaderResponse(allocator: std.mem.Allocator, req: *const Request(eth.Message), response: eth.BlockHeaders) !ValidationOutcome {
+        // This allocator is the transferred worker arena. Both success and
+        // error outcomes retain that arena in ValidatedResponse until the
+        // owner consumes it; deinit frees all decoded arrays, including these
+        // post-decode rejection paths, together with the response frame.
+        const result = try validateHeaders(allocator, req.msg.get_block_headers, response);
+        if (req.header_purpose == .consensus and result.headers.headers.len == 1) {
+            const header = result.headers.headers[0];
+            if (!std.meta.eql(header.hash(), req.msg.get_block_headers.range.origin.hash)) return error.ConsensusHeaderHashMismatch;
+            if (header.block_access_list_hash == null or header.slot_number == null) return error.PostGloasRequired;
+        }
+        return result;
     }
 
     fn validateBal(allocator: std.mem.Allocator, response: eth.BlockAccessLists) !ValidationOutcome {
@@ -813,13 +866,46 @@ pub const Downloader = struct {
             (std.meta.eql(self.syncTarget().hash, desired) or self.shadow_snapshots.?.status().find(desired) != null);
         if (self.consensus_probe) |pending| {
             if (!already_selected and std.meta.eql(pending, desired)) return;
+            log.info("consensus header probe retired: target={x} generation={} next_target={x} already_selected={}", .{ pending, self.consensus_probe_generation, desired, already_selected });
             self.cancelHeaderRequests(.consensus);
             self.consensus_probe = null;
         }
         if (already_selected) return;
         const req = self.free_eth_requests.pop() orelse return;
+        errdefer self.free_eth_requests.push(req);
+        self.consensus_probe_generation = try std.math.add(u64, self.consensus_probe_generation, 1);
         self.consensus_probe = desired;
+        self.consensus_probe_hedge_attempted = false;
+        self.consensus_probe_notice = null;
+        self.consensus_probe_logged = 0;
         self.requestHeadersFor(req, .{ .hash = desired }, 1, .consensus);
+    }
+
+    fn currentConsensusRequest(self: *Self, req: *const Request(eth.Message)) bool {
+        const probe = self.consensus_probe orelse return false;
+        const desired = self.desiredConsensusHash() orelse return false;
+        return req.header_generation == self.consensus_probe_generation and
+            std.meta.eql(probe, desired) and std.meta.eql(req.msg.get_block_headers.range.origin.hash, desired);
+    }
+
+    fn logConsensusHeader(self: *Self, req: *const Request(eth.Message), action: []const u8, outcome: []const u8) void {
+        std.debug.assert(req.msg == .get_block_headers);
+        const elapsed = if (req.sent_at.nanoseconds == 0) 0 else req.sent_at.untilNow(self.io, .real).toMilliseconds();
+        // Empty replies keep the unchanged immediate primary retry policy.
+        // Log each common primary transition once per probe, not once per RTT.
+        const bit: u8 = if (!req.header_secondary and req.header_generation == self.consensus_probe_generation)
+            (if (std.mem.eql(u8, action, "sent")) 1 else if (std.mem.eql(u8, action, "response")) 2 else if (std.mem.eql(u8, action, "validation") and std.mem.eql(u8, outcome, "empty")) 4 else 0)
+        else
+            0;
+        const repeated = bit != 0 and self.consensus_probe_logged & bit != 0;
+        self.consensus_probe_logged |= bit;
+        const format = "consensus header probe: action={s} target={x} generation={} request={} peer={}/{} alternate={} wait_ms={} deadline_ms={} outcome={s}";
+        const args = .{
+            action,                        req.msg.get_block_headers.range.origin.hash, req.header_generation, req.id,
+            req.peer.peer_index,           req.peer.peer_epoch,                         req.header_secondary,  elapsed,
+            req.deadline.toMilliseconds(), outcome,
+        };
+        if (repeated) log.debug(format, args) else log.info(format, args);
     }
 
     fn handleConsensusHeader(self: *Self, req: *Request(eth.Message), outcome: anyerror!ValidationOutcome) !void {
@@ -832,15 +918,29 @@ pub const Downloader = struct {
             self.free_eth_requests.push(req);
             return;
         }
+        if (req.header_generation != self.consensus_probe_generation) {
+            self.logConsensusHeader(req, "validation", "superseded_generation");
+            self.free_eth_requests.push(req);
+            return;
+        }
         const headers = if (outcome) |result| result.headers.headers else |_| &.{};
         if (headers.len != 1) {
+            self.logConsensusHeader(req, "validation", if (outcome) |_| "empty" else |err| @errorName(err));
+            if (req.header_secondary) {
+                self.free_eth_requests.push(req);
+                return;
+            }
             self.requestHeadersFor(req, .{ .hash = expected }, 1, .consensus);
             return;
         }
         const header = headers[0];
         if (!std.meta.eql(header.hash(), expected)) return error.ConsensusHeaderHashMismatch;
         if (header.block_access_list_hash == null or header.slot_number == null) return error.PostGloasRequired;
+        self.logConsensusHeader(req, "validation", "valid_winner");
         self.free_eth_requests.push(req);
+        // Only a valid decoded current-target header can win. Pending/inflight
+        // siblings are ours; validating siblings will observe the closed probe.
+        self.cancelHeaderRequests(.consensus);
         self.consensus_probe = null;
         if (self.consensus_anchor != null and self.shadow_snapshots.?.status().find(expected) != null) return;
 
@@ -1078,6 +1178,8 @@ pub const Downloader = struct {
         try provider.send(req.peer, req.msg);
         self.metrics.requests_sent.incr(.{ .msg = @tagName(req.msg) }) catch {};
         req.deadline = sent_at.addDuration(try provider.timeoutFor(req.peer, std.meta.activeTag(req.msg)));
+        if (@TypeOf(req.msg) == eth.Message) if (req.msg == .get_block_headers and req.header_purpose == .consensus)
+            self.logConsensusHeader(req, "sent", "primary");
     }
 
     fn matchRequest(
@@ -1143,6 +1245,15 @@ pub const Downloader = struct {
             const request: *List(Request(Message)).Node = @alignCast(@fieldParentPtr("node", node));
 
             if (request.elem.deadline.toMilliseconds() < now.toMilliseconds()) {
+                if (Message == eth.Message) if (request.elem.msg == .get_block_headers and request.elem.header_purpose == .consensus and request.elem.header_secondary) {
+                    // This attempt shares the primary's earlier deadline. Do
+                    // not fabricate an RTT penalty or reissue the extra work.
+                    self.logConsensusHeader(&request.elem, "expired", "alternate_retired");
+                    list.inner.remove(node);
+                    self.free_eth_requests.push(&request.elem);
+                    current_node = next_node;
+                    continue;
+                };
                 if (!std.meta.eql(request.elem.peer, invalid_peer)) {
                     self.metrics.request_timeouts.incr(.{ .msg = @tagName(request.elem.msg) }) catch {};
                     log.debug("{t} request {} to {} timed out after {}ms (timeout {}ms)", .{
@@ -1153,6 +1264,8 @@ pub const Downloader = struct {
                         request.elem.sent_at.durationTo(request.elem.deadline).toMilliseconds(),
                     });
                 }
+                if (Message == eth.Message) if (request.elem.msg == .get_block_headers and request.elem.header_purpose == .consensus)
+                    self.logConsensusHeader(&request.elem, "expired", "primary_reissue");
                 const assumed_rtt: std.Io.Duration = .fromNanoseconds(request.elem.sent_at.durationTo(now).nanoseconds * 2);
                 provider.observeDelay(request.elem.peer, std.meta.activeTag(request.elem.msg), assumed_rtt);
                 if (Message == eth.Message) if (self.state_heal) |*heal| {
@@ -1207,9 +1320,71 @@ pub const Downloader = struct {
     }
 
     fn checkEthRequestTimeouts(self: *Self) !void {
+        self.hedgeConsensusHeader(self.eth_provider, std.Io.Clock.now(.real, self.io), std.Io.Clock.now(.awake, self.io));
         self.retryNearHeadBal(self.eth_provider, std.Io.Clock.now(.real, self.io));
         self.checkRequestTimeouts(eth.Message, &self.inflight_eth_requests, &self.pending_eth_requests, self.eth_provider);
         self.drainPendingEthRequests();
+    }
+
+    fn headerHedgeNotice(self: *Self, notice: HeaderHedgeNotice) void {
+        if (self.consensus_probe_notice == notice) return;
+        self.consensus_probe_notice = notice;
+        log.info("consensus header hedge unavailable: target={x} generation={} reason={t} attempts={}", .{
+            self.consensus_probe.?, self.consensus_probe_generation, notice, self.consensus_header_budget.count,
+        });
+    }
+
+    fn hedgeConsensusHeader(self: *Self, provider: anytype, now: std.Io.Timestamp, monotonic_now: std.Io.Timestamp) void {
+        if (self.consensus_probe == null) return;
+        if (self.consensus_probe_hedge_attempted or self.pending_bootstrap != null or self.consensus_anchor == null or self.consensus_updates == null) return;
+        const snapshots = self.shadow_snapshots orelse return;
+        if (snapshots.status().count == 0) return;
+        var node = self.inflight_eth_requests.inner.first;
+        while (node) |n| : (node = n.next) {
+            const primary: *Request(eth.Message) = &@as(*List(Request(eth.Message)).Node, @alignCast(@fieldParentPtr("node", n))).elem;
+            if (primary.msg != .get_block_headers or primary.header_purpose != .consensus or primary.header_secondary or
+                primary.msg.get_block_headers.range.amount != 1 or !self.currentConsensusRequest(primary)) continue;
+            if (primary.sent_at.durationTo(now).nanoseconds < near_head_header_hedge_after.nanoseconds or now.nanoseconds >= primary.deadline.nanoseconds) return;
+            if (!self.consensus_header_budget.available(monotonic_now)) {
+                self.headerHedgeNotice(.cooldown);
+                return;
+            }
+            // Preserve the primary's range/epoch/capacity policy. The probe's
+            // authenticated hash is not a verified block height yet.
+            var filter = PeerFilter(eth.Message).init(self, &self.inflight_eth_requests, self.syncTarget().number -| 16);
+            filter.excluded_peer = primary.peer;
+            const peer = provider.pickRandomPeer(filter) catch {
+                self.headerHedgeNotice(.no_alternate);
+                return;
+            };
+            const alternate = self.free_eth_requests.pop() orelse {
+                self.headerHedgeNotice(.no_request_slot);
+                return;
+            };
+            const spent = self.consensus_header_budget.spend(monotonic_now);
+            std.debug.assert(spent);
+            self.consensus_probe_hedge_attempted = true;
+            const id = provider.nextRequestId();
+            alternate.* = .{
+                .id = id,
+                .peer = peer,
+                .sent_at = now,
+                .deadline = primary.deadline,
+                .header_purpose = .consensus,
+                .header_generation = primary.header_generation,
+                .header_secondary = true,
+                .msg = .{ .get_block_headers = .{ .id = id, .range = primary.msg.get_block_headers.range } },
+            };
+            provider.send(peer, alternate.msg) catch |err| {
+                self.logConsensusHeader(alternate, "send_failed", @errorName(err));
+                self.free_eth_requests.push(alternate);
+                return;
+            };
+            self.inflight_eth_requests.push(alternate);
+            self.metrics.requests_sent.incr(.{ .msg = "get_block_headers" }) catch {};
+            self.logConsensusHeader(alternate, "sent", "alternate");
+            return;
+        }
     }
 
     fn retryNearHeadBal(self: *Self, provider: anytype, now: std.Io.Timestamp) void {
@@ -1489,8 +1664,13 @@ pub const Downloader = struct {
     }
 
     fn requestHeadersFor(self: *Self, req: *Request(eth.Message), origin: eth.HashOrNumber, amount: u64, purpose: HeaderPurpose) void {
-        req.header_generation = self.header_generation;
+        req.header_generation = if (purpose == .consensus) self.consensus_probe_generation else self.header_generation;
         req.header_purpose = purpose;
+        req.header_secondary = false;
+        req.id = 0;
+        req.peer = invalid_peer;
+        req.sent_at = .fromNanoseconds(0);
+        req.deadline = .fromNanoseconds(0);
         req.msg = .{ .get_block_headers = .{ .range = .{
             .origin = origin,
             .amount = amount,
@@ -2695,7 +2875,7 @@ pub const Downloader = struct {
         self.progress.last_log = now;
 
         if (self.eth_provider.server) |server| {
-            log.info("peers: {}/{} connections, eth {}, snap {}; dials {} (failed {}), inbound {}, handshakes {}, disconnects {}", .{
+            log.info("peers: {}/{} connections, eth {}, snap {}; dials {} (failed {}), inbound {}, handshakes {}, disconnects {}; header_hedge_attempts={} header_hedge_interval_ms={}", .{
                 server.connectionCount(),
                 rlpx.Server.max_peers,
                 self.eth_provider.peerCount(),
@@ -2705,6 +2885,8 @@ pub const Downloader = struct {
                 server.stats.inbound.load(.monotonic),
                 server.stats.handshakes.load(.monotonic),
                 server.stats.disconnects.load(.monotonic),
+                self.consensus_header_budget.count,
+                header_hedge_interval.toMilliseconds(),
             });
         }
 
@@ -2766,6 +2948,28 @@ pub const Downloader = struct {
 };
 
 const HeaderPurpose = enum { chain, consensus, ancestors };
+const HeaderHedgeNotice = enum { no_alternate, no_request_slot, cooldown };
+
+/// One renewable allowance, paced by the monotonic awake clock. Target changes,
+/// retries, finality and EMPTY reanchoring never reset it. No accumulated burst:
+/// a send attempt (including failure) starts a fresh interval from actual use.
+/// The separate active-probe flag prevents repeated attempts on one probe even
+/// after this allowance replenishes. No lifetime hash ledger can saturate.
+const HeaderHedgeBudget = struct {
+    next_at: ?std.Io.Timestamp = null,
+    count: u64 = 0,
+
+    fn available(self: *const @This(), now: std.Io.Timestamp) bool {
+        return if (self.next_at) |next| now.nanoseconds >= next.nanoseconds else true;
+    }
+
+    fn spend(self: *@This(), now: std.Io.Timestamp) bool {
+        if (!self.available(now)) return false;
+        self.next_at = .fromNanoseconds(now.nanoseconds +| header_hedge_interval.nanoseconds);
+        self.count +|= 1;
+        return true;
+    }
+};
 
 fn Request(comptime msg: type) type {
     return struct {
@@ -2778,6 +2982,7 @@ fn Request(comptime msg: type) type {
         storage_roots: [][32]u8 = &.{},
         header_purpose: HeaderPurpose = .chain,
         header_generation: u64 = 0,
+        header_secondary: bool = false,
 
         fn lessThan(ctx: void, left: @This(), right: @This()) bool {
             return msg.lessThan(ctx, left.msg, right.msg);
@@ -2860,6 +3065,7 @@ test "retained EMPTY parent cancels obsolete probes without rewinding warmed FUL
     downloader.consensus_anchor = .{ .beacon_root = @splat(8), .execution_hash = parent.hash(), .slot = 100 };
     downloader.consensus_update = .{ .anchor = downloader.consensus_anchor.?, .head = .{ .hash = parent.hash(), .slot = 101 }, .observed_at_ms = 0 };
     downloader.consensus_probe = @splat(9);
+    downloader.consensus_probe_generation = 0;
     downloader.sync_target_mutex = .init;
     downloader.sync_target = .{ .number = full.number, .hash = full.hash(), .cutoff_number = full.number, .cutoff_hash = full.hash() };
     downloader.header_generation = 42;
@@ -2940,6 +3146,8 @@ test "consensus direct extension reuses verified target and checkpoint without a
     downloader.free_eth_requests = .{};
     var request_pool = try List(Request(eth.Message)).init(arena.allocator(), 4);
     const lookup = request_pool.pop().?;
+    lookup.* = .{ .id = 0, .peer = invalid_peer, .sent_at = .fromNanoseconds(0), .deadline = .fromNanoseconds(0), .msg = undefined };
+    lookup.header_generation = downloader.consensus_probe_generation;
     lookup.header_purpose = .consensus;
     lookup.msg = .{ .get_block_headers = .{ .range = .{ .origin = .{ .hash = child.hash() }, .amount = 1, .skip = 0, .reverse = true } } };
     var lookup_headers = [_]types.BlockHeader{child};
@@ -3115,6 +3323,8 @@ test "consensus direct extension reuses verified target and checkpoint without a
     // The retained FULL-A lease stays valid while the writer follows FULL-B.
     downloader.consensus_update.?.head.hash = sibling.hash();
     const sibling_lookup = downloader.free_eth_requests.pop().?;
+    sibling_lookup.* = .{ .id = 0, .peer = invalid_peer, .sent_at = .fromNanoseconds(0), .deadline = .fromNanoseconds(0), .msg = undefined };
+    sibling_lookup.header_generation = downloader.consensus_probe_generation;
     sibling_lookup.header_purpose = .consensus;
     sibling_lookup.msg = .{ .get_block_headers = .{ .range = .{ .origin = .{ .hash = sibling.hash() }, .amount = 1 } } };
     lookup_headers[0] = sibling;
@@ -3374,6 +3584,8 @@ test "incomplete bootstrap advances only a finalized linked root and publishes a
     // An unrelated live execution head must never select bootstrap work.
     try std.testing.expectEqual(child.hash(), d.desiredConsensusHash().?);
     const lookup = d.free_eth_requests.pop().?;
+    lookup.* = .{ .id = 0, .peer = invalid_peer, .sent_at = .fromNanoseconds(0), .deadline = .fromNanoseconds(0), .msg = undefined };
+    lookup.header_generation = d.consensus_probe_generation;
     lookup.header_purpose = .consensus;
     lookup.msg = .{ .get_block_headers = .{ .range = .{ .origin = .{ .hash = child.hash() }, .amount = 1 } } };
     var child_headers = [_]types.BlockHeader{child};
@@ -4143,6 +4355,10 @@ const BalRetryTestFixture = struct {
     }
 
     fn initWithEmptyBal(self: *@This(), backing: std.mem.Allocator, path: []const u8, empty_bal: bool) !void {
+        return self.initWithSelection(backing, path, empty_bal, true);
+    }
+
+    fn initWithSelection(self: *@This(), backing: std.mem.Allocator, path: []const u8, empty_bal: bool, select_child: bool) !void {
         const io = std.testing.io;
         self.memory = .{ .backing = backing };
         errdefer self.memory.deinit();
@@ -4215,8 +4431,8 @@ const BalRetryTestFixture = struct {
         };
         self.updates = .init(&self.updates_storage);
         self.downloader.consensus_updates = &self.updates;
-        try self.downloader.selectConsensusTarget(self.child);
-        try std.testing.expectEqual(self.child.hash(), (try self.bc.head()).hash);
+        if (select_child) try self.downloader.selectConsensusTarget(self.child);
+        try std.testing.expectEqual(if (select_child) self.child.hash() else self.parent.hash(), (try self.bc.head()).hash);
         try std.testing.expectEqual(self.parent.hash(), self.snapshots.status().headers[0].hash());
         try std.testing.expect(self.downloader.inflight_eth_requests.empty());
 
@@ -4237,6 +4453,7 @@ const BalRetryTestFixture = struct {
         // real response RTT observation never receives a future sent_at.
         self.sent_at = .fromNanoseconds(std.Io.Clock.now(.real, io).nanoseconds - 10 * std.time.ns_per_s);
         self.hashes = .{self.child.hash()};
+        if (!select_child) return;
         self.downloader.state_heal = .{
             .next_pivot = self.child,
             .target_pivot = self.child,
@@ -4314,6 +4531,16 @@ const BalRetryTestFixture = struct {
         defer encoded.deinit();
         try rlp.serialize(eth.BlockAccessLists, self.allocator, .{ .request_id = id, .rlps = values_rlp }, &encoded);
         return self.deliverFrame(peer, @backingInt(eth.MessageId.block_access_list), encoded.items);
+    }
+
+    fn deliverHeader(self: *@This(), peer: rlpx.Server.PeerId, id: u64, values: []const []const u8) !bool {
+        const values_rlp = try self.allocator.alloc(rlp.RawValue, values.len);
+        defer self.allocator.free(values_rlp);
+        for (values_rlp, values) |*value, bytes| value.* = .{ .value = bytes };
+        var encoded = std.array_list.Managed(u8).init(self.allocator);
+        defer encoded.deinit();
+        try rlp.serialize(eth.BlockHeaders, self.allocator, .{ .request_id = id, .rlps = values_rlp }, &encoded);
+        return self.deliverFrame(peer, @backingInt(eth.MessageId.block_headers), encoded.items);
     }
 
     fn deliverFrame(self: *@This(), peer: rlpx.Server.PeerId, message_id: u8, bytes: []const u8) !bool {
@@ -5091,5 +5318,506 @@ test "near-head BAL retry nonempty invalid alternate validates once then uses or
         try f.finishValidation();
         try f.expectChildState(old);
         try std.testing.expectEqual(max_inflight_requests, f.downloader.free_eth_requests.inner.len());
+    }
+}
+
+const HeaderProbeTest = struct {
+    arena: std.heap.ArenaAllocator,
+    dir: std.testing.TmpDir,
+    f: BalRetryTestFixture,
+    old: snapshots_db.View,
+
+    fn init(self: *@This()) !void {
+        self.arena = .init(std.testing.allocator);
+        errdefer self.arena.deinit();
+        self.dir = std.testing.tmpDir(.{});
+        errdefer self.dir.cleanup();
+        try self.dir.dir.createDir(std.testing.io, "db", .default_dir);
+        var path: [1024]u8 = undefined;
+        const len = try self.dir.dir.realPathFile(std.testing.io, "db", &path);
+        try self.f.initWithSelection(self.arena.allocator(), path[0..len], false, false);
+        errdefer self.f.deinit();
+        self.old = try self.f.snapshots.acquire(self.f.parent.hash(), self.f.parent.state_root);
+        self.f.downloader.ancestors_ready = self.f.parent.hash();
+    }
+
+    fn deinit(self: *@This()) void {
+        self.old.deinit();
+        self.f.deinit();
+        self.dir.cleanup();
+        self.arena.deinit();
+    }
+
+    fn request(self: *@This(), secondary: bool) ?*Request(eth.Message) {
+        var node = self.f.downloader.inflight_eth_requests.inner.first;
+        while (node) |n| : (node = n.next) {
+            const req = &@as(*List(Request(eth.Message)).Node, @alignCast(@fieldParentPtr("node", n))).elem;
+            if (req.msg == .get_block_headers and req.header_purpose == .consensus and req.header_secondary == secondary) return req;
+        }
+        return null;
+    }
+
+    fn begin(self: *@This()) !*Request(eth.Message) {
+        try std.testing.expectEqual(null, self.f.downloader.state_heal);
+        try std.testing.expectEqual(self.f.parent.hash(), (try self.f.bc.head()).hash);
+        try self.f.downloader.advanceConsensusTarget();
+        const primary = self.request(false).?;
+        try std.testing.expectEqual(@as(i64, 15000), primary.sent_at.durationTo(primary.deadline).toMilliseconds());
+        try std.testing.expectEqual(BalRetryTestFixture.old_peer, primary.peer);
+        try std.testing.expectEqual(@as(usize, 1), try self.f.drainWrites());
+        return primary;
+    }
+
+    fn encodeHeader(self: *@This(), header: types.BlockHeader) ![]u8 {
+        var out = std.array_list.Managed(u8).init(self.arena.allocator());
+        try rlp.serialize(types.BlockHeader, self.arena.allocator(), header, &out);
+        return out.toOwnedSlice();
+    }
+
+    fn hedge(self: *@This(), primary: *Request(eth.Message)) !*Request(eth.Message) {
+        // Change only age; the real send-assigned fifteen-second deadline stays.
+        primary.sent_at = std.Io.Clock.real.now(std.testing.io).addDuration(.fromSeconds(-2));
+        try self.f.downloader.handleTick();
+        try std.testing.expect(self.request(true) != null);
+        const alternate = self.request(true).?;
+        try std.testing.expectEqual(primary.deadline, alternate.deadline);
+        try std.testing.expectEqual(BalRetryTestFixture.alternate, alternate.peer);
+        const write = (try self.f.takeWrite()).?;
+        defer self.f.releaseWrite(write);
+        const expected, const expected_len = try rlpx.encodeMsg(self.arena.allocator(), 16 + @backingInt(eth.MessageId.get_block_headers), alternate.msg.get_block_headers, true);
+        try std.testing.expectEqual(alternate.peer, write.peer_id);
+        try std.testing.expectEqualSlices(u8, expected[0..expected_len], write.payload[0..write.payload_len]);
+        try std.testing.expectEqual(null, try self.f.takeWrite());
+        return alternate;
+    }
+
+    fn finishChild(self: *@This()) !void {
+        try std.testing.expectEqual(null, self.f.snapshots.status().find(self.f.child.hash()));
+        try self.f.downloader.advanceShadowWork();
+        var node = self.f.downloader.inflight_eth_requests.inner.first;
+        var bal: ?*Request(eth.Message) = null;
+        while (node) |n| : (node = n.next) {
+            const req = &@as(*List(Request(eth.Message)).Node, @alignCast(@fieldParentPtr("node", n))).elem;
+            if (req.msg == .get_block_access_list) bal = req;
+        }
+        const req = bal orelse return error.NoBalAfterValidHeader;
+        _ = try self.f.drainWrites();
+        try std.testing.expect(try self.f.deliver(req.peer, req.id, &.{self.f.bal_bytes}));
+        try self.f.finishValidation();
+        try self.f.expectChildState(self.old);
+    }
+};
+
+test "current head header hedge real owner avoids silent fifteen second probe with exact state" {
+    {
+        var control: HeaderProbeTest = undefined;
+        try control.init();
+        defer control.deinit();
+        const req = try control.begin();
+        const id = req.id;
+        req.sent_at = std.Io.Clock.real.now(std.testing.io).addDuration(.fromSeconds(-12));
+        req.deadline = req.sent_at.addDuration(.fromSeconds(15));
+        // Exercise the exact pre-existing timeout path at one full slot: the
+        // silent request remains owned, with no response/retry/state available.
+        const d = &control.f.downloader;
+        d.checkRequestTimeouts(eth.Message, &d.inflight_eth_requests, &d.pending_eth_requests, &control.f.eth_provider);
+        d.drainPendingEthRequests();
+        try std.testing.expectEqual(id, req.id);
+        try std.testing.expectEqual(1, d.inflight_eth_requests.inner.len());
+        try std.testing.expectEqual(null, try control.f.takeWrite());
+        try std.testing.expectEqual(null, control.f.snapshots.status().find(control.f.child.hash()));
+    }
+    var h: HeaderProbeTest = undefined;
+    try h.init();
+    defer h.deinit();
+    const primary = try h.begin();
+    const original_id = primary.id;
+    const deadline = primary.deadline;
+    // The unchanged primary deadline crosses the entire twelve-second slot.
+    const slot_end = primary.sent_at.addDuration(.fromSeconds(12));
+    try std.testing.expectEqual(@as(i64, 3000), slot_end.durationTo(deadline).toMilliseconds());
+    try std.testing.expectEqual(null, h.f.snapshots.status().find(h.f.child.hash()));
+    const alternate = try h.hedge(primary);
+    try std.testing.expectEqual(original_id, primary.id);
+    try std.testing.expectEqual(deadline, primary.deadline);
+    try std.testing.expectEqual(2, h.f.downloader.inflight_eth_requests.inner.len());
+    try std.testing.expectEqual(1, h.f.downloader.consensus_header_budget.count);
+    try h.f.downloader.handleTick();
+    try std.testing.expectEqual(null, try h.f.takeWrite());
+    const bytes = try h.encodeHeader(h.f.child);
+    try std.testing.expect(try h.f.deliverHeader(alternate.peer, alternate.id, &.{bytes}));
+    try h.f.finishValidation();
+    try std.testing.expect(h.f.downloader.inflight_eth_requests.empty());
+    try std.testing.expectEqual(null, h.f.downloader.consensus_probe);
+    try std.testing.expect(!try h.f.deliverHeader(BalRetryTestFixture.old_peer, original_id, &.{bytes}));
+    try h.finishChild();
+}
+
+test "current head header hedge renewable allowance bounds long running load and clock regressions" {
+    var budget: HeaderHedgeBudget = .{};
+    var now: std.Io.Timestamp = .fromNanoseconds(10 * std.time.ns_per_s);
+    // More than the rejected lifetime-ledger capacity, without saturation or
+    // accumulated catch-up credits. One failed/successful send has the same cost.
+    for (0..8192) |i| {
+        try std.testing.expect(budget.spend(now));
+        try std.testing.expectEqual(i + 1, budget.count);
+        try std.testing.expect(!budget.spend(now));
+        try std.testing.expect(!budget.spend(now.addDuration(.fromSeconds(-1))));
+        try std.testing.expect(!budget.spend(now.addDuration(.fromNanoseconds(std.time.ns_per_s - 1))));
+        now = now.addDuration(.fromSeconds(1));
+    }
+    now = now.addDuration(.fromSeconds(86400));
+    try std.testing.expect(budget.spend(now));
+    try std.testing.expect(!budget.spend(now));
+    try std.testing.expectEqual(now.addDuration(header_hedge_interval), budget.next_at.?);
+}
+
+test "current head header hedge exact threshold no alternate and failed send preserve primary" {
+    var h: HeaderProbeTest = undefined;
+    try h.init();
+    defer h.deinit();
+    const primary = try h.begin();
+    primary.sent_at = std.Io.Clock.real.now(std.testing.io).addDuration(.fromSeconds(-2));
+    const original = primary.*;
+    h.f.downloader.hedgeConsensusHeader(&h.f.eth_provider, primary.sent_at.addDuration(.fromNanoseconds(std.time.ns_per_s - 1)), .fromNanoseconds(0));
+    try std.testing.expectEqual(null, try h.f.takeWrite());
+    h.f.eth_provider.peers[1].info.store(.{ .epoch = 0, .offset = 0 }, .release);
+    h.f.downloader.hedgeConsensusHeader(&h.f.eth_provider, primary.sent_at.addDuration(.fromSeconds(1)), .fromNanoseconds(0));
+    try std.testing.expectEqual(0, h.f.downloader.consensus_header_budget.count);
+    try std.testing.expectEqualDeep(.{ original.id, original.peer, original.msg, original.deadline }, .{ primary.id, primary.peer, primary.msg, primary.deadline });
+    h.f.enablePeer(BalRetryTestFixture.alternate, 0, h.f.child.number);
+    const RejectSend = struct {
+        provider: *eth.Provider,
+        fn pickRandomPeer(self: *@This(), filter: anytype) !rlpx.Server.PeerId {
+            return self.provider.pickRandomPeer(filter);
+        }
+        fn nextRequestId(self: *@This()) u64 {
+            return self.provider.nextRequestId();
+        }
+        fn send(_: *@This(), _: rlpx.Server.PeerId, _: eth.Message) !void {
+            return error.TestQueueFull;
+        }
+    };
+    var reject: RejectSend = .{ .provider = &h.f.eth_provider };
+    const free_before = h.f.downloader.free_eth_requests.inner.len();
+    h.f.downloader.hedgeConsensusHeader(&reject, primary.sent_at.addDuration(.fromSeconds(1)), .fromNanoseconds(0));
+    try std.testing.expectEqual(1, h.f.downloader.consensus_header_budget.count);
+    try std.testing.expectEqual(free_before, h.f.downloader.free_eth_requests.inner.len());
+    try std.testing.expectEqual(1, h.f.downloader.inflight_eth_requests.inner.len());
+    try std.testing.expectEqualDeep(.{ original.id, original.peer, original.msg, original.deadline }, .{ primary.id, primary.peer, primary.msg, primary.deadline });
+    h.f.downloader.hedgeConsensusHeader(&h.f.eth_provider, primary.sent_at.addDuration(.fromSeconds(2)), .fromNanoseconds(2 * std.time.ns_per_s));
+    try std.testing.expectEqual(null, try h.f.takeWrite());
+}
+
+test "current head header hedge empty either peer preserves the other exact response" {
+    inline for (.{ false, true }) |empty_alternate| {
+        var h: HeaderProbeTest = undefined;
+        try h.init();
+        defer h.deinit();
+        const primary = try h.begin();
+        const alternate = try h.hedge(primary);
+        const empty = if (empty_alternate) alternate.* else primary.*;
+        const winner = if (empty_alternate) primary.* else alternate.*;
+        try std.testing.expect(try h.f.deliverHeader(empty.peer, empty.id, &.{}));
+        try h.f.finishValidation();
+        try std.testing.expectEqual(null, h.f.snapshots.status().find(h.f.child.hash()));
+        try std.testing.expect(h.f.eth_provider.peers[empty.peer.peer_index].info.load(.acquire).offset != 0);
+        _ = try h.f.drainWrites(); // ordinary primary reissue may coexist
+        const bytes = try h.encodeHeader(h.f.child);
+        try std.testing.expect(try h.f.deliverHeader(winner.peer, winner.id, &.{bytes}));
+        try h.f.finishValidation();
+        try h.finishChild();
+        try std.testing.expectEqual(1, h.f.downloader.consensus_header_budget.count);
+    }
+}
+
+test "current head header hedge both validating invalid first cannot consume valid second" {
+    inline for (.{ false, true }) |invalid_alternate| {
+        inline for (.{ false, true }) |wrong_hash| {
+            var h: HeaderProbeTest = undefined;
+            try h.init();
+            defer h.deinit();
+            const primary = try h.begin();
+            const alternate = try h.hedge(primary);
+            const bad = if (invalid_alternate) alternate.* else primary.*;
+            const good = if (invalid_alternate) primary.* else alternate.*;
+            const bytes = try h.encodeHeader(h.f.child);
+            var wrong = h.f.child;
+            wrong.beneficiary = @splat(0x77);
+            const bad_bytes = if (wrong_hash) try h.encodeHeader(wrong) else &.{0xc0};
+            try std.testing.expect(try h.f.deliverHeader(bad.peer, bad.id, &.{bad_bytes}));
+            try std.testing.expect(try h.f.deliverHeader(good.peer, good.id, &.{bytes}));
+            try h.f.downloader.task_group.await(std.testing.io);
+            const one = try h.f.downloader.validated_responses.getOne(std.testing.io);
+            const two = try h.f.downloader.validated_responses.getOne(std.testing.io);
+            const first = if (one.resp.eth.req.id == bad.id) one else two;
+            const second = if (one.resp.eth.req.id == bad.id) two else one;
+            try h.f.downloader.handleValidated(first);
+            try std.testing.expectEqual(null, h.f.snapshots.status().find(h.f.child.hash()));
+            try std.testing.expectEqual(1, h.f.downloader.validating_eth_requests.inner.len());
+            try h.f.downloader.handleValidated(second);
+            _ = try h.f.drainWrites();
+            try h.finishChild();
+        }
+    }
+}
+
+test "current head header hedge both valid completions elect exactly one winner" {
+    inline for (.{ false, true }) |alternate_first| {
+        var h: HeaderProbeTest = undefined;
+        try h.init();
+        defer h.deinit();
+        const primary = (try h.begin());
+        const alternate = try h.hedge(primary);
+        const first_id = if (alternate_first) alternate.id else primary.id;
+        const bytes = try h.encodeHeader(h.f.child);
+        try std.testing.expect(try h.f.deliverHeader(primary.peer, primary.id, &.{bytes}));
+        try std.testing.expect(try h.f.deliverHeader(alternate.peer, alternate.id, &.{bytes}));
+        try h.f.downloader.task_group.await(std.testing.io);
+        const one = try h.f.downloader.validated_responses.getOne(std.testing.io);
+        const two = try h.f.downloader.validated_responses.getOne(std.testing.io);
+        const one_first = one.resp.eth.req.id == first_id;
+        try h.f.downloader.handleValidated(if (one_first) one else two);
+        try std.testing.expectEqual(null, h.f.downloader.consensus_probe);
+        try std.testing.expectEqual(h.f.child.hash(), (try h.f.bc.head()).hash);
+        try h.f.downloader.handleValidated(if (one_first) two else one);
+        try std.testing.expectEqual(max_inflight_requests, h.f.downloader.free_eth_requests.inner.len());
+        try std.testing.expect(h.f.downloader.validating_eth_requests.empty());
+        try std.testing.expectEqual(@as(usize, 0), h.f.peer_slots[0].disconnect_epoch.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), h.f.peer_slots[1].disconnect_epoch.load(.acquire));
+        try h.finishChild();
+    }
+}
+
+test "current head header hedge supersession and EMPTY reanchoring preserve global pacing and worker ownership" {
+    var h: HeaderProbeTest = undefined;
+    try h.init();
+    defer h.deinit();
+    const d = &h.f.downloader;
+    const primary = try h.begin();
+    const first_generation = d.consensus_probe_generation;
+    primary.sent_at = std.Io.Clock.real.now(std.testing.io).addDuration(.fromSeconds(-2));
+    const mono: std.Io.Timestamp = .fromNanoseconds(10 * std.time.ns_per_s);
+    d.hedgeConsensusHeader(&h.f.eth_provider, primary.sent_at.addDuration(.fromSeconds(1)), mono);
+    const old_alt = h.request(true).?.*;
+    _ = try h.f.drainWrites();
+    // Keep an invalid A worker outstanding through A -> B -> A. Its completion
+    // must free the original frame/request without penalizing the live peer.
+    try std.testing.expect(try h.f.deliverHeader(primary.peer, primary.id, &.{&.{0xc0}}));
+    d.consensus_update.?.head.hash = @splat(0x88);
+    try d.advanceConsensusTarget();
+    _ = try h.f.drainWrites();
+    d.consensus_update.?.head.hash = h.f.child.hash();
+    d.consensus_update.?.head.slot += 5;
+    d.consensus_update.?.anchor.slot += 1;
+    try d.advanceConsensusTarget();
+    _ = try h.f.drainWrites();
+    try std.testing.expectEqual(first_generation + 2, d.consensus_probe_generation);
+    try std.testing.expectEqual(mono.addDuration(header_hedge_interval), d.consensus_header_budget.next_at.?);
+    const current = h.request(false).?;
+    current.sent_at = std.Io.Clock.real.now(std.testing.io).addDuration(.fromSeconds(-2));
+    const wall = current.sent_at.addDuration(.fromSeconds(1));
+    d.hedgeConsensusHeader(&h.f.eth_provider, wall, mono.addDuration(.fromNanoseconds(std.time.ns_per_s - 1)));
+    try std.testing.expectEqual(null, h.request(true));
+    try h.f.finishValidation();
+    try std.testing.expectEqual(@as(usize, 0), h.f.peer_slots[0].disconnect_epoch.load(.acquire));
+    try std.testing.expectEqual(h.f.parent.hash(), (try h.f.bc.head()).hash);
+    const bytes = try h.encodeHeader(h.f.child);
+    try std.testing.expect(!try h.f.deliverHeader(old_alt.peer, old_alt.id, &.{bytes}));
+    // A legitimate new probe gets its allowance exactly one second later,
+    // not a slot later. No target change or later EMPTY anchor granted it early.
+    d.hedgeConsensusHeader(&h.f.eth_provider, wall, mono.addDuration(.fromSeconds(1)));
+    const winner = h.request(true).?.*;
+    try std.testing.expectEqual(2, d.consensus_header_budget.count);
+    _ = try h.f.drainWrites();
+    d.consensus_update.?.head.slot += 10;
+    d.consensus_update.?.anchor.slot += 10;
+    try d.advanceConsensusTarget();
+    d.hedgeConsensusHeader(&h.f.eth_provider, wall, mono.addDuration(.fromSeconds(100)));
+    try std.testing.expectEqual(2, d.consensus_header_budget.count);
+    try std.testing.expectEqual(null, try h.f.takeWrite());
+    try std.testing.expect(try h.f.deliverHeader(winner.peer, winner.id, &.{bytes}));
+    try h.f.finishValidation();
+    try h.finishChild();
+}
+
+test "current head header hedge wrong wire identity and timeout retain ordinary primary retry" {
+    var h: HeaderProbeTest = undefined;
+    try h.init();
+    defer h.deinit();
+    const d = &h.f.downloader;
+    const primary = try h.begin();
+    const alternate = try h.hedge(primary);
+    const old_primary = primary.*;
+    const old_alt = alternate.*;
+    const bytes = try h.encodeHeader(h.f.child);
+    try std.testing.expect(!try h.f.deliverHeader(alternate.peer, alternate.id + 100, &.{bytes}));
+    var reused_peer = alternate.peer;
+    reused_peer.peer_epoch += 1;
+    try std.testing.expect(!try h.f.deliverHeader(reused_peer, alternate.id, &.{bytes}));
+    try std.testing.expectEqual(2, d.inflight_eth_requests.inner.len());
+    primary.deadline = std.Io.Clock.real.now(std.testing.io).addDuration(.fromSeconds(-1));
+    alternate.deadline = primary.deadline;
+    try d.checkEthRequestTimeouts();
+    try std.testing.expectEqual(null, h.request(true));
+    try std.testing.expectEqual(1, d.inflight_eth_requests.inner.len());
+    try std.testing.expectEqual(1, try h.f.drainWrites());
+    const reissued = h.request(false).?;
+    try std.testing.expect(reissued.id != old_primary.id and reissued.id != old_alt.id);
+    reissued.sent_at = std.Io.Clock.real.now(std.testing.io).addDuration(.fromSeconds(-2));
+    d.hedgeConsensusHeader(&h.f.eth_provider, reissued.sent_at.addDuration(.fromSeconds(1)), .fromNanoseconds(std.math.maxInt(i96)));
+    try std.testing.expectEqual(1, d.consensus_header_budget.count);
+    try std.testing.expectEqual(null, try h.f.takeWrite());
+    try std.testing.expect(!try h.f.deliverHeader(old_primary.peer, old_primary.id, &.{bytes}));
+    try std.testing.expect(!try h.f.deliverHeader(old_alt.peer, old_alt.id, &.{bytes}));
+    try std.testing.expect(try h.f.deliverHeader(reissued.peer, reissued.id, &.{bytes}));
+    try h.f.finishValidation();
+    try h.finishChild();
+}
+
+test "current head header hedge excludes scope and pool pressure without spending" {
+    var h: HeaderProbeTest = undefined;
+    try h.init();
+    defer h.deinit();
+    const d = &h.f.downloader;
+    const primary = try h.begin();
+    primary.sent_at = std.Io.Clock.real.now(std.testing.io).addDuration(.fromSeconds(-2));
+    const now = primary.sent_at.addDuration(.fromSeconds(1));
+    const mono: std.Io.Timestamp = .fromNanoseconds(0);
+    d.consensus_updates = null;
+    d.hedgeConsensusHeader(&h.f.eth_provider, now, mono);
+    d.consensus_updates = &h.f.updates;
+    d.pending_bootstrap = h.f.parent;
+    d.hedgeConsensusHeader(&h.f.eth_provider, now, mono);
+    d.pending_bootstrap = null;
+    d.shadow_snapshots = null;
+    d.hedgeConsensusHeader(&h.f.eth_provider, now, mono);
+    d.shadow_snapshots = &h.f.snapshots;
+    primary.header_purpose = .chain;
+    d.hedgeConsensusHeader(&h.f.eth_provider, now, mono);
+    primary.header_purpose = .consensus;
+    primary.msg.get_block_headers.range.amount = 2;
+    d.hedgeConsensusHeader(&h.f.eth_provider, now, mono);
+    primary.msg.get_block_headers.range.amount = 1;
+    var held: List(Request(eth.Message)) = .{};
+    while (d.free_eth_requests.pop()) |req| held.push(req);
+    d.hedgeConsensusHeader(&h.f.eth_provider, now, mono);
+    while (held.pop()) |req| d.free_eth_requests.push(req);
+    try std.testing.expectEqual(0, d.consensus_header_budget.count);
+    try std.testing.expectEqual(1, d.inflight_eth_requests.inner.len());
+    try std.testing.expectEqual(null, try h.f.takeWrite());
+    d.hedgeConsensusHeader(&h.f.eth_provider, now, mono);
+    try std.testing.expectEqual(1, d.consensus_header_budget.count);
+    try std.testing.expectEqual(2, d.inflight_eth_requests.inner.len());
+    try std.testing.expectEqual(1, try h.f.drainWrites());
+}
+
+test "current head header hedge post decode rejection releases real worker arena and frame" {
+    var worker: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .canary = 0x9813af7 });
+    defer std.testing.expectEqual(@as(usize, 0), worker.deinit()) catch @panic("header worker arena leak");
+    var h: HeaderProbeTest = undefined;
+    try h.init();
+    defer h.deinit();
+    // A well-formed exact-hash header which is missing the post-Gloas fields
+    // passes validateHeaders and fails only the new post-decode requirement.
+    var pre_fork = h.f.child;
+    pre_fork.block_access_list_hash = null;
+    pre_fork.slot_number = null;
+    h.f.downloader.consensus_update.?.head.hash = pre_fork.hash();
+    const primary = try h.begin();
+    h.f.downloader.eth_arena.deinit();
+    h.f.downloader.eth_arena = .init(worker.allocator());
+    try std.testing.expect(try h.f.deliverHeader(primary.peer, primary.id, &.{try h.encodeHeader(pre_fork)}));
+    const result = try h.f.downloader.validated_responses.getOne(std.testing.io);
+    try std.testing.expectError(error.PostGloasRequired, result.outcome);
+    try std.testing.expectError(error.PostGloasRequired, h.f.downloader.handleValidated(result));
+    try h.f.downloader.task_group.await(std.testing.io);
+    try std.testing.expect(h.f.downloader.validating_eth_requests.empty());
+    try std.testing.expectEqual(max_inflight_requests, h.f.downloader.free_eth_requests.inner.len());
+    try std.testing.expectEqual(@as(usize, 0), h.f.peer_slots[0].disconnect_epoch.load(.acquire));
+    try std.testing.expectEqual(null, try h.f.takeWrite());
+    try std.testing.expectEqual(null, h.f.snapshots.status().find(pre_fork.hash()));
+    try std.testing.expectEqual(h.f.parent.hash(), (try h.f.bc.head()).hash);
+}
+
+test "current head header hedge stale header metadata cannot change reused BAL timeout" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.createDir(std.testing.io, "db", .default_dir);
+    var path: [1024]u8 = undefined;
+    const length = try dir.dir.realPathFile(std.testing.io, "db", &path);
+    var f: BalRetryTestFixture = undefined;
+    try f.init(arena.allocator(), path[0..length]);
+    defer f.deinit();
+    f.request.header_purpose = .consensus;
+    f.request.header_secondary = true;
+    f.request.deadline = std.Io.Clock.real.now(std.testing.io).addDuration(.fromSeconds(-1));
+    const original = f.request.*;
+    try f.downloader.checkEthRequestTimeouts();
+    try std.testing.expectEqual(1, f.downloader.inflight_eth_requests.inner.len());
+    try std.testing.expectEqual(1, try f.drainWrites());
+    try std.testing.expect(f.request.id != original.id);
+    try std.testing.expectEqual(eth.Message.get_block_access_list, std.meta.activeTag(f.request.msg));
+    try std.testing.expectEqual(max_inflight_requests - 1, f.downloader.free_eth_requests.inner.len());
+}
+
+test "current head header hedge cancellation joins workers before stale result disposal" {
+    var workers: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .canary = 0x54caf832 });
+    defer std.testing.expectEqual(@as(usize, 0), workers.deinit()) catch @panic("canceled header worker arena leak");
+    var h: HeaderProbeTest = undefined;
+    try h.init();
+    defer h.deinit();
+    const d = &h.f.downloader;
+    const primary = try h.begin();
+    const alternate = try h.hedge(primary);
+    const bytes = try h.encodeHeader(h.f.child);
+    for ([_]*Request(eth.Message){ primary, alternate }) |req| {
+        d.eth_arena.deinit();
+        d.eth_arena = .init(workers.allocator());
+        try std.testing.expect(try h.f.deliverHeader(req.peer, req.id, &.{bytes}));
+    }
+    d.consensus_update.?.head.hash = h.f.parent.hash();
+    try d.advanceConsensusTarget();
+    try std.testing.expectEqual(null, d.consensus_probe);
+    try std.testing.expectEqual(2, d.validating_eth_requests.inner.len());
+    d.task_group.cancel(std.testing.io);
+    // The uncancelable completion queue preserves both arena/frame owners.
+    for (0..2) |_| try d.handleValidated(try d.validated_responses.getOne(std.testing.io));
+    try std.testing.expect(d.validating_eth_requests.empty());
+    try std.testing.expectEqual(max_inflight_requests, d.free_eth_requests.inner.len());
+    try std.testing.expectEqual(h.f.parent.hash(), (try h.f.bc.head()).hash);
+    try std.testing.expectEqual(null, h.f.snapshots.status().find(h.f.child.hash()));
+    try std.testing.expectEqual(null, try h.f.takeWrite());
+}
+
+test "current head header hedge sustained head changes do not stall or mint allowance" {
+    var h: HeaderProbeTest = undefined;
+    try h.init();
+    defer h.deinit();
+    const d = &h.f.downloader;
+    _ = try h.begin();
+    for (0..16) |i| {
+        if (i != 0) {
+            d.consensus_update.?.head.hash[0] ^= 0x40;
+            d.consensus_update.?.head.slot += 1;
+            d.consensus_update.?.anchor.slot += 1;
+            try d.advanceConsensusTarget();
+            _ = try h.f.drainWrites();
+        }
+        const req = h.request(false).?;
+        req.sent_at = std.Io.Clock.real.now(std.testing.io).addDuration(.fromSeconds(-2));
+        const wall = req.sent_at.addDuration(.fromSeconds(1));
+        const mono: std.Io.Timestamp = .fromNanoseconds(@as(i96, @intCast(i)) * std.time.ns_per_s);
+        if (i != 0) {
+            d.hedgeConsensusHeader(&h.f.eth_provider, wall, mono.addDuration(.fromNanoseconds(-1)));
+            try std.testing.expectEqual(null, h.request(true));
+        }
+        d.hedgeConsensusHeader(&h.f.eth_provider, wall, mono);
+        try std.testing.expect(h.request(true) != null);
+        try std.testing.expectEqual(2, d.inflight_eth_requests.inner.len());
+        try std.testing.expectEqual(i + 1, d.consensus_header_budget.count);
+        try std.testing.expectEqual(1, try h.f.drainWrites());
     }
 }
